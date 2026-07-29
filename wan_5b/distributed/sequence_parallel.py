@@ -1,12 +1,14 @@
 # Adopted from https://github.com/Wan-Video/Wan2.2
 # SPDX-License-Identifier: Apache-2.0
 import torch
-import torch.cuda.amp as amp
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention, distributed_flex_attention
 from .util import gather_forward, get_rank, get_world_size
-import math
+from utils.position_embedding_utils import (
+    compute_temporal_freqs as _compute_temporal_freqs,
+    select_temporal_offset_for_sample,
+)
 
 
 def pad_freqs(original_tensor, target_len):
@@ -22,12 +24,6 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-from utils.position_embedding_utils import (
-    compute_temporal_freqs as _compute_temporal_freqs,
-    select_temporal_offset_for_sample,
-)
-
-
 @torch.amp.autocast('cuda', enabled=False)
 def sp_rope_apply(
     x,
@@ -37,6 +33,7 @@ def sp_rope_apply(
     method="linear",
     original_seq_len=None,
     temporal_offset=0.0,
+    global_token_shard=False,
 ):
     """
     x:          [B, L, N, C].
@@ -47,33 +44,70 @@ def sp_rope_apply(
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
+    sp_size = get_world_size()
+    sp_rank = get_rank()
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        local_f = f
-        sp_rank = get_rank()
-        start_frame = sp_rank * local_f
-        seq_len = local_f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        temporal_offset_i = select_temporal_offset_for_sample(
-            temporal_offset, i, local_f, start_frame=start_frame)
-        temporal_freqs = _compute_temporal_freqs(
-            freqs[0], local_f, start_frame, t_scale, x.device,
-            method=method, original_seq_len=original_seq_len,
-            temporal_offset=temporal_offset_i)
-        freqs_i = torch.cat([
-            temporal_freqs.view(local_f, 1, 1, -1).expand(local_f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(local_f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(local_f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        if global_token_shard:
+            # sp_dit_forward pads the global sequence and then partitions flat
+            # tokens; a rank boundary need not align with a video frame.
+            seq_len = f * h * w
+            global_padded_len = x.size(1) * sp_size
+            if seq_len > global_padded_len:
+                raise ValueError(
+                    f"RoPE sequence length {seq_len} exceeds padded length "
+                    f"{global_padded_len}")
+            temporal_offset_i = select_temporal_offset_for_sample(
+                temporal_offset, i, f, start_frame=0)
+            temporal_freqs = _compute_temporal_freqs(
+                freqs[0], f, 0, t_scale, x.device,
+                method=method, original_seq_len=original_seq_len,
+                temporal_offset=temporal_offset_i)
+            freqs_i = torch.cat([
+                temporal_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(seq_len, 1, -1)
+            if seq_len < global_padded_len:
+                freqs_i = torch.cat([
+                    freqs_i,
+                    torch.ones(
+                        global_padded_len - seq_len,
+                        1,
+                        freqs_i.size(-1),
+                        dtype=freqs_i.dtype,
+                        device=freqs_i.device,
+                    ),
+                ])
+            freqs_i = freqs_i.chunk(sp_size, dim=0)[sp_rank]
+            x_i = torch.view_as_complex(
+                x[i].to(torch.float64).reshape(x.size(1), n, -1, 2))
+            x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        else:
+            # Causal SP training supplies an already frame-sharded input and a
+            # local grid size, so retain its temporal rank offset semantics.
+            local_f = f
+            start_frame = sp_rank * local_f
+            seq_len = local_f * h * w
+            x_i = torch.view_as_complex(
+                x[i, :seq_len].to(torch.float64).reshape(
+                    seq_len, n, -1, 2))
+            temporal_offset_i = select_temporal_offset_for_sample(
+                temporal_offset, i, local_f, start_frame=start_frame)
+            temporal_freqs = _compute_temporal_freqs(
+                freqs[0], local_f, start_frame, t_scale, x.device,
+                method=method, original_seq_len=original_seq_len,
+                temporal_offset=temporal_offset_i)
+            freqs_i = torch.cat([
+                temporal_freqs.view(local_f, 1, 1, -1).expand(
+                    local_f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(
+                    local_f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(
+                    local_f, h, w, -1)
+            ], dim=-1).reshape(seq_len, 1, -1)
+            x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+            x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection
         output.append(x_i)
@@ -182,10 +216,12 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16,
     q, k, v = qkv_fn(x)
     q = sp_rope_apply(q, grid_sizes, freqs, t_scale=t_scale,
                       method=method, original_seq_len=original_seq_len,
-                      temporal_offset=temporal_offset)
+                      temporal_offset=temporal_offset,
+                      global_token_shard=True)
     k = sp_rope_apply(k, grid_sizes, freqs, t_scale=t_scale,
                       method=method, original_seq_len=original_seq_len,
-                      temporal_offset=temporal_offset)
+                      temporal_offset=temporal_offset,
+                      global_token_shard=True)
 
     x = distributed_attention(
         half(q),

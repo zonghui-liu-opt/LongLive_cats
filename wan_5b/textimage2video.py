@@ -10,7 +10,6 @@ from contextlib import contextmanager
 from functools import partial
 
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -77,6 +76,7 @@ class WanTI2V:
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.use_sp = use_sp
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -458,72 +458,151 @@ class WanTI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width (from max_area)
         """
-        # preprocess
-        ih, iw = img.height, img.width
-        dh, dw = self.patch_size[1] * self.vae_stride[1], self.patch_size[
-            2] * self.vae_stride[2]
-        ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+        videos = self.i2v_batch(
+            input_prompts=[input_prompt],
+            imgs=[img],
+            max_area=max_area,
+            frame_num=frame_num,
+            shift=shift,
+            sample_solver=sample_solver,
+            sampling_steps=sampling_steps,
+            guide_scale=guide_scale,
+            n_prompts=[n_prompt],
+            seeds=[seed],
+            offload_model=offload_model,
+        )
+        return videos[0] if self.rank == 0 else None
 
-        scale = max(ow / iw, oh / ih)
-        img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
+    def i2v_batch(self,
+                  input_prompts,
+                  imgs,
+                  max_area=704 * 1280,
+                  frame_num=121,
+                  shift=5.0,
+                  sample_solver='unipc',
+                  sampling_steps=40,
+                  guide_scale=5.0,
+                  n_prompts="",
+                  seeds=None,
+                  offload_model=True):
+        """Generate an I2V batch with the original full-sequence Wan model.
 
-        # center-crop
-        x1 = (img.width - ow) // 2
-        y1 = (img.height - oh) // 2
-        img = img.crop((x1, y1, x1 + ow, y1 + oh))
-        assert img.width == ow and img.height == oh
+        Every item in a batch must resolve to the same output size. ``seeds``
+        is per-sample so results do not depend on how the caller batches data.
+        Returns a list of ``[C, frame_num, H, W]`` tensors on rank 0.
+        """
+        input_prompts = list(input_prompts)
+        imgs = list(imgs)
+        batch_size = len(input_prompts)
+        if batch_size == 0:
+            raise ValueError("input_prompts and imgs must not be empty")
+        if len(imgs) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} images, got {len(imgs)}")
+        if frame_num < 1 or (frame_num - 1) % self.vae_stride[0] != 0:
+            raise ValueError(
+                f"frame_num must be 4n+1 for this VAE, got {frame_num}")
 
-        # to tensor
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1)
+        if isinstance(n_prompts, str):
+            n_prompts = [n_prompts] * batch_size
+        else:
+            n_prompts = list(n_prompts)
+        if len(n_prompts) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} negative prompts, got {len(n_prompts)}")
+        n_prompts = [p if p else self.sample_neg_prompt for p in n_prompts]
 
-        F = frame_num
-        seq_len = ((F - 1) // self.vae_stride[0] + 1) * (
-            oh // self.vae_stride[1]) * (ow // self.vae_stride[2]) // (
+        if seeds is None:
+            seeds = [-1] * batch_size
+        elif isinstance(seeds, int):
+            seeds = [seeds + i if seeds >= 0 else -1
+                     for i in range(batch_size)]
+        else:
+            seeds = list(seeds)
+        if len(seeds) != batch_size:
+            raise ValueError(f"Expected {batch_size} seeds, got {len(seeds)}")
+        seeds = [s if s >= 0 else random.randint(0, sys.maxsize)
+                 for s in seeds]
+
+        dh = self.patch_size[1] * self.vae_stride[1]
+        dw = self.patch_size[2] * self.vae_stride[2]
+        processed_imgs = []
+        output_sizes = []
+        for img in imgs:
+            if not isinstance(img, Image.Image):
+                raise TypeError("imgs must contain PIL.Image.Image objects")
+            img = img.convert("RGB")
+            ih, iw = img.height, img.width
+            ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+            scale = max(ow / iw, oh / ih)
+            resized = img.resize(
+                (round(iw * scale), round(ih * scale)), Image.LANCZOS)
+            x1 = (resized.width - ow) // 2
+            y1 = (resized.height - oh) // 2
+            resized = resized.crop((x1, y1, x1 + ow, y1 + oh))
+            processed_imgs.append(
+                TF.to_tensor(resized).sub_(0.5).div_(0.5).to(
+                    self.device).unsqueeze(1))
+            output_sizes.append((ow, oh))
+
+        if len(set(output_sizes)) != 1:
+            raise ValueError(
+                "All images in one batch must resolve to the same output size; "
+                f"got {output_sizes}")
+        ow, oh = output_sizes[0]
+        latent_frames = (frame_num - 1) // self.vae_stride[0] + 1
+        seq_len = latent_frames * (oh // self.vae_stride[1]) * (
+            ow // self.vae_stride[2]) // (
                 self.patch_size[1] * self.patch_size[2])
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
 
-        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
-        noise = torch.randn(
-            self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
-            oh // self.vae_stride[1],
-            ow // self.vae_stride[2],
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device)
+        generators = []
+        noises = []
+        for seed in seeds:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+            generators.append(generator)
+            noises.append(torch.randn(
+                self.vae.model.z_dim,
+                latent_frames,
+                oh // self.vae_stride[1],
+                ow // self.vae_stride[2],
+                dtype=torch.float32,
+                generator=generator,
+                device=self.device,
+            ))
 
-        if n_prompt == "":
-            n_prompt = self.sample_neg_prompt
-
-        # preprocess
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
+            context = self.text_encoder(input_prompts, self.device)
+            context_null = self.text_encoder(n_prompts, self.device)
             if offload_model:
                 self.text_encoder.model.cpu()
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            cpu = torch.device('cpu')
+            context = self.text_encoder(input_prompts, cpu)
+            context_null = self.text_encoder(n_prompts, cpu)
+            context = [value.to(self.device) for value in context]
+            context_null = [value.to(self.device) for value in context_null]
 
-        z = self.vae.encode([img])
+        clean_latents = torch.stack(self.vae.encode(processed_imgs))
+        _, mask2_list = masks_like(noises, zero=True)
+        mask2 = torch.stack(mask2_list)
+        latent = torch.stack(noises)
+        latent = (1. - mask2) * clean_latents + mask2 * latent
 
         @contextmanager
         def noop_no_sync():
             yield
 
-        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+        def stack_model_output(value):
+            return torch.stack(value) if isinstance(value, (list, tuple)) else value
 
-        # evaluation mode
+        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
         with (
                 torch.amp.autocast('cuda', dtype=self.param_dtype),
                 torch.no_grad(),
                 no_sync(),
         ):
-
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
@@ -543,61 +622,47 @@ class WanTI2V:
                     device=self.device,
                     sigmas=sampling_sigmas)
             else:
-                raise NotImplementedError("Unsupported solver.")
+                raise NotImplementedError(
+                    f"Unsupported solver: {sample_solver}")
 
-            # sample videos
-            latent = noise
-            mask1, mask2 = masks_like([noise], zero=True)
-            latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
-
-            arg_c = {
-                'context': [context[0]],
-                'seq_len': seq_len,
-            }
-
-            arg_null = {
-                'context': context_null,
-                'seq_len': seq_len,
-            }
+            arg_c = {'context': context, 'seq_len': seq_len}
+            arg_null = {'context': context_null, 'seq_len': seq_len}
 
             if offload_model or self.init_on_cpu:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
-                timestep = [t]
+            for t in tqdm(timesteps, disable=self.rank != 0):
+                latent_model_input = list(latent.unbind(0))
+                timestep_rows = []
+                for sample_mask in mask2_list:
+                    temp_ts = (sample_mask[0][:, ::2, ::2] * t).flatten()
+                    temp_ts = torch.cat([
+                        temp_ts,
+                        temp_ts.new_ones(seq_len - temp_ts.size(0)) * t,
+                    ])
+                    timestep_rows.append(temp_ts)
+                timestep = torch.stack(timestep_rows)
 
-                timestep = torch.stack(timestep).to(self.device)
-
-                temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
-                temp_ts = torch.cat([
-                    temp_ts,
-                    temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
-                ])
-                timestep = temp_ts.unsqueeze(0)
-
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                noise_pred_cond = stack_model_output(self.model(
+                    latent_model_input, t=timestep, **arg_c))
                 if offload_model:
                     torch.cuda.empty_cache()
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                noise_pred_uncond = stack_model_output(self.model(
+                    latent_model_input, t=timestep, **arg_null))
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
+                latent = sample_scheduler.step(
+                    noise_pred,
                     t,
-                    latent.unsqueeze(0),
+                    latent,
                     return_dict=False,
-                    generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
-                latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
-
-                x0 = [latent]
+                    generator=(generators[0] if batch_size == 1 else generators),
+                )[0]
+                latent = (1. - mask2) * clean_latents + mask2 * latent
                 del latent_model_input, timestep
 
             if offload_model:
@@ -605,15 +670,16 @@ class WanTI2V:
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
+            videos = None
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                videos = self.vae.decode(list(latent.unbind(0)))
 
-        del noise, latent, x0
+        del noises, clean_latents, latent, mask2
         del sample_scheduler
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
-        if dist.is_initialized():
+        if self.use_sp and dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        return videos

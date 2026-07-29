@@ -83,6 +83,10 @@ The default git clone fetches objects from all branches, including our demopage 
 
 ### Quick Start
 
+For batched inference with the original bidirectional Wan2.2-TI2V-5B weights,
+including single- and multi-H100 launch commands, see the
+[Chinese deployment guide](docs/WAN22_TI2V_BATCH_INFERENCE_ZH.md).
+
 #### BF16
 
 ```python
