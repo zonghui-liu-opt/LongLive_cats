@@ -13,6 +13,7 @@ from functools import partial
 import torch
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
+from diffusers import FlowMatchEulerDiscreteScheduler
 from PIL import Image
 from tqdm import tqdm
 
@@ -114,6 +115,36 @@ def _load_wan_model(checkpoint_dir, config, torch_dtype=None):
         raise RuntimeError(
             f"Checkpoint is missing {len(missing)} model tensors: {preview}")
     return model
+
+
+def _prepare_sampling_scheduler(
+        sample_solver, sampling_steps, shift, num_train_timesteps, device):
+    """Create a flow-matching scheduler with a shared Wan sigma schedule."""
+    if sample_solver == 'unipc':
+        scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False)
+        scheduler.set_timesteps(sampling_steps, device=device, shift=shift)
+        return scheduler, scheduler.timesteps
+
+    sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+    if sample_solver == 'dpm++':
+        scheduler = FlowDPMSolverMultistepScheduler(
+            num_train_timesteps=num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False)
+    elif sample_solver == 'euler':
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False)
+    else:
+        raise NotImplementedError(f"Unsupported solver: {sample_solver}")
+
+    timesteps, _ = retrieve_timesteps(
+        scheduler, device=device, sigmas=sampling_sigmas)
+    return scheduler, timesteps
 
 
 class WanTI2V:
@@ -425,26 +456,13 @@ class WanTI2V:
                 no_sync(),
         ):
 
-            if sample_solver == 'unipc':
-                sample_scheduler = FlowUniPCMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
-                timesteps = sample_scheduler.timesteps
-            elif sample_solver == 'dpm++':
-                sample_scheduler = FlowDPMSolverMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-                timesteps, _ = retrieve_timesteps(
-                    sample_scheduler,
-                    device=self.device,
-                    sigmas=sampling_sigmas)
-            else:
-                raise NotImplementedError("Unsupported solver.")
+            sample_scheduler, timesteps = _prepare_sampling_scheduler(
+                sample_solver=sample_solver,
+                sampling_steps=sampling_steps,
+                shift=shift,
+                num_train_timesteps=self.num_train_timesteps,
+                device=self.device,
+            )
 
             # sample videos
             latents = noise
@@ -560,7 +578,7 @@ class WanTI2V:
             sample_solver=sample_solver,
             sampling_steps=sampling_steps,
             guide_scale=guide_scale,
-            n_prompts=[n_prompt],
+            n_prompts=None if n_prompt == "" else [n_prompt],
             seeds=[seed],
             offload_model=offload_model,
         )
@@ -575,7 +593,7 @@ class WanTI2V:
                   sample_solver='unipc',
                   sampling_steps=40,
                   guide_scale=5.0,
-                  n_prompts="",
+                  n_prompts=None,
                   seeds=None,
                   offload_model=True):
         """Generate an I2V batch with the original full-sequence Wan model.
@@ -596,15 +614,15 @@ class WanTI2V:
             raise ValueError(
                 f"frame_num must be 4n+1 for this VAE, got {frame_num}")
 
-        if isinstance(n_prompts, str):
+        if n_prompts is None:
+            n_prompts = [self.sample_neg_prompt] * batch_size
+        elif isinstance(n_prompts, str):
             n_prompts = [n_prompts] * batch_size
         else:
             n_prompts = list(n_prompts)
         if len(n_prompts) != batch_size:
             raise ValueError(
                 f"Expected {batch_size} negative prompts, got {len(n_prompts)}")
-        n_prompts = [p if p else self.sample_neg_prompt for p in n_prompts]
-
         if seeds is None:
             seeds = [-1] * batch_size
         elif isinstance(seeds, int):
@@ -696,27 +714,13 @@ class WanTI2V:
                 torch.no_grad(),
                 no_sync(),
         ):
-            if sample_solver == 'unipc':
-                sample_scheduler = FlowUniPCMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
-                timesteps = sample_scheduler.timesteps
-            elif sample_solver == 'dpm++':
-                sample_scheduler = FlowDPMSolverMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-                timesteps, _ = retrieve_timesteps(
-                    sample_scheduler,
-                    device=self.device,
-                    sigmas=sampling_sigmas)
-            else:
-                raise NotImplementedError(
-                    f"Unsupported solver: {sample_solver}")
+            sample_scheduler, timesteps = _prepare_sampling_scheduler(
+                sample_solver=sample_solver,
+                sampling_steps=sampling_steps,
+                shift=shift,
+                num_train_timesteps=self.num_train_timesteps,
+                device=self.device,
+            )
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}

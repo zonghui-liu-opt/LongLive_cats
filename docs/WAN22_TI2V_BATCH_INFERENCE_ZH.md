@@ -68,6 +68,23 @@ python scripts/infer_wan22_ti2v_batch.py \
 
 ## 2. 单卡 H100
 
+### 关键采样参数
+
+如需复现 DiffSynth `WanVideoPipeline` 的一阶 Flow-Matching Euler 推理，指定：
+
+```bash
+--solver euler \
+--sampling-steps 50 \
+--frame-num 97 \
+--t-shift 5.0 \
+--negative-prompt "模糊，低质量，畸形，多余肢体"
+```
+
+其中 `--t-shift`、`--t_shift` 和 `--shift` 完全等价，对应 DiffSynth 的
+`sigma_shift`。`97` 满足 Wan2.2 VAE 的 `4n+1` 帧数约束。若省略
+`--negative-prompt`，使用 Wan 内置默认负面词；若要与原 DiffSynth 脚本的空
+negative prompt 完全一致，请显式传 `--negative-prompt ''`。
+
 先用 batch 1 验证环境和权重，再逐步增大到 2 或 3：
 
 ```bash

@@ -43,8 +43,10 @@ class _Movable:
 class _FakeTextEncoder:
     def __init__(self):
         self.model = _Movable()
+        self.calls = []
 
     def __call__(self, texts, device):
+        self.calls.append(list(texts))
         return [torch.ones(2, 4, device=device) for _ in texts]
 
 
@@ -96,6 +98,44 @@ def _make_pipeline():
 
 
 class WanTI2VBatchTest(unittest.TestCase):
+    def test_euler_uses_diffsynth_wan_shifted_schedule(self):
+        scheduler, timesteps = ti2v_module._prepare_sampling_scheduler(
+            sample_solver="euler",
+            sampling_steps=4,
+            shift=3.0,
+            num_train_timesteps=1000,
+            device=torch.device("cpu"),
+        )
+
+        torch.testing.assert_close(
+            timesteps, torch.tensor([1000.0, 900.0, 750.0, 500.0]))
+        torch.testing.assert_close(
+            scheduler.sigmas,
+            torch.tensor([1.0, 0.9, 0.75, 0.5, 0.0]),
+        )
+
+    def test_explicit_empty_negative_prompt_does_not_use_model_default(self):
+        pipe = _make_pipeline()
+        image = Image.new("RGB", (32, 32), "white")
+        with mock.patch.object(
+                ti2v_module.torch.amp,
+                "autocast",
+                side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+        ):
+            pipe.i2v_batch(
+                input_prompts=["positive"],
+                imgs=[image],
+                max_area=32 * 32,
+                frame_num=5,
+                sample_solver="euler",
+                sampling_steps=1,
+                n_prompts="",
+                seeds=[1],
+                offload_model=False,
+            )
+
+        self.assertEqual(pipe.text_encoder.calls, [["positive"], [""]])
+
     def test_configless_flat_checkpoint_loads_strictly(self):
         config = SimpleNamespace(
             model_type="ti2v",

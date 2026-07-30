@@ -58,10 +58,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--frame-num", type=int, default=81)
     parser.add_argument("--sampling-steps", type=int, default=50)
-    parser.add_argument("--solver", choices=("unipc", "dpm++"), default="unipc")
-    parser.add_argument("--shift", type=float, default=3.0)
+    parser.add_argument(
+        "--solver", choices=("euler", "unipc", "dpm++"), default="unipc")
+    parser.add_argument(
+        "--shift", "--t-shift", "--t_shift", dest="shift", type=float,
+        default=3.0,
+        help="Wan sigma/timestep shift; same as DiffSynth sigma_shift.")
     parser.add_argument("--guide-scale", type=float, default=5.0)
-    parser.add_argument("--negative-prompt", default="")
+    parser.add_argument(
+        "--negative-prompt", default=None,
+        help=(
+            "Shared negative prompt. Omit it to use Wan's built-in default; "
+            "pass an explicit empty string to disable negative text."
+        ))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--limit", type=int, default=None)
@@ -227,6 +236,9 @@ def save_sample(video: torch.Tensor, sample: Sample, output_path: Path,
         "solver": args.solver,
         "shift": args.shift,
         "guide_scale": args.guide_scale,
+        "negative_prompt": args.negative_prompt,
+        "negative_prompt_source": (
+            "wan_default" if args.negative_prompt is None else "cli"),
         "checkpoint_dir": str(args.checkpoint_dir.expanduser().resolve()),
         "auxiliary_dir": str(
             (args.auxiliary_dir or args.checkpoint_dir).expanduser().resolve()),
