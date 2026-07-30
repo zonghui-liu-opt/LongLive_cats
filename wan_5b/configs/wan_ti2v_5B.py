@@ -17,10 +17,14 @@ ti2v_5B.vae_checkpoint = 'Wan2.2_VAE.pth'
 ti2v_5B.vae_stride = (4, 16, 16)
 
 # transformer
+ti2v_5B.model_type = 'ti2v'
 ti2v_5B.patch_size = (1, 2, 2)
+ti2v_5B.in_dim = 48
 ti2v_5B.dim = 3072
 ti2v_5B.ffn_dim = 14336
 ti2v_5B.freq_dim = 256
+ti2v_5B.text_dim = 4096
+ti2v_5B.out_dim = 48
 ti2v_5B.num_heads = 24
 ti2v_5B.num_layers = 30
 ti2v_5B.window_size = (-1, -1)

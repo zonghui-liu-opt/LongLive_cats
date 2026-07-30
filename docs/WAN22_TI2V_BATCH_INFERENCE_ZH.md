@@ -23,24 +23,45 @@ pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
 ```
 
-内网机器不能访问公网时，应提前把 Conda 环境或 wheelhouse，以及完整的
-`Wan2.2-TI2V-5B` 权重目录复制进去。权重目录至少应包含：
+内网机器不能访问公网时，应提前把 Conda 环境或 wheelhouse，以及模型权重
+复制进去。本入口同时支持两种 DiT 权重布局：
 
-```text
-Wan2.2-TI2V-5B/
-├── config.json
-├── diffusion_pytorch_model*.safetensors
-├── Wan2.2_VAE.pth
-├── models_t5_umt5-xxl-enc-bf16.pth
-└── google/umt5-xxl/          # 完整 tokenizer 文件
+- 含 `config.json` 的 Diffusers 目录；
+- `merge_ti2v5b_lora.py` 生成的 DiffSynth 扁平合并目录。此布局不生成
+  `config.json`，代码会使用仓库内置的原始 TI2V-5B 架构严格加载权重。
+
+推荐合并时设置 `AUX_FILES_MODE=copy`，得到可独立搬运的目录：
+
+```bash
+MODEL_ROOT=/data/models/Wan2.2-TI2V-5B \
+LORA_PATH=/data/lora/epoch-26.safetensors \
+MERGED_MODEL_ROOT=/data/models/merged_bi-direct_Wan2.2-5B-cats \
+AUX_FILES_MODE=copy \
+bash merge_ti2v5b_lora.sh
 ```
 
-先在仓库根目录做不加载模型的检查：
+完整合并目录至少包含：
+
+```text
+merged_bi-direct_Wan2.2-5B-cats/
+├── diffusion_pytorch_model*.safetensors
+├── diffusion_pytorch_model.safetensors.index.json  # 多 shard 时
+├── Wan2.2_VAE.pth
+├── models_t5_umt5-xxl-enc-bf16.pth
+├── google/umt5-xxl/          # 完整 tokenizer 文件
+└── merge_manifest.json       # 推荐保留，非加载必需
+```
+
+若合并时使用 `AUX_FILES_MODE=none`，只搬运合并后的 DiT，并在推理时用
+`--auxiliary-dir` 指向原始 Wan2.2-TI2V-5B 根目录。使用默认的 `symlink`
+时要确认软链接在内网目标机仍有效；直接复制目录时更推荐 `copy`。
+
+先在仓库根目录做不加载模型和 CUDA 的完整路径检查：
 
 ```bash
 python scripts/infer_wan22_ti2v_batch.py \
   --metadata testsets/metadata_6cases_480x832.csv \
-  --checkpoint-dir /data/models/Wan2.2-TI2V-5B \
+  --checkpoint-dir /data/models/merged_bi-direct_Wan2.2-5B-cats \
   --batch-size 2 \
   --dry-run
 ```
@@ -52,7 +73,7 @@ python scripts/infer_wan22_ti2v_batch.py \
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/infer_wan22_ti2v_batch.py \
   --metadata testsets/metadata_6cases_480x832.csv \
-  --checkpoint-dir /data/models/Wan2.2-TI2V-5B \
+  --checkpoint-dir /data/models/merged_bi-direct_Wan2.2-5B-cats \
   --output-dir outputs/wan22_ti2v_81f \
   --batch-size 2 \
   --frame-num 81 \
@@ -67,11 +88,17 @@ CUDA_VISIBLE_DEVICES=0 python scripts/infer_wan22_ti2v_batch.py \
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/infer_wan22_ti2v_batch.py \
   --metadata testsets/metadata_6cases_480x832.csv \
-  --checkpoint-dir /data/models/Wan2.2-TI2V-5B \
+  --checkpoint-dir /data/models/merged_bi-direct_Wan2.2-5B-cats \
   --output-dir outputs/wan22_ti2v_81f \
   --batch-size 1 \
   --offload-model \
   --t5-cpu
+```
+
+若合并目录只有 DiT 权重，命令增加：
+
+```bash
+  --auxiliary-dir /data/models/Wan2.2-TI2V-5B
 ```
 
 ## 3. 多卡 H100
@@ -83,7 +110,7 @@ batch，适合当前 6 条测试集：
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   scripts/infer_wan22_ti2v_batch.py \
   --metadata testsets/metadata_6cases_480x832.csv \
-  --checkpoint-dir /data/models/Wan2.2-TI2V-5B \
+  --checkpoint-dir /data/models/merged_bi-direct_Wan2.2-5B-cats \
   --output-dir outputs/wan22_ti2v_81f \
   --parallel-mode data \
   --batch-size 2
@@ -97,7 +124,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
   scripts/infer_wan22_ti2v_batch.py \
   --metadata testsets/metadata_6cases_480x832.csv \
-  --checkpoint-dir /data/models/Wan2.2-TI2V-5B \
+  --checkpoint-dir /data/models/merged_bi-direct_Wan2.2-5B-cats \
   --output-dir outputs/wan22_ti2v_81f \
   --parallel-mode ulysses \
   --batch-size 2
@@ -122,6 +149,10 @@ MP4 会被跳过；需要覆盖重跑时传 `--no-resume`。
 
 常见问题：
 
+- 报缺少 `config.json`：更新到本实现后，DiffSynth 合并目录不需要该文件；
+  不要手工伪造配置。先用上面的 `--dry-run` 检查实际路径。
+- T5/VAE/tokenizer 缺失：若合并目录只含 DiT，传入原始模型的
+  `--auxiliary-dir`；若是失效软链接，重新以 `AUX_FILES_MODE=copy` 合并或复制。
 - CUDA OOM：先把 `--batch-size` 降为 1，再启用 `--offload-model --t5-cpu`。
 - 找不到 FlashAttention：确认它针对内网机器上的当前 PyTorch/CUDA 版本编译。
 - 找不到 tokenizer：检查权重目录中的 `google/umt5-xxl/` 是否完整，避免运行时访问公网。

@@ -46,6 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument(
+        "--auxiliary-dir", type=Path, default=None,
+        help=(
+            "Directory containing T5, VAE and tokenizer files. Defaults to "
+            "--checkpoint-dir; set this to the original model root when the "
+            "merged directory contains DiT weights only."
+        ))
+    parser.add_argument(
         "--output-dir", type=Path,
         default=Path("outputs/wan22_ti2v_5b_bidirectional"))
     parser.add_argument("--batch-size", type=int, default=1)
@@ -152,12 +159,14 @@ def make_batches(samples: list[Sample], batch_size: int) -> list[list[Sample]]:
     return batches
 
 
-def validate_checkpoint_dir(checkpoint_dir: Path) -> None:
+def validate_checkpoint_dir(
+        checkpoint_dir: Path, auxiliary_dir: Path | None = None) -> None:
+    """Validate native/DiffSynth merged layouts; config.json is optional."""
+    auxiliary_dir = auxiliary_dir or checkpoint_dir
     required = [
-        checkpoint_dir / "config.json",
-        checkpoint_dir / "Wan2.2_VAE.pth",
-        checkpoint_dir / "models_t5_umt5-xxl-enc-bf16.pth",
-        checkpoint_dir / "google" / "umt5-xxl",
+        auxiliary_dir / "Wan2.2_VAE.pth",
+        auxiliary_dir / "models_t5_umt5-xxl-enc-bf16.pth",
+        auxiliary_dir / "google" / "umt5-xxl",
     ]
     missing = [str(path) for path in required if not path.exists()]
     model_files = (
@@ -219,6 +228,8 @@ def save_sample(video: torch.Tensor, sample: Sample, output_path: Path,
         "shift": args.shift,
         "guide_scale": args.guide_scale,
         "checkpoint_dir": str(args.checkpoint_dir.expanduser().resolve()),
+        "auxiliary_dir": str(
+            (args.auxiliary_dir or args.checkpoint_dir).expanduser().resolve()),
     }
     output_path.with_suffix(".json").write_text(
         json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n",
@@ -229,6 +240,10 @@ def save_sample(video: torch.Tensor, sample: Sample, output_path: Path,
 def main() -> None:
     args = parse_args()
     samples = load_samples(args.metadata, args.limit)
+    checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
+    auxiliary_dir = (
+        args.auxiliary_dir or args.checkpoint_dir).expanduser().resolve()
+    validate_checkpoint_dir(checkpoint_dir, auxiliary_dir)
 
     env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     env_rank = int(os.environ.get("RANK", "0"))
@@ -250,10 +265,6 @@ def main() -> None:
             print(f"  {shape}: {[sample.index for sample in batch]}")
         return
 
-    checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
-    if not checkpoint_dir.is_dir():
-        raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_dir}")
-    validate_checkpoint_dir(checkpoint_dir)
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     rank, local_rank, world_size = distributed_info(args.parallel_mode)
@@ -269,6 +280,7 @@ def main() -> None:
     pipe = WanTI2V(
         config=WAN_CONFIGS["ti2v-5B"],
         checkpoint_dir=str(checkpoint_dir),
+        auxiliary_dir=str(auxiliary_dir),
         device_id=local_rank,
         rank=model_rank,
         use_sp=use_sp,

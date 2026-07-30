@@ -1,15 +1,23 @@
 import contextlib
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 from PIL import Image
+from safetensors.torch import save_file
 
 import wan_5b.textimage2video as ti2v_module
-from scripts.infer_wan22_ti2v_batch import Sample, make_batches
+from scripts.infer_wan22_ti2v_batch import (
+    Sample,
+    make_batches,
+    validate_checkpoint_dir,
+)
 from wan_5b.distributed import sequence_parallel as sp_module
-from wan_5b.modules.model import rope_apply, rope_params
+from wan_5b.modules.model import WanModel, rope_apply, rope_params
 
 
 class _FakeScheduler:
@@ -88,6 +96,86 @@ def _make_pipeline():
 
 
 class WanTI2VBatchTest(unittest.TestCase):
+    def test_configless_flat_checkpoint_loads_strictly(self):
+        config = SimpleNamespace(
+            model_type="ti2v",
+            patch_size=(1, 2, 2),
+            text_len=8,
+            in_dim=4,
+            dim=16,
+            ffn_dim=32,
+            freq_dim=8,
+            text_dim=12,
+            out_dim=4,
+            num_heads=2,
+            num_layers=1,
+            window_size=(-1, -1),
+            qk_norm=True,
+            cross_attn_norm=True,
+            eps=1e-6,
+        )
+        source = WanModel(**ti2v_module._wan_model_kwargs(config))
+        source_state = source.state_dict()
+        for sharded in (False, True):
+            with self.subTest(sharded=sharded), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                if sharded:
+                    keys = list(source_state)
+                    midpoint = len(keys) // 2
+                    shard_names = (
+                        "diffusion_pytorch_model-00001-of-00002.safetensors",
+                        "diffusion_pytorch_model-00002-of-00002.safetensors",
+                    )
+                    save_file(
+                        {key: source_state[key] for key in keys[:midpoint]},
+                        root / shard_names[0],
+                    )
+                    save_file(
+                        {key: source_state[key] for key in keys[midpoint:]},
+                        root / shard_names[1],
+                    )
+                    weight_map = {
+                        key: shard_names[int(index >= midpoint)]
+                        for index, key in enumerate(keys)
+                    }
+                    (root / "diffusion_pytorch_model.safetensors.index.json").write_text(
+                        json.dumps({"weight_map": weight_map}), encoding="utf-8")
+                else:
+                    save_file(
+                        source_state,
+                        root / "diffusion_pytorch_model.safetensors",
+                    )
+                loaded = ti2v_module._load_wan_model(directory, config)
+
+            self.assertFalse(any(
+                parameter.is_meta for parameter in loaded.parameters()))
+            for key, expected in source_state.items():
+                torch.testing.assert_close(loaded.state_dict()[key], expected)
+
+    def test_checkpoint_validation_allows_merged_layout_without_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "diffusion_pytorch_model.safetensors").touch()
+            (root / "Wan2.2_VAE.pth").touch()
+            (root / "models_t5_umt5-xxl-enc-bf16.pth").touch()
+            (root / "google" / "umt5-xxl").mkdir(parents=True)
+
+            validate_checkpoint_dir(root)
+
+    def test_checkpoint_validation_supports_separate_auxiliary_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dit_root = root / "merged"
+            aux_root = root / "base"
+            dit_root.mkdir()
+            (dit_root / "diffusion_pytorch_model.safetensors").touch()
+            aux_root.mkdir()
+            (aux_root / "Wan2.2_VAE.pth").touch()
+            (aux_root / "models_t5_umt5-xxl-enc-bf16.pth").touch()
+            (aux_root / "google" / "umt5-xxl").mkdir(parents=True)
+
+            validate_checkpoint_dir(dit_root, aux_root)
+
     def test_resolution_bucketing_never_mixes_orientations(self):
         samples = [
             Sample(i, Path(f"{i}.png"), "prompt", height, width, "")

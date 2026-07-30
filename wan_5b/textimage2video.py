@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
+import glob
 import logging
 import math
 import os
@@ -30,6 +31,91 @@ from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.utils import best_output_size, masks_like
 
 
+def _wan_model_kwargs(config):
+    """Build the native TI2V-5B architecture for config-less checkpoints."""
+    return {
+        'model_type': config.model_type,
+        'patch_size': tuple(config.patch_size),
+        'text_len': config.text_len,
+        'in_dim': config.in_dim,
+        'dim': config.dim,
+        'ffn_dim': config.ffn_dim,
+        'freq_dim': config.freq_dim,
+        'text_dim': config.text_dim,
+        'out_dim': config.out_dim,
+        'num_heads': config.num_heads,
+        'num_layers': config.num_layers,
+        'window_size': tuple(config.window_size),
+        'qk_norm': config.qk_norm,
+        'cross_attn_norm': config.cross_attn_norm,
+        'eps': config.eps,
+    }
+
+
+def _flat_checkpoint_path(checkpoint_dir):
+    """Return a flat checkpoint or shard index accepted by Accelerate."""
+    checkpoint_dir = os.path.abspath(checkpoint_dir)
+    indices = sorted(
+        path for suffix in ('diffusion_pytorch_model*.safetensors.index.json',
+                            'diffusion_pytorch_model*.bin.index.json')
+        for path in glob.glob(os.path.join(checkpoint_dir, suffix))
+    )
+    if len(indices) > 1:
+        raise RuntimeError(
+            f"Multiple checkpoint indices found in {checkpoint_dir}: {indices}")
+    if indices:
+        return indices[0]
+
+    weights = sorted(
+        path for suffix in ('diffusion_pytorch_model*.safetensors',
+                            'diffusion_pytorch_model*.bin')
+        for path in glob.glob(os.path.join(checkpoint_dir, suffix))
+    )
+    if len(weights) != 1:
+        detail = "none" if not weights else f"{len(weights)} shards without an index"
+        raise FileNotFoundError(
+            "Expected one flat diffusion checkpoint or one shard index in "
+            f"{checkpoint_dir}; found {detail}")
+    return weights[0]
+
+
+def _load_wan_model(checkpoint_dir, config, torch_dtype=None):
+    """Load either a Diffusers directory or DiffSynth's merged flat shards."""
+    config_path = os.path.join(checkpoint_dir, 'config.json')
+    if os.path.isfile(config_path):
+        return WanModel.from_pretrained(
+            checkpoint_dir,
+            local_files_only=True,
+            torch_dtype=torch_dtype,
+        )
+
+    from accelerate import init_empty_weights
+    from accelerate.utils import load_checkpoint_in_model
+
+    checkpoint_path = _flat_checkpoint_path(checkpoint_dir)
+    logging.info(
+        "No config.json found; loading flat TI2V-5B weights with the "
+        "built-in architecture from %s", checkpoint_path)
+    with init_empty_weights():
+        model = WanModel(**_wan_model_kwargs(config))
+    load_checkpoint_in_model(
+        model,
+        checkpoint=checkpoint_path,
+        device_map={'': 'cpu'},
+        dtype=torch_dtype,
+        strict=True,
+    )
+    missing = [
+        name for name, value in model.state_dict().items()
+        if isinstance(value, torch.Tensor) and value.is_meta
+    ]
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise RuntimeError(
+            f"Checkpoint is missing {len(missing)} model tensors: {preview}")
+    return model
+
+
 class WanTI2V:
 
     def __init__(
@@ -44,6 +130,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        auxiliary_dir=None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -52,7 +139,7 @@ class WanTI2V:
             config (EasyDict):
                 Object containing model parameters initialized from config.py
             checkpoint_dir (`str`):
-                Path to directory containing model checkpoints
+                Path containing the DiT checkpoint shards.
             device_id (`int`,  *optional*, defaults to 0):
                 Id of target GPU device
             rank (`int`,  *optional*, defaults to 0):
@@ -70,6 +157,9 @@ class WanTI2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            auxiliary_dir (`str`, *optional*):
+                Path containing T5, VAE and tokenizer files. Defaults to
+                ``checkpoint_dir``. This supports weight-only merged folders.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -77,6 +167,7 @@ class WanTI2V:
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
         self.use_sp = use_sp
+        auxiliary_dir = auxiliary_dir or checkpoint_dir
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -89,18 +180,20 @@ class WanTI2V:
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            checkpoint_path=os.path.join(auxiliary_dir, config.t5_checkpoint),
+            tokenizer_path=os.path.join(auxiliary_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None)
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         self.vae = Wan2_2_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            vae_pth=os.path.join(auxiliary_dir, config.vae_checkpoint),
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        load_dtype = config.param_dtype if convert_model_dtype else None
+        self.model = _load_wan_model(
+            checkpoint_dir, config, torch_dtype=load_dtype)
         self.model = self._configure_model(
             model=self.model,
             use_sp=use_sp,
