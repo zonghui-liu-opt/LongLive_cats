@@ -7,7 +7,6 @@ import torch.distributed as dist
 import torch
 import math
 
-from pipeline import SelfForcingTrainingPipeline
 from utils.config import section_get
 from utils.loss import get_denoising_loss
 from utils.wan_5b_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -485,6 +484,8 @@ class SelfForcingModel(BaseModel):
         return denoised_pred, denoised_timestep_from, denoised_timestep_to
 
     def _initialize_inference_pipeline(self):
+        from pipeline import SelfForcingTrainingPipeline
+
         """
         Lazy initialize the inference pipeline during the first backward simulation run.
         Here we encapsulate the inference code with a model-dependent outside function.

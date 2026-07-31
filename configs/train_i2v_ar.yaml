@@ -1,22 +1,37 @@
-# Distributed i2v AR training runtime.
+# LongLive-2.0 causal I2V AR Stage-1 LoRA SFT.
+# All heavyweight paths are explicit and may be overridden with the dedicated
+# LONG_LIVE_STAGE1_* environment variables used by train_stage1_i2v.sh.
 infra:
-  sequence_parallel_size: 4
-  sharding_strategy: hybrid_full
+  expected_world_size: 6
+  sequence_parallel_size: 3
+  data_parallel_size: 2
+  fsdp_backend: fsdp2
+  sharding_strategy: hsdp
+  device_mesh_shape: [2, 3]
+  device_mesh_dim_names: [replicate, shard]
   mixed_precision: true
   gradient_checkpointing: true
-  vae_halo_latents: 28
   generator_fsdp_wrap_strategy: size
-  text_encoder_fsdp_wrap_strategy: size
+  cpu_offload: false
+  model_quant: false
 
-# Passed directly to WanDiffusionWrapper(**model_kwargs).
 model_kwargs:
   model_name: Wan2.2-TI2V-5B
   timestep_shift: 5.0
   num_frame_per_block: 8
-  local_attn_size: -1
+  architecture_root: ${oc.env:LONG_LIVE_STAGE1_ARCHITECTURE_ROOT,/absolute/path/to/Wan2.2-TI2V-5B}
+  init_weights: false
 
-# I2V AR diffusion objective. The first latent frame is encoded from the
-# source image, kept clean, and masked out of the flow-matching loss.
+checkpoints:
+  generator_ckpt: ${oc.env:LONG_LIVE_STAGE1_BASE_CHECKPOINT,/absolute/path/to/converted_causal_base.pt}
+  base_manifest: ${oc.env:LONG_LIVE_STAGE1_BASE_MANIFEST,/absolute/path/to/converted_causal_base.manifest.json}
+
+model_paths:
+  architecture_root: ${oc.env:LONG_LIVE_STAGE1_ARCHITECTURE_ROOT,/absolute/path/to/Wan2.2-TI2V-5B}
+  t5_checkpoint: ${oc.env:LONG_LIVE_STAGE1_T5_CHECKPOINT,/absolute/path/to/models_t5_umt5-xxl-enc-bf16.pth}
+  tokenizer_dir: ${oc.env:LONG_LIVE_STAGE1_TOKENIZER_DIR,/absolute/path/to/google/umt5-xxl}
+  vae_checkpoint: ${oc.env:LONG_LIVE_STAGE1_VAE_CHECKPOINT,/absolute/path/to/Wan2.2_VAE.pth}
+
 algorithm:
   trainer: diffusion
   i2v: true
@@ -25,65 +40,104 @@ algorithm:
   independent_first_frame: true
   num_train_timestep: 1000
   denoising_loss_type: flow
+  noise_augmentation_max_timestep: 0
+  prompt_dropout_prob: 0.0
+  input_image_dropout_prob: 0.0
 
-training:
-  lr: 1.0e-05
-  weight_decay: 0.0
-  beta1: 0.0
-  beta2: 0.999
-  batch_size: 1
-  gradient_accumulation_steps: 1
-  ema_weight: 0.99
-  ema_start_step: 100
-  log_iters: 1
-  max_checkpoints: 20
-  max_iters: 600
-  gc_interval: 100
-  error_recycling:
-    enabled: true
-    num_buckets: 50
-    buffer_size_per_bucket: 500
-    buffer_warmup_iter: 50
-    context_inject_prob: 0.9
-    latent_inject_prob: 0.9
-    noise_inject_prob: 0.01
-    clean_prob: 0.2
-    clean_buffer_update_prob: 0.1
-    modulate_factor: 0.3
-    start_step: 0
-    replacement_strategy: random
+adapter:
+  type: lora
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  bias: none
+  modules_to_save: []
+  target_patterns:
+    - '^blocks\.[0-9]+\.self_attn\.(q|k|v|o)$'
+    - '^blocks\.[0-9]+\.ffn\.(0|2)$'
+  expected_target_modules: 180
+  expected_trainable_parameters: 57016320
+  expected_adapter_tensors: 360
+
+preprocessing:
+  min_source_frames: 97
+  selected_frame_start: 0
+  selected_frame_count: 93
+  expected_fps: 24
+  allow_resize: false
+  allow_padding: false
+  dtype: bfloat16
+  prompt_mode: repeat_global
 
 data:
-  data_path: /path/to/longlive2/train_video_dataset
-  eval_data_path: /path/to/longlive2/eval_video_dataset
-  image_or_video_shape:
-  - 1
-  - 96
-  - 48
-  - 44
-  - 80
-  load_raw_video: true
+  backend: stage1_i2v_cache
+  metadata_path: training_sets/metadata_600clips_480x832_buckets.csv
+  cache_dir: ${oc.env:LONG_LIVE_STAGE1_CACHE_DIR,/absolute/path/to/stage1_i2v_cache}
+  expected_num_samples: 600
+  image_or_video_shape: [1, 24, 48, 30, 52]
+  allowed_latent_spatial_shapes: [[30, 52], [52, 30]]
+  batch_size: 1
+  num_workers: 2
+  deterministic: true
+  prompt_mode: repeat_global
 
-# Generation settings used by training-time evaluation.
-inference:
-  sampling_steps: 50
-  sink_size: 0
-  multi_shot_sink: true
-  multi_shot_rope_offset: 8
-  guidance_scale: 3.0
-  independent_first_frame: true
-  negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+training:
+  seed: 42
+  gradient_accumulation_steps: 2
+  reset_optimizer_between_phases: false
+  optimizer:
+    type: adamw
+    beta1: 0.0
+    beta2: 0.999
+    eps: 1.0e-8
+    weight_decay: 0.0
+    max_grad_norm: 10.0
+  ema:
+    enabled: true
+    decay: 0.99
+    start_step: 75
+    dtype: float32
+    device: cpu
+    trainable_only: true
+  phases:
+    - name: phase_a_teacher_forcing
+      epochs: 2
+      lr: {schedule: constant, start: 1.0e-5, end: 1.0e-5}
+      error_recycling: {mode: collect_only}
+    - name: phase_b_error_recycling
+      epochs: 3
+      transition: {schedule: smoothstep, ramp_fraction: 0.4}
+      lr: {start: 1.0e-5, end: 5.0e-6}
+      error_recycling:
+        mode: collect_and_inject
+        max_active_prob: 0.5
+        effective_context_prob: 0.30
+        effective_latent_prob: 0.10
+        effective_noise_prob: 0.0
+  error_recycling:
+    enabled: true
+    enable_position_bucketing: true
+    num_buckets: 24
+    buffer_size_per_bucket: 32
+    buffer_warmup_steps: 75
+    replacement_strategy: random
+    modulate_factor: 0.3
+    clean_buffer_update_prob: 0.1
+  nonfinite_max_attempts_per_update: 2
 
-# Lightweight validation generation during i2v AR training.
+checkpointing:
+  every_epochs: 0.5
+  keep_last_resumable: 2
+  keep_resumable_steps: [300]
+  keep_all_adapters: true
+  atomic_success_marker: true
+
 evaluation:
-  interval: 1
-  num_frames: 32
-  use_ema: true
-  val_batch_size: 1
-  save_latents_only: true
+  interval: 0
 
 logging:
-  seed: 0
-  wandb_key: null
-  wandb_entity: null
-  wandb_project: LongLive2-I2V-AR
+  backend: jsonl
+  jsonl_path: metrics/train_metrics.jsonl
+  console_every_steps: 10
+  jsonl_every_steps: 1
+  fsync_every_steps: 10
+  disable_wandb: true

@@ -18,7 +18,6 @@ from typing import Sequence
 
 import torch
 from einops import rearrange
-from torchvision.io import write_video
 
 from utils.nvfp4_checkpoint import (
     clean_fsdp_state_dict_keys,
@@ -307,6 +306,8 @@ def video_to_uint8(video: torch.Tensor) -> torch.Tensor:
 
 def save_video(video: torch.Tensor, output_path: str | os.PathLike, *, fps: int = 24) -> None:
     """Save a generated LongLive video tensor as an mp4 file."""
+    from torchvision.io import write_video
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_video(str(output_path), video_to_uint8(video), fps=fps)

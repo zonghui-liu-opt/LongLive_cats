@@ -16,7 +16,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import DMD
 import torch
-import wandb
+from utils.optional_wandb import wandb
 import os
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import (

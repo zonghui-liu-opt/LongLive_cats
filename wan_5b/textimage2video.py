@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
 import glob
+import json
 import logging
 import math
 import os
@@ -53,31 +54,126 @@ def _wan_model_kwargs(config):
     }
 
 
-def _flat_checkpoint_path(checkpoint_dir):
-    """Return a flat checkpoint or shard index accepted by Accelerate."""
-    checkpoint_dir = os.path.abspath(checkpoint_dir)
+_WAN_CHECKPOINT_FILE_SUFFIXES = (
+    '.safetensors',
+    '.bin',
+    '.safetensors.index.json',
+    '.bin.index.json',
+)
+
+
+def resolve_wan_checkpoint_path(checkpoint_path):
+    """Resolve a Wan weight file, shard index, or flat checkpoint directory.
+
+    The returned path is accepted by Accelerate's
+    :func:`load_checkpoint_in_model`.  Direct weight/index paths are supported
+    in addition to the directory form used by the release inference CLI.
+    """
+    checkpoint_path = os.path.abspath(os.path.expanduser(os.fspath(checkpoint_path)))
+    if os.path.isfile(checkpoint_path):
+        if not checkpoint_path.endswith(_WAN_CHECKPOINT_FILE_SUFFIXES):
+            raise ValueError(
+                "Unsupported Wan checkpoint file. Expected safetensors, bin, "
+                f"or a shard index, got {checkpoint_path}"
+            )
+        return checkpoint_path
+    if not os.path.isdir(checkpoint_path):
+        raise FileNotFoundError(checkpoint_path)
+
     indices = sorted(
         path for suffix in ('diffusion_pytorch_model*.safetensors.index.json',
                             'diffusion_pytorch_model*.bin.index.json')
-        for path in glob.glob(os.path.join(checkpoint_dir, suffix))
+        for path in glob.glob(os.path.join(checkpoint_path, suffix))
     )
     if len(indices) > 1:
         raise RuntimeError(
-            f"Multiple checkpoint indices found in {checkpoint_dir}: {indices}")
+            f"Multiple checkpoint indices found in {checkpoint_path}: {indices}")
     if indices:
         return indices[0]
 
     weights = sorted(
         path for suffix in ('diffusion_pytorch_model*.safetensors',
                             'diffusion_pytorch_model*.bin')
-        for path in glob.glob(os.path.join(checkpoint_dir, suffix))
+        for path in glob.glob(os.path.join(checkpoint_path, suffix))
     )
     if len(weights) != 1:
         detail = "none" if not weights else f"{len(weights)} shards without an index"
         raise FileNotFoundError(
             "Expected one flat diffusion checkpoint or one shard index in "
-            f"{checkpoint_dir}; found {detail}")
+            f"{checkpoint_path}; found {detail}")
     return weights[0]
+
+
+def _flat_checkpoint_path(checkpoint_dir):
+    """Backward-compatible alias for :func:`resolve_wan_checkpoint_path`."""
+    return resolve_wan_checkpoint_path(checkpoint_dir)
+
+
+def wan_checkpoint_source_files(checkpoint_path):
+    """Return every file that determines the resolved checkpoint weights.
+
+    For sharded checkpoints the index itself and every referenced shard are
+    returned in deterministic order.  Index paths are constrained to the
+    index directory so a malformed weight map cannot make hashing escape the
+    source checkpoint tree.
+    """
+    resolved = resolve_wan_checkpoint_path(checkpoint_path)
+    if not resolved.endswith(('.safetensors.index.json', '.bin.index.json')):
+        return [resolved]
+
+    with open(resolved, 'r', encoding='utf-8') as handle:
+        index = json.load(handle)
+    weight_map = index.get('weight_map')
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Checkpoint index has no non-empty weight_map: {resolved}")
+    if any(not isinstance(key, str) or not key for key in weight_map):
+        raise ValueError(f"Checkpoint index contains an invalid tensor key: {resolved}")
+    shard_names = list(weight_map.values())
+    if any(not isinstance(name, str) or not name for name in shard_names):
+        raise ValueError(f"Checkpoint index contains an invalid shard name: {resolved}")
+
+    root = os.path.realpath(os.path.dirname(resolved))
+    shards = []
+    for shard_name in sorted(set(shard_names)):
+        shard_path = os.path.realpath(os.path.join(root, shard_name))
+        try:
+            inside_root = os.path.commonpath((root, shard_path)) == root
+        except ValueError:
+            inside_root = False
+        if not inside_root:
+            raise ValueError(
+                f"Checkpoint index shard escapes its directory: {shard_name!r}"
+            )
+        if not os.path.isfile(shard_path):
+            raise FileNotFoundError(
+                f"Checkpoint index references missing shard {shard_name!r}: {resolved}"
+            )
+        shards.append(shard_path)
+    return [resolved, *shards]
+
+
+def load_wan_checkpoint_in_model(model, checkpoint_path, torch_dtype=None):
+    """Strictly load flat Wan weights into an already constructed model."""
+    from accelerate.utils import load_checkpoint_in_model
+
+    resolved = resolve_wan_checkpoint_path(checkpoint_path)
+    load_checkpoint_in_model(
+        model,
+        checkpoint=resolved,
+        device_map={'': 'cpu'},
+        dtype=torch_dtype,
+        strict=True,
+    )
+    meta_tensors = [
+        name for name, value in model.state_dict().items()
+        if isinstance(value, torch.Tensor) and value.is_meta
+    ]
+    if meta_tensors:
+        preview = ", ".join(meta_tensors[:10])
+        raise RuntimeError(
+            f"Checkpoint is missing {len(meta_tensors)} model tensors: {preview}"
+        )
+    return resolved
 
 
 def _load_wan_model(checkpoint_dir, config, torch_dtype=None):
@@ -91,29 +187,13 @@ def _load_wan_model(checkpoint_dir, config, torch_dtype=None):
         )
 
     from accelerate import init_empty_weights
-    from accelerate.utils import load_checkpoint_in_model
-
-    checkpoint_path = _flat_checkpoint_path(checkpoint_dir)
+    checkpoint_path = resolve_wan_checkpoint_path(checkpoint_dir)
     logging.info(
         "No config.json found; loading flat TI2V-5B weights with the "
         "built-in architecture from %s", checkpoint_path)
     with init_empty_weights():
         model = WanModel(**_wan_model_kwargs(config))
-    load_checkpoint_in_model(
-        model,
-        checkpoint=checkpoint_path,
-        device_map={'': 'cpu'},
-        dtype=torch_dtype,
-        strict=True,
-    )
-    missing = [
-        name for name, value in model.state_dict().items()
-        if isinstance(value, torch.Tensor) and value.is_meta
-    ]
-    if missing:
-        preview = ", ".join(missing[:10])
-        raise RuntimeError(
-            f"Checkpoint is missing {len(missing)} model tensors: {preview}")
+    load_wan_checkpoint_in_model(model, checkpoint_path, torch_dtype=torch_dtype)
     return model
 
 

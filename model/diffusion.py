@@ -6,7 +6,6 @@ import random
 import torch
 
 from model.base import BaseModel
-from pipeline import CausalDiffusionInferencePipeline
 from utils.i2v_conditioning import _overwrite_i2v_context, _zero_i2v_context_timestep
 from utils.wan_5b_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
@@ -31,7 +30,7 @@ class CausalDiffusion(BaseModel):
         self.num_train_timestep = args.num_train_timestep
         self.min_step = int(0.02 * self.num_train_timestep)
         self.max_step = int(0.98 * self.num_train_timestep)
-        self.guidance_scale = args.guidance_scale
+        self.guidance_scale = getattr(args, "guidance_scale", 0.0)
         self.timestep_shift = getattr(args, "timestep_shift", 1.0)
         self.teacher_forcing = getattr(args, "teacher_forcing", False)
         # Noise augmentation in teacher forcing, we add small noise to clean context latents
@@ -40,6 +39,13 @@ class CausalDiffusion(BaseModel):
         self.args = args
         self.device = device
         self.inference_pipeline = None
+        data_cfg = getattr(args, "data", None)
+        data_backend = (
+            data_cfg.get("backend", None)
+            if isinstance(data_cfg, dict)
+            else getattr(data_cfg, "backend", None)
+        )
+        self.stage1_mode = data_backend == "stage1_i2v_cache"
 
         # Error recycling (SVI-style error buffer)
         # When ``enable_position_bucketing`` is true, each rank holds a 2D
@@ -105,18 +111,24 @@ class CausalDiffusion(BaseModel):
                 global_block_offset=self.er_block_offset,
                 shard_rank=er_shard_rank, shard_size=er_shard_size,
             )
-            self.noise_error_buffer = build_error_buffer(
-                cfg_dict, num_blocks=self.er_num_blocks,
-                global_block_offset=self.er_block_offset,
-                shard_rank=er_shard_rank, shard_size=er_shard_size,
-            )
+            if not self.stage1_mode:
+                self.noise_error_buffer = build_error_buffer(
+                    cfg_dict, num_blocks=self.er_num_blocks,
+                    global_block_offset=self.er_block_offset,
+                    shard_rank=er_shard_rank, shard_size=er_shard_size,
+                )
             self.er_context_inject_prob = float(cfg_dict.get("context_inject_prob", 0.9))
             self.er_latent_inject_prob = float(cfg_dict.get("latent_inject_prob", 0.0))
             self.er_noise_inject_prob = float(cfg_dict.get("noise_inject_prob", 0.0))
             self.er_clean_prob = float(cfg_dict.get("clean_prob", 0.0))
             self.er_clean_buffer_update_prob = float(cfg_dict.get("clean_buffer_update_prob", 0.1))
             self.er_start_step = int(cfg_dict.get("start_step", 0))
-            self.er_buffer_warmup_iter = int(cfg_dict.get("buffer_warmup_iter", 50))
+            self.er_buffer_warmup_iter = int(
+                cfg_dict.get(
+                    "buffer_warmup_steps",
+                    cfg_dict.get("buffer_warmup_iter", 50),
+                )
+            )
             self.er_skip_block_0 = bool(cfg_dict.get("skip_block_0", False))
 
     def _initialize_models(self, args, device):
@@ -126,11 +138,23 @@ class CausalDiffusion(BaseModel):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
-        self.text_encoder = WanTextEncoder()
-        self.text_encoder.requires_grad_(False)
+        data_cfg = getattr(args, "data", None)
+        data_backend = (
+            data_cfg.get("backend", None)
+            if isinstance(data_cfg, dict)
+            else getattr(data_cfg, "backend", None)
+        )
+        if data_backend == "stage1_i2v_cache":
+            # The formal Stage-1 path consumes audited latent/text caches and
+            # must not load or FSDP-wrap T5/VAE.
+            self.text_encoder = None
+            self.vae = None
+        else:
+            self.text_encoder = WanTextEncoder()
+            self.text_encoder.requires_grad_(False)
 
-        self.vae = WanVAEWrapper()
-        self.vae.requires_grad_(False)
+            self.vae = WanVAEWrapper()
+            self.vae.requires_grad_(False)
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
@@ -145,6 +169,9 @@ class CausalDiffusion(BaseModel):
         loss_mask: torch.Tensor = None,
         loss_mask_global_valid_count: torch.Tensor = None,
         global_step: int = None,
+        stage1_schedule_values=None,
+        er_gate: dict = None,
+        defer_error_buffer_commit: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -202,6 +229,7 @@ class CausalDiffusion(BaseModel):
         # Step 5), so per-rank divergence here only affects which slice of data
         # gets corrupted on which rank — perfectly safe under DP+SP, and matches
         # SVI's behavior exactly.
+        stage1_mode = bool(getattr(self, "stage1_mode", False))
         er_latent_injected = False
         er_noise_injected = False
         er_injected = False
@@ -210,7 +238,45 @@ class CausalDiffusion(BaseModel):
             self.error_buffer is not None
             and (global_step is None or global_step >= self.er_start_step)
         )
-        if er_ready and self.er_clean_prob > 0 and random.random() < self.er_clean_prob:
+        er_active = False
+        er_context_requested = False
+        er_latent_requested = False
+        er_noise_requested = False
+        stage1_er_mode = None
+        if stage1_mode:
+            if stage1_schedule_values is None:
+                raise ValueError("Stage-1 generator_loss requires stage1_schedule_values.")
+            stage1_er_mode = (
+                stage1_schedule_values.get("error_recycling_mode")
+                if isinstance(stage1_schedule_values, dict)
+                else getattr(stage1_schedule_values, "error_recycling_mode", None)
+            )
+            if stage1_er_mode not in {"collect_only", "collect_and_inject"}:
+                raise ValueError(
+                    f"Invalid Stage-1 error recycling mode: {stage1_er_mode!r}."
+                )
+            if er_gate is None:
+                raise ValueError("Stage-1 generator_loss requires an SP-synchronized er_gate.")
+            required_gate_keys = {"active", "context", "latent", "noise", "update_buffer"}
+            if set(er_gate) != required_gate_keys:
+                raise ValueError(
+                    f"Stage-1 er_gate keys must be {sorted(required_gate_keys)}, "
+                    f"got {sorted(er_gate)}."
+                )
+            er_active = bool(er_gate["active"])
+            er_context_requested = er_active and bool(er_gate["context"])
+            er_latent_requested = er_active and bool(er_gate["latent"])
+            er_noise_requested = er_active and bool(er_gate["noise"])
+            if stage1_er_mode == "collect_only" and (
+                er_active or er_context_requested or er_latent_requested or er_noise_requested
+            ):
+                raise ValueError("collect_only phase received an injection gate.")
+            if er_noise_requested:
+                raise ValueError("Stage-1 noise error injection is disabled by design.")
+            if self.noise_error_buffer is not None:
+                raise RuntimeError("Stage-1 must not allocate a noise error buffer.")
+            er_use_clean = not er_active
+        elif er_ready and self.er_clean_prob > 0 and random.random() < self.er_clean_prob:
             er_use_clean = True
 
         # Noise error injection (SVI's noise_prob): corrupt noise input.
@@ -218,7 +284,7 @@ class CausalDiffusion(BaseModel):
         # model learns to predict a self-correcting velocity (SVI Eq. logic).
         noise_for_train = noise
         if (
-            er_ready and not er_use_clean
+            not stage1_mode and er_ready and not er_use_clean
             and self.er_noise_inject_prob > 0
             and not self.noise_error_buffer.is_empty()
             and random.random() < self.er_noise_inject_prob
@@ -233,14 +299,29 @@ class CausalDiffusion(BaseModel):
         clean_latent_for_noise = clean_latent
         if (
             er_ready and not er_use_clean
-            and self.er_latent_inject_prob > 0
+            and (er_latent_requested if stage1_mode else self.er_latent_inject_prob > 0)
             and not self.error_buffer.is_empty()
-            and random.random() < self.er_latent_inject_prob
+            and (stage1_mode or random.random() < self.er_latent_inject_prob)
         ):
-            clean_latent_for_noise = self._inject_latent_error_buffer(
-                clean_latent, index, batch_size, num_frame
-            )
-            er_latent_injected = True
+            if stage1_mode:
+                clean_latent_for_noise, applied = self._inject_latent_error_buffer(
+                    clean_latent,
+                    index,
+                    batch_size,
+                    num_frame,
+                    expected_spatial_shape=tuple(clean_latent.shape[-2:]),
+                    return_applied=True,
+                )
+                er_latent_injected = applied > 0
+                er_latent_applied_blocks = applied
+            else:
+                clean_latent_for_noise = self._inject_latent_error_buffer(
+                    clean_latent, index, batch_size, num_frame
+                )
+                er_latent_injected = True
+                er_latent_applied_blocks = int(batch_size * (num_frame // self.num_frame_per_block))
+        else:
+            er_latent_applied_blocks = 0
 
         noisy_latents = self.scheduler.add_noise(
             clean_latent_for_noise.flatten(0, 1),
@@ -280,12 +361,31 @@ class CausalDiffusion(BaseModel):
         if (
             er_ready and not er_use_clean
             and not self.error_buffer.is_empty()
-            and random.random() < self.er_context_inject_prob
-        ):
-            clean_latent_aug = self._inject_error_buffer(
-                clean_latent_aug, index, batch_size, num_frame
+            and (
+                er_context_requested
+                if stage1_mode
+                else random.random() < self.er_context_inject_prob
             )
-            er_injected = True
+        ):
+            if stage1_mode:
+                clean_latent_aug, applied = self._inject_error_buffer(
+                    clean_latent_aug,
+                    index,
+                    batch_size,
+                    num_frame,
+                    expected_spatial_shape=tuple(clean_latent_aug.shape[-2:]),
+                    return_applied=True,
+                )
+                er_injected = applied > 0
+                er_context_applied_blocks = applied
+            else:
+                clean_latent_aug = self._inject_error_buffer(
+                    clean_latent_aug, index, batch_size, num_frame
+                )
+                er_injected = True
+                er_context_applied_blocks = int(batch_size * (num_frame // self.num_frame_per_block))
+        else:
+            er_context_applied_blocks = 0
 
         if context_frames > 0:
             clean_latent_aug = _overwrite_i2v_context(
@@ -316,16 +416,39 @@ class CausalDiffusion(BaseModel):
                     dtype=loss.dtype,
                 )
             loss_mask[:, :context_frames] = 0
+        from utils.stage1_loss import local_loss_metrics
+
+        configured_frames = int(list(getattr(self.args, "image_or_video_shape", image_or_video_shape))[1])
+        total_blocks = configured_frames // self.num_frame_per_block
+        global_frame_offset = (
+            int(getattr(self, "er_block_offset", 0)) * self.num_frame_per_block
+            if num_frame < configured_frames
+            else 0
+        )
+        metrics = local_loss_metrics(
+            loss,
+            loss_mask,
+            num_frame_per_block=self.num_frame_per_block,
+            global_frame_offset=global_frame_offset,
+            total_blocks=total_blocks,
+        )
         if loss_mask is not None:
-            loss = loss * loss_mask
-            valid_count = loss_mask_global_valid_count if loss_mask_global_valid_count is not None else loss_mask.sum()
-            loss = loss.sum() / valid_count.clamp(min=1.0)
+            valid_count = (
+                loss_mask_global_valid_count
+                if loss_mask_global_valid_count is not None
+                else metrics.count
+            )
+            loss = metrics.numerator / valid_count.clamp(min=1.0)
         else:
-            loss = loss.mean()
+            loss = metrics.numerator / metrics.count.clamp(min=1.0)
 
         log_dict = {
             "x0": clean_latent.detach(),
-            "x0_pred": x0_pred.detach()
+            "x0_pred": x0_pred.detach(),
+            "loss_numerator_local": metrics.numerator.detach(),
+            "loss_count_local": metrics.count.detach(),
+            "block_numerators_local": metrics.block_numerators.detach(),
+            "block_counts_local": metrics.block_counts.detach(),
         }
 
         # Step 5: Store prediction errors into error buffer.
@@ -348,11 +471,16 @@ class CausalDiffusion(BaseModel):
                 sigma = self.scheduler.sigmas.to(flow_pred.device)[index].reshape(
                     batch_size, num_frame, 1, 1, 1
                 ).to(flow_pred.dtype)
-                noise_err = (flow_pred.detach() - training_target.detach()) * (1.0 - sigma)
+                if not stage1_mode:
+                    noise_err = (flow_pred.detach() - training_target.detach()) * (1.0 - sigma)
 
                 use_distributed = (
                     global_step is not None
-                    and global_step <= self.er_buffer_warmup_iter
+                    and (
+                        global_step < self.er_buffer_warmup_iter
+                        if stage1_mode
+                        else global_step <= self.er_buffer_warmup_iter
+                    )
                 )
 
                 # === PHASE A: collective — runs on EVERY rank, no gating ===
@@ -360,41 +488,69 @@ class CausalDiffusion(BaseModel):
                     lat_items = self._gather_errors_for_buffer(
                         self.error_buffer, latent_err, index, batch_size, num_frame
                     )
-                    noise_items = self._gather_errors_for_buffer(
-                        self.noise_error_buffer, noise_err, index, batch_size, num_frame
-                    )
+                    noise_items = None
+                    if not stage1_mode:
+                        noise_items = self._gather_errors_for_buffer(
+                            self.noise_error_buffer, noise_err, index, batch_size, num_frame
+                        )
                 else:
                     lat_items = self._collect_local_items(
                         self.error_buffer, latent_err, index, batch_size, num_frame
                     )
-                    noise_items = self._collect_local_items(
-                        self.noise_error_buffer, noise_err, index, batch_size, num_frame
-                    )
+                    noise_items = None
+                    if not stage1_mode:
+                        noise_items = self._collect_local_items(
+                            self.noise_error_buffer, noise_err, index, batch_size, num_frame
+                        )
 
                 # === PHASE B: local replay — random.random() per-rank is OK ===
                 # When the input was clean (low-error), only update buffer with
                 # small probability to avoid flooding it with near-zero samples
                 # (SVI: clean_buffer_update_prob).
                 should_update = True
-                if er_use_clean and random.random() >= self.er_clean_buffer_update_prob:
+                if stage1_mode:
+                    should_update = (
+                        stage1_er_mode == "collect_only"
+                        or er_active
+                        or bool(er_gate["update_buffer"])
+                    )
+                elif er_use_clean and random.random() >= self.er_clean_buffer_update_prob:
                     should_update = False
-                if should_update:
+                if should_update and stage1_mode and defer_error_buffer_commit:
+                    log_dict["pending_error_buffer_items"] = lat_items
+                elif should_update:
                     self._apply_gathered_items(self.error_buffer, lat_items)
-                    self._apply_gathered_items(self.noise_error_buffer, noise_items)
+                    if not stage1_mode:
+                        self._apply_gathered_items(self.noise_error_buffer, noise_items)
             buf_stats = self.error_buffer.stats()
-            noise_buf_stats = self.noise_error_buffer.stats()
             log_dict["er_total_added"] = buf_stats["total_added"]
             log_dict["er_filled_buckets"] = buf_stats["filled_buckets"]
             log_dict["er_total_entries"] = buf_stats["total_entries"]
-            log_dict["er_noise_total_entries"] = noise_buf_stats["total_entries"]
+            log_dict["er_noise_total_entries"] = (
+                0 if stage1_mode else self.noise_error_buffer.stats()["total_entries"]
+            )
             log_dict["er_injected"] = er_injected
             log_dict["er_latent_injected"] = er_latent_injected
             log_dict["er_noise_injected"] = er_noise_injected
+            log_dict["er_logical_active"] = er_active
+            log_dict["er_logical_context"] = er_context_requested
+            log_dict["er_logical_latent"] = er_latent_requested
+            log_dict["er_context_applied_blocks"] = er_context_applied_blocks
+            log_dict["er_latent_applied_blocks"] = er_latent_applied_blocks
 
         return loss, log_dict
 
 
-    def _inject_error_buffer(self, clean_latent_aug, index, batch_size, num_frame):
+    def _inject_error_buffer(
+        self,
+        clean_latent_aug,
+        index,
+        batch_size,
+        num_frame,
+        *,
+        expected_spatial_shape=None,
+        return_applied=False,
+    ):
         """Inject errors into the clean prefix (E_img).
 
         2D (position-bucketed): the i-th LOCAL prefix block draws from
@@ -409,25 +565,42 @@ class CausalDiffusion(BaseModel):
         block_size = self.num_frame_per_block
         num_blocks = num_frame // block_size
         result = clean_latent_aug.clone()
+        applied = 0
         for b in range(batch_size):
             for blk in range(num_blocks):
                 if self.er_skip_block_0 and (self.er_block_offset + blk) == 0:
                     continue
                 if self.er_num_blocks > 0:
+                    sample_kwargs = {}
+                    if expected_spatial_shape is not None:
+                        sample_kwargs["expected_spatial_shape"] = expected_spatial_shape
                     err = self.error_buffer.sample_pos_any_t(
-                        blk, device=result.device, dtype=result.dtype
+                        blk, device=result.device, dtype=result.dtype, **sample_kwargs
                     )
                 else:
+                    sample_kwargs = {}
+                    if expected_spatial_shape is not None:
+                        sample_kwargs["expected_spatial_shape"] = expected_spatial_shape
                     err = self.error_buffer.sample_global(
-                        device=result.device, dtype=result.dtype
+                        device=result.device, dtype=result.dtype, **sample_kwargs
                     )
                 if err is not None:
                     start = blk * block_size
                     end = start + block_size
                     result[b, start:end] = result[b, start:end] + err
-        return result
+                    applied += 1
+        return (result, applied) if return_applied else result
 
-    def _inject_latent_error_buffer(self, clean_latent, index, batch_size, num_frame):
+    def _inject_latent_error_buffer(
+        self,
+        clean_latent,
+        index,
+        batch_size,
+        num_frame,
+        *,
+        expected_spatial_shape=None,
+        return_applied=False,
+    ):
         """Inject errors into clean_latent before noising (E_vid).
 
         Matches BOTH block_position (LOCAL) and timestep when the buffer is
@@ -437,19 +610,27 @@ class CausalDiffusion(BaseModel):
         num_blocks = num_frame // block_size
         index_per_block = index[:, ::block_size]
         result = clean_latent.clone()
+        applied = 0
         for b in range(batch_size):
             for blk in range(num_blocks):
                 t_idx = index_per_block[b, blk].item()
                 pos = blk if self.er_num_blocks > 0 else None
+                sample_kwargs = {}
+                if expected_spatial_shape is not None:
+                    sample_kwargs["expected_spatial_shape"] = expected_spatial_shape
                 err = self.error_buffer.sample(
-                    t_idx, device=result.device, dtype=result.dtype,
+                    t_idx,
+                    device=result.device,
+                    dtype=result.dtype,
                     block_pos=pos,
+                    **sample_kwargs,
                 )
                 if err is not None:
                     start = blk * block_size
                     end = start + block_size
                     result[b, start:end] = result[b, start:end] + err
-        return result
+                    applied += 1
+        return (result, applied) if return_applied else result
 
     def _inject_noise_error_buffer(self, noise, index, batch_size, num_frame):
         """Inject errors into the noise (E_noise).
@@ -565,6 +746,8 @@ class CausalDiffusion(BaseModel):
         Here we encapsulate the inference code with a model-dependent outside function.
         We pass our FSDP-wrapped modules into the pipeline to save memory.
         """
+        from pipeline import CausalDiffusionInferencePipeline
+
         self.inference_pipeline = CausalDiffusionInferencePipeline(
             args=self.args,
             device=self.device,

@@ -8,6 +8,19 @@ from wan_5b.distributed.sp_training import (
 
 
 class I2VSequenceParallelConfigTest(unittest.TestCase):
+    def test_stage1_24_latents_partition_as_three_8_frame_blocks(self):
+        cfg = SimpleNamespace(
+            i2v=True,
+            independent_first_frame=True,
+            image_or_video_shape=[1, 24, 48, 30, 52],
+        )
+        self.assertEqual(sp_training_sequence_frame_count(cfg), 24)
+        validate_sequence_parallel_training_config(
+            cfg,
+            sp_size=3,
+            num_frame_per_block=8,
+        )
+
     def test_i2v_training_frames_use_full_configured_sequence(self):
         cfg = SimpleNamespace(
             i2v=True,

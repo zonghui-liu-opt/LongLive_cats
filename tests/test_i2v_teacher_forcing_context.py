@@ -63,6 +63,24 @@ class _FakeBuffer:
         }
 
 
+class _Stage1Buffer(_FakeBuffer):
+    def __init__(self):
+        self.items = []
+
+    def sample(self, timestep_index, device, dtype, block_pos=None, expected_spatial_shape=None):
+        return torch.full((2, 1, 1, 1), 2.0, device=device, dtype=dtype)
+
+    def sample_global(self, device, dtype, expected_spatial_shape=None):
+        return torch.full((2, 1, 1, 1), 3.0, device=device, dtype=dtype)
+
+    def stats(self):
+        return {
+            "total_added": len(self.items),
+            "filled_buckets": "1/1",
+            "total_entries": len(self.items),
+        }
+
+
 class _StubBaseModel(torch.nn.Module):
     def _get_timestep(
         self,
@@ -139,6 +157,58 @@ def _load_causal_diffusion_with_stubs():
 
 
 class I2VTeacherForcingContextTest(unittest.TestCase):
+    def test_stage1_stages_single_buffer_updates_and_reports_realized_blocks(self):
+        CausalDiffusion = _load_causal_diffusion_with_stubs()
+        model = CausalDiffusion.__new__(CausalDiffusion)
+        torch.nn.Module.__init__(model)
+        model.device = torch.device("cpu")
+        model.dtype = torch.float32
+        model.args = SimpleNamespace(i2v=True, image_or_video_shape=[1, 4, 1, 1, 1])
+        model.stage1_mode = True
+        model.independent_first_frame = True
+        model.num_frame_per_block = 2
+        model.scheduler = _FakeScheduler()
+        model.teacher_forcing = True
+        model.noise_augmentation_max_timestep = 0
+        model.generator = _FakeGenerator()
+        model.error_buffer = _Stage1Buffer()
+        model.noise_error_buffer = None
+        model.er_num_blocks = 0
+        model.er_block_offset = 0
+        model.er_start_step = 0
+        model.er_buffer_warmup_iter = 75
+        model.er_skip_block_0 = False
+
+        clean_latent = torch.zeros(1, 4, 1, 1, 1)
+        initial_latent = torch.full((1, 1, 1, 1, 1), 7.0)
+        _, log = model.generator_loss(
+            image_or_video_shape=[1, 4, 1, 1, 1],
+            conditional_dict={"prompt_embeds": torch.zeros(1, 1)},
+            unconditional_dict={},
+            clean_latent=clean_latent,
+            initial_latent=initial_latent,
+            global_step=75,
+            stage1_schedule_values={"error_recycling_mode": "collect_and_inject"},
+            er_gate={
+                "active": True,
+                "context": True,
+                "latent": True,
+                "noise": False,
+                "update_buffer": False,
+            },
+            defer_error_buffer_commit=True,
+        )
+
+        recorded = model.generator.recorded
+        # Explicit I2V input wins after both latent and context injection.
+        self.assertTrue(torch.equal(recorded["noisy_image_or_video"][:, :1], initial_latent))
+        self.assertTrue(torch.equal(recorded["clean_x"][:, :1], initial_latent))
+        self.assertEqual(log["er_context_applied_blocks"], 2)
+        self.assertEqual(log["er_latent_applied_blocks"], 2)
+        self.assertEqual(len(log["pending_error_buffer_items"]), 2)
+        self.assertEqual(log["er_noise_total_entries"], 0)
+        self.assertEqual(log["loss_count_local"].item(), 3)
+
     def test_teacher_forcing_keeps_i2v_context_clean_after_augmentation(self):
         CausalDiffusion = _load_causal_diffusion_with_stubs()
         model = CausalDiffusion.__new__(CausalDiffusion)

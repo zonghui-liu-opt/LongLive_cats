@@ -1,5 +1,6 @@
 import types
 from typing import List, Optional
+import json
 import os
 import torch
 from torch import nn
@@ -13,9 +14,131 @@ from wan_5b.modules.t5 import umt5_xxl
 from wan_5b.modules.causal_model import CausalWanModel
 
 
+DEFAULT_WAN_ARCHITECTURE_ROOT = "wan_models/Wan2.2-TI2V-5B"
+DEFAULT_WAN_T5_CHECKPOINT = (
+    "wan_models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth"
+)
+DEFAULT_WAN_TOKENIZER_DIR = "wan_models/Wan2.2-TI2V-5B/google/umt5-xxl"
+DEFAULT_WAN_VAE_CHECKPOINT = "wan_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+
+_WAN_ARCHITECTURE_FIELDS = (
+    "model_type",
+    "patch_size",
+    "text_len",
+    "in_dim",
+    "dim",
+    "ffn_dim",
+    "freq_dim",
+    "text_dim",
+    "out_dim",
+    "num_heads",
+    "num_layers",
+    "window_size",
+    "qk_norm",
+    "cross_attn_norm",
+    "eps",
+)
+
+
+def _architecture_config_from_root(architecture_root, model_name):
+    """Load architecture values without loading a model checkpoint."""
+    root = os.path.abspath(os.path.expanduser(os.fspath(architecture_root)))
+    config_path = os.path.join(root, "config.json")
+    raw_config = {}
+    if model_name == "Wan2.2-TI2V-5B":
+        # Some Diffusers configs omit constructor values listed in
+        # ``ignore_for_config``.  Seed those locked TI2V values from the same
+        # canonical config used by the flat-checkpoint inference loader, then
+        # let an explicit config.json override them.
+        from wan_5b.configs import WAN_CONFIGS
+
+        raw_config.update(dict(WAN_CONFIGS["ti2v-5B"]))
+    if os.path.isfile(config_path):
+        with open(config_path, "r", encoding="utf-8") as handle:
+            file_config = json.load(handle)
+        if not isinstance(file_config, dict):
+            raise ValueError(f"Wan architecture config must be an object: {config_path}")
+        raw_config.update(file_config)
+    elif model_name == "Wan2.2-TI2V-5B" and architecture_root == DEFAULT_WAN_ARCHITECTURE_ROOT:
+        # Preserve the legacy default while allowing architecture-only tools to
+        # run against config-less TI2V weight layouts.
+        pass
+    else:
+        raise FileNotFoundError(
+            f"Wan architecture_root must contain config.json: {config_path}"
+        )
+
+    missing = [field for field in _WAN_ARCHITECTURE_FIELDS if field not in raw_config]
+    if missing:
+        raise ValueError(
+            f"Wan architecture config is missing required fields {missing}: {config_path}"
+        )
+    return {field: raw_config[field] for field in _WAN_ARCHITECTURE_FIELDS}
+
+
+def build_wan_model(
+    *,
+    model_name="Wan2.2-TI2V-5B",
+    is_causal=False,
+    architecture_root=None,
+    init_weights=True,
+    local_attn_size=-1,
+    sink_size=0,
+    num_frame_per_block=1,
+):
+    """Build a Wan DiT with explicit architecture and weight-loading policy.
+
+    ``init_weights=True`` preserves the legacy ``from_pretrained`` behavior.
+    ``False`` constructs only the architecture from ``config.json`` (or the
+    built-in legacy TI2V config) and never reads a model weight file.
+    """
+    architecture_root = os.fspath(
+        architecture_root
+        if architecture_root is not None
+        else f"wan_models/{model_name}"
+    )
+    model_cls = CausalWanModel if is_causal else WanModel
+    if init_weights:
+        overrides = {}
+        if is_causal:
+            overrides = {
+                "local_attn_size": local_attn_size,
+                "sink_size": sink_size,
+                "num_frame_per_block": num_frame_per_block,
+            }
+        return model_cls.from_pretrained(architecture_root, **overrides)
+
+    architecture_kwargs = _architecture_config_from_root(
+        architecture_root, model_name
+    )
+    if is_causal:
+        architecture_kwargs.pop("window_size")
+        architecture_kwargs.update(
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            num_frame_per_block=num_frame_per_block,
+        )
+    return model_cls(**architecture_kwargs)
+
+
 class WanTextEncoder(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        t5_checkpoint=None,
+        tokenizer_dir=None,
+        device=None,
+    ) -> None:
         super().__init__()
+
+        t5_checkpoint = os.path.abspath(os.path.expanduser(os.fspath(
+            t5_checkpoint or DEFAULT_WAN_T5_CHECKPOINT
+        )))
+        tokenizer_dir = os.path.abspath(os.path.expanduser(os.fspath(
+            tokenizer_dir or DEFAULT_WAN_TOKENIZER_DIR
+        )))
+        if device is None:
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self._device = torch.device(device)
 
         self.text_encoder = umt5_xxl(
             encoder_only=True,
@@ -24,39 +147,41 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(t5_checkpoint,
                        map_location='cpu', weights_only=False)
         )
-        
-        # Move text encoder to GPU if available
-        if torch.cuda.is_available():
-            self.text_encoder = self.text_encoder.cuda()
+
+        self.text_encoder = self.text_encoder.to(self._device)
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.2-TI2V-5B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=tokenizer_dir, seq_len=512, clean='whitespace')
 
     @property
     def device(self):
-        # Assume we are always on GPU
-        return torch.cuda.current_device()
+        try:
+            return next(self.text_encoder.parameters()).device
+        except StopIteration:
+            return self._device
 
-    def forward(self, text_prompts: List[str]) -> dict:
+    def forward(self, text_prompts: List[str], return_mask: bool = False) -> dict:
         ids, mask = self.tokenizer(
             text_prompts, return_mask=True, add_special_tokens=True)
         ids = ids.to(self.device)
         mask = mask.to(self.device)
-        seq_lens = mask.gt(0).sum(dim=1).long()
+        prompt_mask = mask.gt(0)
+        seq_lens = prompt_mask.sum(dim=1).long()
         context = self.text_encoder(ids, mask)
         for u, v in zip(context, seq_lens):
             u[v:] = 0.0  # set padding to 0.0
 
-        return {
-            "prompt_embeds": context
-        }
+        result = {"prompt_embeds": context}
+        if return_mask:
+            result["prompt_mask"] = prompt_mask
+        return result
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, vae_checkpoint=None):
         super().__init__()
         mean = [
                 -0.2289,
@@ -163,7 +288,9 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
+            pretrained_path=os.path.abspath(os.path.expanduser(os.fspath(
+                vae_checkpoint or DEFAULT_WAN_VAE_CHECKPOINT
+            ))),
         ).eval().requires_grad_(False)
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
@@ -286,15 +413,20 @@ class WanDiffusionWrapper(torch.nn.Module):
             t_scale=1.0,
             rope_method="linear",
             original_seq_len=None,
+            architecture_root=None,
+            init_weights=True,
     ):
         super().__init__()
 
-        if is_causal:
-            self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
-                num_frame_per_block=num_frame_per_block)
-        else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+        self.model = build_wan_model(
+            model_name=model_name,
+            is_causal=is_causal,
+            architecture_root=architecture_root,
+            init_weights=init_weights,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            num_frame_per_block=num_frame_per_block,
+        )
         self.model.eval()
         self.model.t_scale = t_scale
         self.model.rope_method = rope_method

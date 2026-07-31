@@ -2,7 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import random
+from collections import Counter
+
 import torch
+
+
+ERROR_BUFFER_STATE_SCHEMA = "longlive_error_buffer"
+ERROR_BUFFER_STATE_VERSION = 2
 
 
 class ErrorBuffer:
@@ -50,12 +56,18 @@ class ErrorBuffer:
         shard_rank=0,
         shard_size=1,
     ):
-        self.num_buckets = num_buckets
-        self.max_size = max_size_per_bucket
-        self.num_train_timesteps = num_train_timesteps
-        self.modulate_factor = modulate_factor
+        self.num_buckets = int(num_buckets)
+        self.max_size = int(max_size_per_bucket)
+        self.num_train_timesteps = int(num_train_timesteps)
+        self.modulate_factor = float(modulate_factor)
         self.replacement_strategy = replacement_strategy
-        self.bucket_width = num_train_timesteps / num_buckets
+        if self.num_buckets <= 0:
+            raise ValueError("num_buckets must be positive.")
+        if self.max_size <= 0:
+            raise ValueError("max_size_per_bucket must be positive.")
+        if self.num_train_timesteps <= 0:
+            raise ValueError("num_train_timesteps must be positive.")
+        self.bucket_width = self.num_train_timesteps / self.num_buckets
         self.num_blocks = int(num_blocks) if num_blocks else 0
         # ``global_block_offset`` is only used for stats / debug display so
         # users can tell which absolute positions of the full sequence this
@@ -65,9 +77,21 @@ class ErrorBuffer:
 
         self.shard_rank = int(shard_rank)
         self.shard_size = max(int(shard_size), 1)
+        if not 0 <= self.shard_rank < self.shard_size:
+            raise ValueError(
+                f"shard_rank must be in [0, {self.shard_size}), got "
+                f"{self.shard_rank}."
+            )
         self._owned_t_buckets = sorted(
-            t for t in range(num_buckets) if t % self.shard_size == self.shard_rank
+            t
+            for t in range(self.num_buckets)
+            if t % self.shard_size == self.shard_rank
         )
+        if not self._owned_t_buckets:
+            raise ValueError(
+                f"shard_rank={self.shard_rank}/{self.shard_size} owns no timestep "
+                f"buckets out of num_buckets={self.num_buckets}."
+            )
 
         if self.num_blocks > 0:
             self.buckets = {
@@ -107,6 +131,31 @@ class ErrorBuffer:
             return (p, t_bucket)
         return t_bucket
 
+    @staticmethod
+    def _normalize_spatial_shape(expected_spatial_shape):
+        if expected_spatial_shape is None:
+            return None
+        shape = tuple(int(value) for value in expected_spatial_shape)
+        if len(shape) != 2 or any(value <= 0 for value in shape):
+            raise ValueError(
+                "expected_spatial_shape must contain positive (height, width), "
+                f"got {expected_spatial_shape!r}."
+            )
+        return shape
+
+    @classmethod
+    def _filter_spatial_shape(cls, entries, expected_spatial_shape):
+        expected = cls._normalize_spatial_shape(expected_spatial_shape)
+        if expected is None:
+            return entries
+        return [
+            entry
+            for entry in entries
+            if torch.is_tensor(entry)
+            and entry.ndim >= 2
+            and tuple(entry.shape[-2:]) == expected
+        ]
+
     # ------------------------------------------------------------------ add
     def add(self, error_block, timestep_index, block_pos=None):
         """Store a single block error into the matching bucket.
@@ -132,30 +181,57 @@ class ErrorBuffer:
                 buf.pop(0)
                 buf.append(entry)
             elif self.replacement_strategy == "l2":
-                stacked = torch.stack(buf)
-                dists = (stacked - entry.unsqueeze(0)).flatten(1).norm(dim=1)
-                most_similar = torch.argmin(dists).item()
-                buf[most_similar] = entry
+                # A base bucket may contain both orientations.  Its capacity is
+                # still shared, but L2 distance is only defined for identical
+                # tensor shapes.  If no comparable entry exists, replace one
+                # slot randomly instead of stacking incompatible tensors.
+                comparable_indices = [
+                    index
+                    for index, candidate in enumerate(buf)
+                    if tuple(candidate.shape) == tuple(entry.shape)
+                ]
+                if comparable_indices:
+                    stacked = torch.stack(
+                        [buf[index] for index in comparable_indices]
+                    )
+                    dists = (
+                        stacked.float() - entry.unsqueeze(0).float()
+                    ).flatten(1).norm(dim=1)
+                    closest = comparable_indices[torch.argmin(dists).item()]
+                    buf[closest] = entry
+                else:
+                    buf[random.randint(0, len(buf) - 1)] = entry
             else:  # "random" (default)
                 idx = random.randint(0, self.max_size - 1)
                 buf[idx] = entry
         self.total_added += 1
 
     # ------------------------------------------------------------------ sample
-    def sample(self, timestep_index, device, dtype, block_pos=None):
+    def sample(
+        self,
+        timestep_index,
+        device,
+        dtype,
+        block_pos=None,
+        expected_spatial_shape=None,
+    ):
         """Sample one entry matching (block_pos, timestep_index) when 2D, or
         just timestep_index when 1D.  Non-owned timestep buckets are
         transparently remapped to the nearest owned one.  Returns None if the
         (remapped) bucket is empty."""
         t = self._nearest_owned_t(self._t_bucket(timestep_index))
         key = self._make_key(t, block_pos)
-        buf = self.buckets[key]
+        buf = self._filter_spatial_shape(
+            self.buckets[key], expected_spatial_shape
+        )
         if not buf:
             return None
         err = random.choice(buf)
         return self._modulate(err).to(device=device, dtype=dtype)
 
-    def sample_pos_any_t(self, block_pos, device, dtype):
+    def sample_pos_any_t(
+        self, block_pos, device, dtype, expected_spatial_shape=None
+    ):
         """For 2D buffers: sample at the given position, with random timestep.
 
         This is the natural choice for context (E_img) injection — the clean
@@ -167,21 +243,29 @@ class ErrorBuffer:
         Only owned timestep buckets are scanned.
         """
         if self.num_blocks <= 0:
-            return self.sample_global(device, dtype)
+            return self.sample_global(
+                device, dtype, expected_spatial_shape=expected_spatial_shape
+            )
         p = max(0, min(int(block_pos), self.num_blocks - 1))
         all_entries = []
         for t in self._owned_t_buckets:
             all_entries.extend(self.buckets[(p, t)])
+        all_entries = self._filter_spatial_shape(
+            all_entries, expected_spatial_shape
+        )
         if not all_entries:
             return None
         err = random.choice(all_entries)
         return self._modulate(err).to(device=device, dtype=dtype)
 
-    def sample_global(self, device, dtype):
+    def sample_global(self, device, dtype, expected_spatial_shape=None):
         """Sample one entry uniformly from ALL buckets (legacy SVI E_img)."""
         all_entries = []
         for buf in self.buckets.values():
             all_entries.extend(buf)
+        all_entries = self._filter_spatial_shape(
+            all_entries, expected_spatial_shape
+        )
         if not all_entries:
             return None
         err = random.choice(all_entries)
@@ -215,6 +299,16 @@ class ErrorBuffer:
             "filled_buckets": f"{filled}/{denom}",
             "total_entries": total,
         }
+        shape_counts = Counter(
+            tuple(entry.shape[-2:])
+            for bucket in self.buckets.values()
+            for entry in bucket
+            if torch.is_tensor(entry) and entry.ndim >= 2
+        )
+        out["entries_by_spatial_shape"] = {
+            f"{height}x{width}": count
+            for (height, width), count in sorted(shape_counts.items())
+        }
         if self.shard_size > 1:
             out["shard"] = f"shard_rank={self.shard_rank}/{self.shard_size} ({num_owned_t}/{self.num_buckets} t-buckets)"
         if self.num_blocks > 0:
@@ -227,16 +321,22 @@ class ErrorBuffer:
         # Keys are tuples (pos, t) when 2D — torch.save handles them fine
         # via pickle. We serialize the bucket layout so loaders can validate.
         return {
+            "state_schema": ERROR_BUFFER_STATE_SCHEMA,
+            "state_version": ERROR_BUFFER_STATE_VERSION,
             "buckets": {k: list(v) for k, v in self.buckets.items()},
             "total_added": self.total_added,
             "num_blocks": self.num_blocks,
             "num_buckets": self.num_buckets,
+            "max_size_per_bucket": self.max_size,
+            "num_train_timesteps": self.num_train_timesteps,
+            "modulate_factor": self.modulate_factor,
+            "replacement_strategy": self.replacement_strategy,
             "global_block_offset": self.global_block_offset,
             "shard_rank": self.shard_rank,
             "shard_size": self.shard_size,
         }
 
-    def load_state_dict(self, state, strict_offset=True):
+    def load_state_dict(self, state, strict_offset=True, strict_schema=False):
         """Restore buckets from a serialized state.
 
         Args:
@@ -251,6 +351,9 @@ class ErrorBuffer:
                 Pass ``strict_offset=False`` only for backward-compat
                 with checkpoints saved before this field existed.
         """
+        if strict_schema:
+            self._validate_strict_state(state)
+
         if self.num_blocks > 0 and strict_offset:
             saved_off = state.get("global_block_offset", None)
             if saved_off is None:
@@ -271,7 +374,13 @@ class ErrorBuffer:
         # we just load whichever buckets overlap).
         saved_shard_size = int(state.get("shard_size", state.get("dp_size", 1)))
         saved_shard_rank = int(state.get("shard_rank", state.get("dp_rank", 0)))
-        if saved_shard_size != self.shard_size or saved_shard_rank != self.shard_rank:
+        if (
+            not strict_schema
+            and (
+                saved_shard_size != self.shard_size
+                or saved_shard_rank != self.shard_rank
+            )
+        ):
             import logging
             logging.warning(
                 f"[ErrorBuffer] Shard layout changed: checkpoint was "
@@ -291,6 +400,74 @@ class ErrorBuffer:
             elif str(k) in saved:
                 self.buckets[k] = saved[str(k)]
         self.total_added = int(state.get("total_added", 0))
+
+    def _validate_strict_state(self, state):
+        if state.get("state_schema") != ERROR_BUFFER_STATE_SCHEMA:
+            raise RuntimeError(
+                "ErrorBuffer strict load requires state_schema="
+                f"{ERROR_BUFFER_STATE_SCHEMA!r}, got "
+                f"{state.get('state_schema')!r}."
+            )
+        if int(state.get("state_version", -1)) != ERROR_BUFFER_STATE_VERSION:
+            raise RuntimeError(
+                "Unsupported ErrorBuffer state_version="
+                f"{state.get('state_version')!r}; expected "
+                f"{ERROR_BUFFER_STATE_VERSION}."
+            )
+
+        expected_fields = {
+            "num_blocks": self.num_blocks,
+            "num_buckets": self.num_buckets,
+            "max_size_per_bucket": self.max_size,
+            "num_train_timesteps": self.num_train_timesteps,
+            "modulate_factor": self.modulate_factor,
+            "replacement_strategy": self.replacement_strategy,
+            "global_block_offset": self.global_block_offset,
+            "shard_rank": self.shard_rank,
+            "shard_size": self.shard_size,
+        }
+        for field, expected in expected_fields.items():
+            if field not in state or state[field] != expected:
+                raise RuntimeError(
+                    f"ErrorBuffer strict load mismatch for {field}: "
+                    f"checkpoint={state.get(field)!r}, current={expected!r}."
+                )
+
+        saved_buckets = state.get("buckets")
+        if not isinstance(saved_buckets, dict):
+            raise RuntimeError("ErrorBuffer strict load requires a buckets mapping.")
+        if set(saved_buckets) != set(self.buckets):
+            missing = sorted(set(self.buckets) - set(saved_buckets), key=repr)
+            unexpected = sorted(set(saved_buckets) - set(self.buckets), key=repr)
+            raise RuntimeError(
+                "ErrorBuffer strict bucket-key mismatch: "
+                f"missing={missing}, unexpected={unexpected}."
+            )
+
+        entry_count = 0
+        for key, entries in saved_buckets.items():
+            if not isinstance(entries, (list, tuple)):
+                raise RuntimeError(
+                    f"ErrorBuffer bucket {key!r} must contain a list/tuple."
+                )
+            if len(entries) > self.max_size:
+                raise RuntimeError(
+                    f"ErrorBuffer bucket {key!r} has {len(entries)} entries, "
+                    f"exceeding capacity {self.max_size}."
+                )
+            for entry in entries:
+                if not torch.is_tensor(entry) or entry.ndim < 2:
+                    raise RuntimeError(
+                        f"ErrorBuffer bucket {key!r} contains an invalid entry."
+                    )
+            entry_count += len(entries)
+
+        total_added = int(state.get("total_added", -1))
+        if total_added < entry_count:
+            raise RuntimeError(
+                f"ErrorBuffer total_added={total_added} is smaller than the "
+                f"{entry_count} serialized entries."
+            )
 
 
 def build_error_buffer(config, num_blocks=0, global_block_offset=0,
