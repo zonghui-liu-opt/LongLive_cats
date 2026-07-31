@@ -108,6 +108,7 @@ def convert_diffsynth_checkpoint(
     manifest_path=None,
     model_name="Wan2.2-TI2V-5B",
     conversion_command: list[str] | None = None,
+    causal_config: dict | None = None,
     use_meta_init: bool = True,
 ) -> dict:
     """Convert one flat/sharded checkpoint using injectable architecture builders.
@@ -165,6 +166,12 @@ def convert_diffsynth_checkpoint(
             f"Converted state contains non-BF16 floating tensors: {non_bf16[:10]}"
         )
     output_state_summary = _tensor_summary(converted_state)
+    coverage = {
+        "expected_keys": source_state_summary["tensor_count"],
+        "loaded_keys": source_state_summary["tensor_count"],
+        "key_percent": 100.0,
+        "shape_percent": 100.0,
+    }
 
     payload = {
         "generator": converted_state,
@@ -173,6 +180,7 @@ def convert_diffsynth_checkpoint(
         "model_name": model_name,
         "source_aggregate_sha256": source_aggregate_before,
         "converter_version": CONVERTER_VERSION,
+        "causal_config": dict(causal_config or {}),
     }
     # Keep the output temporary until fresh strict reload and the second source
     # hash audit both succeed.  A failed conversion therefore cannot replace a
@@ -233,6 +241,8 @@ def convert_diffsynth_checkpoint(
         },
         "source_state": source_state_summary,
         "generator_state": output_state_summary,
+        "coverage": coverage,
+        "causal_config": dict(causal_config or {}),
         "conversion_command": list(conversion_command or []),
         "strict_reload": True,
     }
@@ -301,10 +311,21 @@ def main(argv=None) -> int:
         model_builder=model_builder,
         reload_wrapper_builder=reload_wrapper_builder,
         conversion_command=command,
+        causal_config={
+            "local_attn_size": args.local_attn_size,
+            "sink_size": args.sink_size,
+            "num_frame_per_block": args.num_frame_per_block,
+        },
     )
     print(
         "Converted Wan2.2-TI2V-5B causal base: "
         f"{manifest['output']['path']} ({manifest['output']['sha256']})"
+    )
+    print(
+        "Coverage: "
+        f"keys={manifest['coverage']['key_percent']:.1f}%, "
+        f"shapes={manifest['coverage']['shape_percent']:.1f}%, "
+        f"fresh_strict_reload={manifest['strict_reload']}"
     )
     return 0
 

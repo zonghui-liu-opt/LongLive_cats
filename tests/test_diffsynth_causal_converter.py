@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from safetensors.torch import save_file
@@ -45,6 +46,11 @@ def _convert(source, output):
         reload_wrapper_builder=TinyGeneratorWrapper,
         model_name="tiny-ti2v",
         conversion_command=["converter", "--tiny"],
+        causal_config={
+            "local_attn_size": -1,
+            "sink_size": 0,
+            "num_frame_per_block": 8,
+        },
     )
 
 
@@ -76,10 +82,18 @@ def test_direct_safetensors_converts_bf16_and_strictly_reloads(tmp_path):
     }
     assert manifest["conversion_command"] == ["converter", "--tiny"]
     assert manifest["strict_reload"] is True
+    assert manifest["coverage"] == {
+        "expected_keys": 3,
+        "loaded_keys": 3,
+        "key_percent": 100.0,
+        "shape_percent": 100.0,
+    }
+    assert manifest["causal_config"]["num_frame_per_block"] == 8
     assert manifest["output"]["sha256"] == sha256_file(output)
 
     payload = torch.load(output, map_location="cpu", weights_only=False)
     assert payload["checkpoint_format"] == CHECKPOINT_FORMAT
+    assert payload["causal_config"]["num_frame_per_block"] == 8
     assert set(payload["generator"]) == {
         "model.proj.weight",
         "model.proj.bias",
@@ -346,3 +360,24 @@ def test_vae_checkpoint_path_is_explicit(tmp_path, monkeypatch):
     checkpoint = tmp_path / "vae.pt"
     wrapper_module.WanVAEWrapper(vae_checkpoint=checkpoint)
     assert captured["path"] == str(checkpoint.resolve())
+
+
+def test_build_vae_uses_explicit_model_path(tmp_path, monkeypatch):
+    wrapper_module = _import_wan_wrapper(monkeypatch)
+    captured = {}
+
+    class FakeVAE:
+        def __init__(self, vae_checkpoint=None):
+            captured["vae_checkpoint"] = vae_checkpoint
+
+    checkpoint = tmp_path / "Wan2.2_VAE.pth"
+    monkeypatch.setattr(wrapper_module, "WanVAEWrapper", FakeVAE)
+    vae = wrapper_module.build_vae_5b(
+        SimpleNamespace(
+            vae_type="wan",
+            model_paths={"vae_checkpoint": str(checkpoint)},
+        )
+    )
+
+    assert isinstance(vae, FakeVAE)
+    assert captured["vae_checkpoint"] == str(checkpoint)

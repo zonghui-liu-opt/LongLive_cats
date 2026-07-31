@@ -80,6 +80,29 @@ python scripts/convert_diffsynth_wan22_to_longlive.py \
 只有 converter 报告 100% key/shape coverage、fresh causal wrapper `strict=True` reload，
 且源文件转换前后 hash 不变，才能继续。
 
+### 3.1 使用仓库 testsets 验证转换和 causal 视频生成
+
+转换完成后，建议在 cache/正式训练前运行独立的 6-case 门禁。它会重新审计 source/base/
+manifest，严格解析 `testsets/metadata_6cases_480x832.csv`，不缩放地将首帧预处理成 causal
+I2V carrier 格式，按横竖屏生成两份 config，顺序推理并验证全部 93-frame/24fps MP4：
+
+```bash
+export LONG_LIVE_STAGE1_VALIDATION_DIR=/local_nvme/stage1_causal_base_validation_seed1
+
+CUDA_VISIBLE_DEVICES=0 python scripts/run_stage1_causal_testsets_validation.py \
+  --metadata testsets/metadata_6cases_480x832.csv \
+  --work-dir "$LONG_LIVE_STAGE1_VALIDATION_DIR" \
+  --sampling-steps 50 \
+  --guidance-scale 5.0 \
+  --seed 1
+```
+
+最终 `validation_report.json` 必须为 `status=pass`、`sample_count=6`，并人工查看 3 个横屏和
+3 个竖屏 MP4。完整格式、指标、prepare-only 命令和结果解释见
+[`STAGE1_CAUSAL_BASE_VALIDATION_ZH.md`](STAGE1_CAUSAL_BASE_VALIDATION_ZH.md)。converted base
+尚未做 causal LoRA 适配，因此这一门禁验证转换与运行链路，不替代 Stage‑1 merge 后的最终
+动作效果选型。
+
 ## 4. 使用 4×H100 一次性构建 600 条离线 cache
 
 cache 只编码视频、首帧和 prompt，因此只读取 auxiliary 目录中的 VAE、T5 与

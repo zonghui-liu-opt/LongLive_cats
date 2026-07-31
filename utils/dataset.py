@@ -359,7 +359,13 @@ class MultiVideoConcatDataset(Dataset):
         if not self.caption_dir.exists():
             raise ValueError(f"Caption directory not found: {self.caption_dir}")
         
-        self.folders = [d for d in self.data_dir.iterdir() if d.is_dir()]
+        # Stable folder order is part of the causal validation output contract:
+        # rank0-<idx> filenames must map back to the same source CSV row on
+        # every filesystem and every repeated run.
+        self.folders = sorted(
+            (d for d in self.data_dir.iterdir() if d.is_dir()),
+            key=lambda path: path.name,
+        )
         if len(self.folders) == 0:
             raise ValueError(f"No subdirectories found in {self.data_dir}")
 

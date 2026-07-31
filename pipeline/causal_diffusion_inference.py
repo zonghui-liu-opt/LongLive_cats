@@ -41,9 +41,15 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         model_name = getattr(args.model_kwargs, "model_name", "Wan2.2-TI2V-5B")
         if "5B" not in model_name:
             raise ValueError(f"Only Wan2.2-TI2V-5B is supported in this release, got {model_name}")
+        model_paths = getattr(args, "model_paths", {}) or {}
+        t5_checkpoint = model_paths.get("t5_checkpoint", None)
+        tokenizer_dir = model_paths.get("tokenizer_dir", None)
         self.generator = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
-        self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
+        self.text_encoder = WanTextEncoder(
+            t5_checkpoint=t5_checkpoint,
+            tokenizer_dir=tokenizer_dir,
+        ) if text_encoder is None else text_encoder
         self.vae = build_vae_5b(args) if vae is None else vae
 
         # iter-33: optionally compile the VAE decoder (cuda:2). The Python

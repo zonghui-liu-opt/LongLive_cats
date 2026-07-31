@@ -35,6 +35,23 @@ class I2VDatasetFrameAccountingTest(unittest.TestCase):
             self.assertEqual(dataset.first_chunk_frames, 33)
             self.assertEqual(dataset.total_segments, 4)
 
+    def test_folder_order_is_stable_for_indexed_inference_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("z-last", "a-first"):
+                (root / "video" / name).mkdir(parents=True)
+                (root / "caption" / name).mkdir(parents=True)
+            dataset = MultiVideoConcatDataset(
+                data_dir=str(root),
+                video_size=(480, 832),
+                total_frames=29,
+                independent_first_frame=True,
+                num_frame_per_block=8,
+                temporal_compression_ratio=4,
+            )
+
+            self.assertEqual([path.name for path in dataset.folders], ["a-first", "z-last"])
+
 
 if __name__ == "__main__":
     unittest.main()

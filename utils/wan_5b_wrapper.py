@@ -699,9 +699,11 @@ _MG_LIGHTVAE_DEFAULT_PATHS = {
 def build_vae_5b(args):
     """Return the 5B VAE wrapper requested by args.vae_type."""
     vae_type = str(getattr(args, "vae_type", "wan")).lower().strip()
+    model_paths = getattr(args, "model_paths", {}) or {}
+    vae_checkpoint = model_paths.get("vae_checkpoint", None)
 
     if vae_type in ("wan", "wan2.2", ""):
-        return WanVAEWrapper()
+        return WanVAEWrapper(vae_checkpoint=vae_checkpoint)
 
     if vae_type in _MG_LIGHTVAE_DEFAULT_PATHS:
         from utils.lightvae_5b_wrapper import LightVAE5BWrapper
