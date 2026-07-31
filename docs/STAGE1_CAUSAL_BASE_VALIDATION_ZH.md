@@ -222,10 +222,10 @@ PY
 期望 `records: 6`，两个 bucket 各 3 条，`num_latent_frames=24`、
 `num_frame_per_block=8`、`expected_pixel_frames=93`、`carrier_frames=97`。
 
-### 4.3 写入 t_shift、CFG、steps、negative prompt 和 seed
+### 4.3 复核或覆盖 t_shift、CFG、steps、negative prompt 和 seed
 
-预处理器已经写入 t_shift `5.0`、CFG `5.0`、50 steps 和 seed `1`。为避免手工编辑两份
-YAML 时漏改，并补上与 `infer_batch.sh` 一致的负面 prompt，运行：
+预处理器已经写入 t_shift `5.0`、CFG `5.0`、50 steps、seed `1`，以及与
+`infer_batch.sh` 一致的负面 prompt。若需要显式复核或统一覆盖两份 YAML，可运行：
 
 ```bash
 export LONG_LIVE_STAGE1_T_SHIFT=5.0

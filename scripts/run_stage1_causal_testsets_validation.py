@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.config import DEFAULT_NEGATIVE_PROMPT  # noqa: E402
 from utils.stage1_causal_validation import (  # noqa: E402
     prepare_causal_testsets,
     validate_causal_testset_outputs,
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--minimum-first-frame-psnr-db", type=float, default=12.0)
     parser.add_argument("--minimum-frame-std", type=float, default=5.0)
     parser.add_argument("--minimum-temporal-abs-diff", type=float, default=0.05)
@@ -88,6 +90,7 @@ def main(argv=None) -> int:
         sampling_steps=args.sampling_steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
+        negative_prompt=args.negative_prompt,
     )
     report: dict[str, object] = {
         "status": "prepared" if args.prepare_only else "running",

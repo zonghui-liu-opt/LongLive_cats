@@ -121,6 +121,8 @@ def test_testsets_are_strictly_parsed_and_split_by_geometry(tmp_path):
     assert list(configs[1].data.image_or_video_shape) == [1, 24, 48, 52, 30]
     assert configs[0].model_kwargs.init_weights is False
     assert configs[0].model_paths.vae_checkpoint.endswith("vae.pt")
+    assert configs[0].inference.negative_prompt == manifest["sampling"]["negative_prompt"]
+    assert manifest["sampling"]["solver"] == "unipc"
     assert "adapter" not in configs[0]
 
 

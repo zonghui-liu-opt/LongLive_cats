@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.config import DEFAULT_NEGATIVE_PROMPT  # noqa: E402
 from utils.stage1_causal_validation import prepare_causal_testsets  # noqa: E402
 
 
@@ -55,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
     return parser
 
 
@@ -74,6 +76,7 @@ def main(argv=None) -> int:
         sampling_steps=args.sampling_steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
+        negative_prompt=args.negative_prompt,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0

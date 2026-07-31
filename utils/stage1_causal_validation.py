@@ -1,4 +1,4 @@
-"""Deterministic validation helpers for the converted Stage-1 causal base."""
+"""Deterministic validation helpers for Stage-1 causal bases and checkpoints."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image
 
+from utils.config import DEFAULT_NEGATIVE_PROMPT
 from utils.stage1_io import (
     atomic_output_path,
     atomic_write_bytes,
@@ -36,6 +37,68 @@ REQUIRED_TESTSET_COLUMNS = (
     "width",
     "bucket",
 )
+
+
+def discover_stage1_training_checkpoints(
+    training_root: str | os.PathLike[str],
+    *,
+    steps: list[int] | tuple[int, ...] | None = None,
+    expected_base_sha256: str | None = None,
+) -> list[Path]:
+    """Return committed Stage-1 adapter checkpoints in optimizer-step order.
+
+    A directory matching ``checkpoint_model_XXXXXX`` is never silently ignored:
+    an uncommitted or corrupt directory is an error.  This prevents a batch
+    comparison from looking complete while accidentally omitting a training
+    checkpoint that failed part-way through publication.
+    """
+
+    from utils.stage1_checkpoint import (
+        CHECKPOINT_DIRECTORY_PATTERN,
+        checkpoint_step,
+        validate_checkpoint,
+    )
+
+    training_root = Path(training_root).expanduser().resolve()
+    if not training_root.is_dir():
+        raise FileNotFoundError(training_root)
+    requested_steps = None if steps is None else {int(step) for step in steps}
+    if requested_steps is not None:
+        if not requested_steps:
+            raise ValueError("steps must contain at least one optimizer step")
+        if any(step <= 0 for step in requested_steps):
+            raise ValueError(f"optimizer steps must be positive: {sorted(requested_steps)}")
+
+    discovered: dict[int, Path] = {}
+    for path in sorted(training_root.iterdir()):
+        if not path.is_dir() or CHECKPOINT_DIRECTORY_PATTERN.fullmatch(path.name) is None:
+            continue
+        step = checkpoint_step(path)
+        if step in discovered:
+            raise RuntimeError(
+                f"duplicate Stage-1 optimizer step {step}: {discovered[step]} and {path}"
+            )
+        # Validate every checkpoint-shaped directory, even when --steps would
+        # not select it, so incomplete artifacts cannot be silently hidden.
+        validate_checkpoint(
+            path,
+            require_resumable=False,
+            expected_base_sha256=expected_base_sha256,
+        )
+        discovered[step] = path.resolve()
+
+    if not discovered:
+        raise RuntimeError(f"No committed checkpoint_model_XXXXXX directories found in {training_root}")
+    if requested_steps is not None:
+        missing = sorted(requested_steps - set(discovered))
+        if missing:
+            raise RuntimeError(
+                f"Requested Stage-1 optimizer steps are missing from {training_root}: {missing}"
+            )
+        discovered = {
+            step: path for step, path in discovered.items() if step in requested_steps
+        }
+    return [discovered[step] for step in sorted(discovered)]
 
 
 @dataclass(frozen=True)
@@ -270,6 +333,7 @@ def prepare_causal_testsets(
     sampling_steps: int = 50,
     guidance_scale: float = 5.0,
     seed: int = 1,
+    negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
     carrier_writer: Callable[..., None] = write_static_carrier_video,
     carrier_probe: Callable[[str | os.PathLike[str]], dict[str, Any]] = probe_video,
 ) -> dict[str, Any]:
@@ -403,6 +467,7 @@ def prepare_causal_testsets(
                 "sink_size": 0,
                 "local_attn_size": -1,
                 "guidance_scale": guidance_scale,
+                "negative_prompt": negative_prompt,
                 "multi_shot_sink": False,
                 "streaming_vae": False,
                 "async_vae": False,
@@ -447,9 +512,11 @@ def prepare_causal_testsets(
             "fps": fps,
         },
         "sampling": {
+            "solver": "unipc",
             "sampling_steps": sampling_steps,
             "guidance_scale": guidance_scale,
             "seed": seed,
+            "negative_prompt": negative_prompt,
         },
         "buckets": bucket_entries,
     }

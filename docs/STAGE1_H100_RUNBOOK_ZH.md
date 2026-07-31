@@ -190,14 +190,35 @@ python scripts/plot_stage1_training.py \
   --formats png svg
 ```
 
-## 7. 恢复、产物与最终 merge
+## 7. 恢复、testsets 选型与最终 merge
 
 同一命令重启时只会自动选择同时具有 `_SUCCESS`、`_RESUMABLE_SUCCESS` 且 manifest/
 base/topology/hash 完整的最新 checkpoint。恢复后下一次 `update_index` 等于目录中的 completed
 step；例如 `checkpoint_model_000300` 从 `update_index=300` 开始。不要手工删除或改写
 checkpoint 内文件。
 
-用户完成外部视觉验证并选定某个 checkpoint 后，再运行 merge；训练器不会自动选择 best：
+训练结束后可一次性对所有 EMA checkpoints 运行仓库 6-case testsets，并在本地 HTML 中按
+test case 横向查看各 step。脚本会临时做严格 EMA merge，成功推理后默认删除可重建的 full
+checkpoint，避免 10 个 step 长期占用约 100 GiB：
+
+```bash
+export LONG_LIVE_STAGE1_CHECKPOINT_VALIDATION_DIR=/local_nvme/stage1_checkpoint_testsets_seed1
+
+CUDA_VISIBLE_DEVICES=0 python scripts/run_stage1_training_checkpoints_validation.py \
+  --training-root "$LONG_LIVE_STAGE1_TRAIN_DIR" \
+  --metadata testsets/metadata_6cases_480x832.csv \
+  --work-dir "$LONG_LIVE_STAGE1_CHECKPOINT_VALIDATION_DIR" \
+  --sampling-steps 50 \
+  --guidance-scale 5.0 \
+  --seed 1
+```
+
+顶层 `validation_report.json` 必须为 `status=pass`，每个 step 必须有 6 个通过技术门禁的视频；
+再打开 `comparison.html` 人工比较动作、身份和 block 边界。完整参数、部分 step 选择、失败处理
+和磁盘策略见 [`STAGE1_CHECKPOINT_TESTSETS_VALIDATION_ZH.md`](STAGE1_CHECKPOINT_TESTSETS_VALIDATION_ZH.md)。
+
+用户完成视觉验证并选定某个 checkpoint 后，再运行最终 merge；训练器和验证脚本都不会自动
+选择 best：
 
 ```bash
 python scripts/merge_lora_generator.py \
