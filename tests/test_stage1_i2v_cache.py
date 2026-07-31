@@ -2,7 +2,9 @@ import json
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
+from scripts.precompute_stage1_i2v_cache import _validate_precompute_runtime
 from utils.stage1_i2v_data import (
     Stage1I2VCacheDataset,
     load_cache_manifest,
@@ -74,3 +76,33 @@ def test_cache_rejects_wrong_shape_or_dtype(tmp_path):
     tensors["video_latent"] = tensors["video_latent"].float()
     with pytest.raises(ValueError, match="dtype"):
         save_cache_artifact(tmp_path / "bad.safetensors", tensors, metadata={})
+
+
+def test_cache_precompute_runtime_enforces_world_size_and_cuda():
+    config = OmegaConf.create(
+        {
+            "cache_precompute": {
+                "expected_world_size": 4,
+                "require_cuda": True,
+                "log_every_records": 10,
+            }
+        }
+    )
+    with pytest.raises(RuntimeError, match="world-size mismatch"):
+        _validate_precompute_runtime(
+            config, world_size=1, device=torch.device("cpu")
+        )
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        _validate_precompute_runtime(
+            config, world_size=4, device=torch.device("cpu")
+        )
+
+
+def test_cache_precompute_runtime_keeps_generic_config_compatible():
+    config = OmegaConf.create({})
+    assert (
+        _validate_precompute_runtime(
+            config, world_size=1, device=torch.device("cpu")
+        )
+        == 10
+    )

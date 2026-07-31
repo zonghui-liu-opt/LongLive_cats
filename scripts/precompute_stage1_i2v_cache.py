@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -54,6 +55,39 @@ def _broadcast_rank0_object(value, rank: int):
     values = [value if rank == 0 else None]
     dist.broadcast_object_list(values, src=0)
     return values[0]
+
+
+def _validate_precompute_runtime(config, *, world_size: int, device: torch.device) -> int:
+    settings = config.get("cache_precompute", {})
+    expected_world_size = int(settings.get("expected_world_size", world_size))
+    if world_size != expected_world_size:
+        raise RuntimeError(
+            "Cache precompute world-size mismatch: "
+            f"expected {expected_world_size}, got {world_size}."
+        )
+    require_cuda = bool(settings.get("require_cuda", False))
+    if require_cuda and device.type != "cuda":
+        raise RuntimeError("Cache precompute requires CUDA, but no CUDA device is available.")
+    minimum_capability = settings.get("minimum_cuda_capability", None)
+    if minimum_capability is not None:
+        if device.type != "cuda":
+            raise RuntimeError(
+                "minimum_cuda_capability is configured, but cache precompute is not on CUDA."
+            )
+        minimum_capability = tuple(int(value) for value in minimum_capability)
+        if len(minimum_capability) != 2:
+            raise ValueError("minimum_cuda_capability must contain [major, minor].")
+        actual_capability = torch.cuda.get_device_capability(device)
+        if actual_capability < minimum_capability:
+            raise RuntimeError(
+                "Cache precompute requires CUDA capability >= "
+                f"{minimum_capability}, got {actual_capability} on "
+                f"{torch.cuda.get_device_name(device)}."
+            )
+    log_every_records = int(settings.get("log_every_records", 10))
+    if log_every_records < 1:
+        raise ValueError("cache_precompute.log_every_records must be at least 1.")
+    return log_every_records
 
 
 def _existing_artifact_valid(path: Path, *, row_sha256: str, source_sha256: str) -> bool:
@@ -141,6 +175,9 @@ def _encode_record(record, *, vae, text_encoder, device, preprocessing):
 def precompute(config_path: str, *, cache_dir_override: str | None = None) -> Path | None:
     config = normalize_config(OmegaConf.load(config_path))
     rank, world_size, device = _initialize_distributed()
+    log_every_records = _validate_precompute_runtime(
+        config, world_size=world_size, device=device
+    )
     data = config.data
     preprocessing = config.preprocessing
     model_paths = config.model_paths
@@ -167,27 +204,47 @@ def precompute(config_path: str, *, cache_dir_override: str | None = None) -> Pa
     fingerprint = _broadcast_rank0_object(fingerprint, rank)
     source_sha256 = fingerprint["aggregate_sha256"]
 
-    from utils.wan_5b_wrapper import WanTextEncoder, WanVAEWrapper
-
-    text_encoder = WanTextEncoder(
-        t5_checkpoint=model_paths.t5_checkpoint,
-        tokenizer_dir=model_paths.tokenizer_dir,
-        device=device,
-    ).eval().requires_grad_(False)
-    vae = WanVAEWrapper(vae_checkpoint=model_paths.vae_checkpoint).eval().requires_grad_(False)
-    vae = vae.to(device=device)
-
-    verified_shapes: set[tuple[int, int]] = set()
-    for record in records:
-        if record.row_id % world_size != rank:
-            continue
+    assigned_records = [
+        record for record in records if record.row_id % world_size == rank
+    ]
+    pending_records = []
+    for record in assigned_records:
         output_path = cache_dir / cache_artifact_name(record.row_id)
-        if _existing_artifact_valid(
+        if not _existing_artifact_valid(
             output_path,
             row_sha256=record.row_sha256,
             source_sha256=source_sha256,
         ):
-            continue
+            pending_records.append(record)
+    device_name = (
+        torch.cuda.get_device_name(device) if device.type == "cuda" else str(device)
+    )
+    print(
+        f"[rank {rank}/{world_size}] device={device_name} "
+        f"assigned={len(assigned_records)} pending={len(pending_records)} "
+        f"resumed={len(assigned_records) - len(pending_records)}",
+        flush=True,
+    )
+
+    text_encoder = None
+    vae = None
+    if pending_records:
+        from utils.wan_5b_wrapper import WanTextEncoder, WanVAEWrapper
+
+        text_encoder = WanTextEncoder(
+            t5_checkpoint=model_paths.t5_checkpoint,
+            tokenizer_dir=model_paths.tokenizer_dir,
+            device=device,
+        ).eval().requires_grad_(False)
+        vae = WanVAEWrapper(
+            vae_checkpoint=model_paths.vae_checkpoint
+        ).eval().requires_grad_(False)
+        vae = vae.to(device=device)
+
+    verified_shapes: set[tuple[int, int]] = set()
+    started_at = time.perf_counter()
+    for completed, record in enumerate(pending_records, start=1):
+        output_path = cache_dir / cache_artifact_name(record.row_id)
         tensors = _encode_record(
             record,
             vae=vae,
@@ -216,6 +273,14 @@ def precompute(config_path: str, *, cache_dir_override: str | None = None) -> Pa
             for name in tensors:
                 torch.testing.assert_close(cached[name], tensors[name], rtol=0, atol=0)
             verified_shapes.add(shape)
+        if completed % log_every_records == 0 or completed == len(pending_records):
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"[rank {rank}/{world_size}] completed={completed}/"
+                f"{len(pending_records)} row_id={record.row_id} "
+                f"elapsed={elapsed:.1f}s avg={elapsed / completed:.2f}s/record",
+                flush=True,
+            )
 
     if dist.is_initialized():
         dist.barrier()

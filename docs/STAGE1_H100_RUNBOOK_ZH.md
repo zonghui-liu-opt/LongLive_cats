@@ -44,15 +44,18 @@ PY
 只设置本任务使用的环境变量，不要覆盖 `HOME`、`CODEX_HOME` 等系统变量：
 
 ```bash
-export LONG_LIVE_STAGE1_ARCHITECTURE_ROOT=/data/models/Wan2.2-TI2V-5B
-export LONG_LIVE_STAGE1_T5_CHECKPOINT=/data/models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
-export LONG_LIVE_STAGE1_TOKENIZER_DIR=/data/models/Wan2.2-TI2V-5B/google/umt5-xxl
-export LONG_LIVE_STAGE1_VAE_CHECKPOINT=/data/models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
-export LONG_LIVE_STAGE1_BASE_CHECKPOINT=/data/longlive/converted_causal_base.pt
-export LONG_LIVE_STAGE1_BASE_MANIFEST=/data/longlive/converted_causal_base.manifest.json
-export LONG_LIVE_STAGE1_CACHE_DIR=/data/longlive/stage1_i2v_cache
-export LONG_LIVE_STAGE1_DRY_RUN_DIR=/data/longlive/runs/stage1_dry_run
-export LONG_LIVE_STAGE1_TRAIN_DIR=/data/longlive/runs/stage1_formal
+export LONG_LIVE_STAGE1_PROJECT_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
+export LONG_LIVE_STAGE1_AUXILIARY_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B
+export LONG_LIVE_STAGE1_SOURCE_CHECKPOINT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts
+export LONG_LIVE_STAGE1_ARCHITECTURE_ROOT="$LONG_LIVE_STAGE1_AUXILIARY_ROOT"
+export LONG_LIVE_STAGE1_T5_CHECKPOINT="$LONG_LIVE_STAGE1_AUXILIARY_ROOT/models_t5_umt5-xxl-enc-bf16.pth"
+export LONG_LIVE_STAGE1_TOKENIZER_DIR="$LONG_LIVE_STAGE1_AUXILIARY_ROOT/google/umt5-xxl"
+export LONG_LIVE_STAGE1_VAE_CHECKPOINT="$LONG_LIVE_STAGE1_AUXILIARY_ROOT/Wan2.2_VAE.pth"
+export LONG_LIVE_STAGE1_BASE_CHECKPOINT="$LONG_LIVE_STAGE1_PROJECT_ROOT/checkpoints/stage1/converted_causal_base.pt"
+export LONG_LIVE_STAGE1_BASE_MANIFEST="$LONG_LIVE_STAGE1_PROJECT_ROOT/checkpoints/stage1/converted_causal_base.manifest.json"
+export LONG_LIVE_STAGE1_CACHE_DIR="$LONG_LIVE_STAGE1_PROJECT_ROOT/cache/stage1_i2v_600_bf16"
+export LONG_LIVE_STAGE1_DRY_RUN_DIR="$LONG_LIVE_STAGE1_PROJECT_ROOT/logs/stage1_dry_run"
+export LONG_LIVE_STAGE1_TRAIN_DIR="$LONG_LIVE_STAGE1_PROJECT_ROOT/logs/stage1_formal"
 ```
 
 配置中的 `data.metadata_path` 默认是
@@ -67,7 +70,7 @@ SP3×DP2、accumulation=2、LoRA target 或训练步数。
 
 ```bash
 python scripts/convert_diffsynth_wan22_to_longlive.py \
-  --source-checkpoint /data/models/diffsynth_wan22_ti2v_5b \
+  --source-checkpoint "$LONG_LIVE_STAGE1_SOURCE_CHECKPOINT" \
   --architecture-root "$LONG_LIVE_STAGE1_ARCHITECTURE_ROOT" \
   --output-path "$LONG_LIVE_STAGE1_BASE_CHECKPOINT" \
   --manifest-path "$LONG_LIVE_STAGE1_BASE_MANIFEST" \
@@ -77,18 +80,28 @@ python scripts/convert_diffsynth_wan22_to_longlive.py \
 只有 converter 报告 100% key/shape coverage、fresh causal wrapper `strict=True` reload，
 且源文件转换前后 hash 不变，才能继续。
 
-## 4. 一次性构建 600 条离线 cache
+## 4. 使用 4×H100 一次性构建 600 条离线 cache
+
+cache 只编码视频、首帧和 prompt，因此只读取 auxiliary 目录中的 VAE、T5 与
+tokenizer；不会加载 `infer_batch.sh` 已验证的 merged bidirectional DiT。默认内网路径已写入
+`configs/train_i2v_ar.yaml`，仍可通过第 2 节的环境变量覆盖。4 个 rank 按稳定 row id
+取模分片，每卡正好处理 150 条；已有且 hash/metadata 完整的 artifact 会被跳过。
 
 ```bash
-torchrun --standalone --nnodes=1 --nproc_per_node=6 \
-  scripts/precompute_stage1_i2v_cache.py \
-  --config-path configs/train_i2v_ar.yaml \
-  --cache-dir "$LONG_LIVE_STAGE1_CACHE_DIR"
+# 默认使用物理卡 0,1,2,3；若调度器已经设置 CUDA_VISIBLE_DEVICES，会原样沿用。
+bash precompute_stage1_i2v_cache_h100_4gpu.sh
+
+# 例如显式使用 4,5,6,7：
+LONG_LIVE_STAGE1_CACHE_GPUS=4,5,6,7 \
+  bash precompute_stage1_i2v_cache_h100_4gpu.sh
 ```
 
 完成条件：manifest 恰好 600 条、row id 连续、视频无重复、每条均为 24 latent
 frames、输入图为 1 latent frame、tensor dtype/shape/hash 全部通过。正式训练启动时 rank0
 会再次流式审计源数据、模型依赖和全部 cache，结果再广播给其他 ranks。
+
+启动器和 `cache_precompute` 配置会严格要求 world size=4、CUDA capability ≥ 9.0
+（Hopper/H100）。正式训练仍严格使用 6 卡 SP3×DP2，不受这里的 4 卡设置影响。
 
 ## 5. 本地测试与 6 rank 分布式门禁
 
@@ -167,7 +180,7 @@ checkpoint 内文件。
 python scripts/merge_lora_generator.py \
   --base-checkpoint "$LONG_LIVE_STAGE1_BASE_CHECKPOINT" \
   --training-checkpoint "$LONG_LIVE_STAGE1_TRAIN_DIR/checkpoint_model_XXXXXX" \
-  --output-path /data/longlive/stage1_causal_ema_merged.pt
+  --output-path "$LONG_LIVE_STAGE1_PROJECT_ROOT/checkpoints/stage1/stage1_causal_ema_merged.pt"
 ```
 
 merge 只有在 base/checkpoint hash、360 个 EMA LoRA tensor、safe merge、BF16 输出以及 fresh

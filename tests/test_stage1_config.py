@@ -18,6 +18,9 @@ def test_release_stage1_config_has_one_locked_source_of_truth():
     assert config.sharding_strategy == "hsdp"
     assert config.device_mesh_shape == [2, 3]
     assert config.device_mesh_dim_names == ["replicate", "shard"]
+    assert config.cache_precompute.expected_world_size == 4
+    assert config.cache_precompute.require_cuda is True
+    assert config.cache_precompute.minimum_cuda_capability == [9, 0]
     assert config.image_or_video_shape == [1, 24, 48, 30, 52]
     assert config.gradient_accumulation_steps == 2
     assert "max_iters" not in config

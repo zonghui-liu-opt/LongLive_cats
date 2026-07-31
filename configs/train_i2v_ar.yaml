@@ -19,18 +19,29 @@ model_kwargs:
   model_name: Wan2.2-TI2V-5B
   timestep_shift: 5.0
   num_frame_per_block: 8
-  architecture_root: ${oc.env:LONG_LIVE_STAGE1_ARCHITECTURE_ROOT,/absolute/path/to/Wan2.2-TI2V-5B}
+  architecture_root: ${oc.env:LONG_LIVE_STAGE1_ARCHITECTURE_ROOT,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}
   init_weights: false
 
 checkpoints:
-  generator_ckpt: ${oc.env:LONG_LIVE_STAGE1_BASE_CHECKPOINT,/absolute/path/to/converted_causal_base.pt}
-  base_manifest: ${oc.env:LONG_LIVE_STAGE1_BASE_MANIFEST,/absolute/path/to/converted_causal_base.manifest.json}
+  generator_ckpt: ${oc.env:LONG_LIVE_STAGE1_BASE_CHECKPOINT,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage1/converted_causal_base.pt}
+  base_manifest: ${oc.env:LONG_LIVE_STAGE1_BASE_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage1/converted_causal_base.manifest.json}
 
 model_paths:
-  architecture_root: ${oc.env:LONG_LIVE_STAGE1_ARCHITECTURE_ROOT,/absolute/path/to/Wan2.2-TI2V-5B}
-  t5_checkpoint: ${oc.env:LONG_LIVE_STAGE1_T5_CHECKPOINT,/absolute/path/to/models_t5_umt5-xxl-enc-bf16.pth}
-  tokenizer_dir: ${oc.env:LONG_LIVE_STAGE1_TOKENIZER_DIR,/absolute/path/to/google/umt5-xxl}
-  vae_checkpoint: ${oc.env:LONG_LIVE_STAGE1_VAE_CHECKPOINT,/absolute/path/to/Wan2.2_VAE.pth}
+  # Cache extraction only reads these three auxiliary assets. The merged
+  # bidirectional DiT checkpoint used by infer_batch.sh is intentionally not
+  # loaded while precomputing VAE/T5 cache records.
+  architecture_root: ${oc.env:LONG_LIVE_STAGE1_ARCHITECTURE_ROOT,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}
+  t5_checkpoint: ${oc.env:LONG_LIVE_STAGE1_T5_CHECKPOINT,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth}
+  tokenizer_dir: ${oc.env:LONG_LIVE_STAGE1_TOKENIZER_DIR,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl}
+  vae_checkpoint: ${oc.env:LONG_LIVE_STAGE1_VAE_CHECKPOINT,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B/Wan2.2_VAE.pth}
+
+# Read only by scripts/precompute_stage1_i2v_cache.py. Formal Stage-1 training
+# remains locked to infra.expected_world_size=6 and SP3 x DP2 above.
+cache_precompute:
+  expected_world_size: 4
+  require_cuda: true
+  minimum_cuda_capability: [9, 0]
+  log_every_records: 10
 
 algorithm:
   trainer: diffusion
@@ -71,7 +82,7 @@ preprocessing:
 data:
   backend: stage1_i2v_cache
   metadata_path: training_sets/metadata_600clips_480x832_buckets.csv
-  cache_dir: ${oc.env:LONG_LIVE_STAGE1_CACHE_DIR,/absolute/path/to/stage1_i2v_cache}
+  cache_dir: ${oc.env:LONG_LIVE_STAGE1_CACHE_DIR,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/cache/stage1_i2v_600_bf16}
   expected_num_samples: 600
   image_or_video_shape: [1, 24, 48, 30, 52]
   allowed_latent_spatial_shapes: [[30, 52], [52, 30]]
