@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_default("LONG_LIVE_STAGE1_VAE_CHECKPOINT"),
         required=_env_default("LONG_LIVE_STAGE1_VAE_CHECKPOINT") is None,
     )
+    parser.add_argument(
+        "--allow-repeated-input-images",
+        action="store_true",
+        help="Allow one validated input image to be reused by multiple metadata rows.",
+    )
     parser.add_argument("--num-latent-frames", type=int, default=24)
     parser.add_argument("--num-frame-per-block", type=int, default=8)
     parser.add_argument("--minimum-source-frames", type=int, default=97)
@@ -70,6 +75,7 @@ def main(argv=None) -> int:
         t5_checkpoint=args.t5_checkpoint,
         tokenizer_dir=args.tokenizer_dir,
         vae_checkpoint=args.vae_checkpoint,
+        allow_repeated_input_images=args.allow_repeated_input_images,
         num_latent_frames=args.num_latent_frames,
         num_frame_per_block=args.num_frame_per_block,
         minimum_source_frames=args.minimum_source_frames,

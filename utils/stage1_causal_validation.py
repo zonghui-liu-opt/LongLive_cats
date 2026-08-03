@@ -130,7 +130,11 @@ def _bucket_id(bucket: str, height: int, width: int) -> str:
     return f"{bucket}_{height}x{width}"
 
 
-def load_causal_testset_records(metadata_path: str | os.PathLike[str]) -> list[CausalTestsetRecord]:
+def load_causal_testset_records(
+    metadata_path: str | os.PathLike[str],
+    *,
+    allow_repeated_input_images: bool = False,
+) -> list[CausalTestsetRecord]:
     """Load the image/prompt test CSV without silently changing its geometry."""
 
     metadata_path = Path(metadata_path).expanduser().resolve()
@@ -175,7 +179,7 @@ def load_causal_testset_records(metadata_path: str | os.PathLike[str]) -> list[C
         image_path = image_path.resolve()
         if not image_path.is_file():
             raise FileNotFoundError(f"row {row_id}: missing input image: {image_path}")
-        if image_path in seen_images:
+        if image_path in seen_images and not allow_repeated_input_images:
             raise ValueError(f"row {row_id}: duplicate input image: {image_path}")
         seen_images.add(image_path)
 
@@ -325,6 +329,7 @@ def prepare_causal_testsets(
     t5_checkpoint: str | os.PathLike[str],
     tokenizer_dir: str | os.PathLike[str],
     vae_checkpoint: str | os.PathLike[str],
+    allow_repeated_input_images: bool = False,
     num_latent_frames: int = 24,
     num_frame_per_block: int = 8,
     temporal_compression_ratio: int = 4,
@@ -365,7 +370,10 @@ def prepare_causal_testsets(
         if not expected:
             raise FileNotFoundError(f"Missing {name}: {path}")
 
-    records = load_causal_testset_records(metadata_path)
+    records = load_causal_testset_records(
+        metadata_path,
+        allow_repeated_input_images=allow_repeated_input_images,
+    )
     grouped: dict[str, list[CausalTestsetRecord]] = defaultdict(list)
     for record in records:
         grouped[record.bucket_id].append(record)
