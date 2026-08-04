@@ -1,0 +1,54 @@
+{
+  "format": "longlive-image-prompt-v1",
+  "task": "BF16 TI2V cat action sequence",
+  "actions": [
+    "forward_jump",
+    "teaser_wand",
+    "yarn_ball"
+  ],
+  "source": {
+    "metadata": "testsets/metadata_12cases_two_actions_480x832_253frames.csv",
+    "case_group": "russian_forest_jump_then_toy",
+    "prompt_style": "absolute_timeline",
+    "image": "testsets/images_480x832/russian_forest_cat_480x832_no_distortion.png",
+    "image_sha256": "6cd462159c08c9c249e33c7754d6be68c713e05111d1ae2d5d4e1c78902b6c28"
+  },
+  "prepared": {
+    "image": "testsets/processed_bf16_ti2v/images/russian_forest_jump_wand_yarn.png",
+    "image_sha256": "1a573deec1ea68c1abe2650fc6a716880c388a316a42224c4bb75f266504dcb4",
+    "prompt": "testsets/processed_bf16_ti2v/prompts/russian_forest_jump_wand_yarn.txt",
+    "prompt_non_empty_lines": 1,
+    "prompt_strategy": "single-line absolute timeline to preserve one continuous shot",
+    "source_size_wh": [
+      832,
+      480
+    ],
+    "resized_size_wh": [
+      1220,
+      704
+    ],
+    "target_size_wh": [
+      1280,
+      704
+    ],
+    "padding_left_top": [
+      30,
+      0
+    ],
+    "resize_mode": "aspect-preserving contain with centered white padding"
+  },
+  "inference_shape": [
+    1,
+    64,
+    48,
+    44,
+    80
+  ],
+  "num_frame_per_block": 8,
+  "num_blocks": 8,
+  "temporal_compression_ratio": 4,
+  "decoded_frames": 253,
+  "fps": 24,
+  "duration_seconds": 10.541666666666666,
+  "precision_note": "PNG is uint8 RGB; inference.py casts image and VAE latent to torch.bfloat16."
+}

@@ -1,0 +1,55 @@
+# BF16 TI2V fixture: forward jump -> teaser wand -> yarn ball.
+# Generate the paired image/prompt data first:
+#   python scripts/prepare_cat_ti2v_testset.py
+
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 8
+  local_attn_size: 32
+
+i2v: true
+
+use_ema: false
+output_folder: videos/cat_jump_wand_yarn_bf16
+num_samples: 1
+save_latents_only: false
+save_with_index: true
+inference_iter: -1
+
+# 64 latent frames decode to (64 - 1) * 4 + 1 = 253 frames, matching the
+# 10.54-second / 24-fps reference metadata in testsets/.
+num_output_frames: 64
+
+data:
+  data_path: testsets/processed_bf16_ti2v
+  # [B, latent F, latent C, latent H, latent W]. H/W 44x80 decode to
+  # the Wan2.2-TI2V-5B supported landscape resolution 704x1280.
+  image_or_video_shape:
+  - 1
+  - 64
+  - 48
+  - 44
+  - 80
+
+inference:
+  sampling_steps: 4
+  independent_first_frame: true
+  sink_size: 8
+  guidance_scale: 1.0
+  multi_shot_sink: false
+  multi_shot_rope_offset: 0
+  streaming_vae: false
+  async_vae: false
+  vae_type: wan
+  negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+checkpoints:
+  # Public LongLive 2.0 merged BF16 checkpoint (AR generator + 4-step DMD LoRA).
+  # It can exercise the I2V code path, but its release training did not use I2V
+  # data, so first-frame adherence is experimental rather than officially validated.
+  # This fixture intentionally has no adapter/lora_ckpt to avoid loading LoRA twice.
+  generator_ckpt: /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/LongLive-2.0-5B/model_bf16.pt
+
+logging:
+  seed: 0
