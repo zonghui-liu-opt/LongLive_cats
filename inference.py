@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import sys
+import json
 
 # torchrun no longer consistently prepends the script directory to sys.path,
 # which breaks absolute project imports when launched from another cwd.
@@ -489,6 +490,28 @@ else:
     pipeline.vae.to(device=device)
     if vae_device_str and local_rank == 0:
         print(f"[inference] Ignoring vae_device={vae_device_str} because streaming_vae is false")
+
+# Explicit continuation manifests reuse the complete model/checkpoint/device
+# bootstrap above, then bypass the ordinary dataset loop below.  Normal
+# inference remains the default whenever this opt-in section is absent.
+continuation_config = getattr(config, "continuation", None)
+if continuation_config is not None and _config_bool(
+    getattr(continuation_config, "enabled", False)
+):
+    if dist.is_initialized():
+        raise ValueError("Stage-1 continuation inference supports one GPU only")
+    from utils.stage1_continuation_inference import (
+        run_prepared_continuation_bucket,
+    )
+
+    with torch.inference_mode():
+        continuation_report = run_prepared_continuation_bucket(
+            pipeline,
+            config,
+            device=device,
+        )
+    print(json.dumps(continuation_report, ensure_ascii=False, indent=2))
+    raise SystemExit(0)
 
 # Create dataset
 nfpb = getattr(config, 'num_frame_per_block', 8)

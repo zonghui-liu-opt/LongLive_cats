@@ -320,6 +320,34 @@ def _write_inference_config(path: Path, values: dict[str, Any]) -> None:
     atomic_write_bytes(path, text.encode("utf-8"))
 
 
+def resolve_stage1_model_paths(
+    *,
+    base_checkpoint: str | os.PathLike[str],
+    architecture_root: str | os.PathLike[str],
+    t5_checkpoint: str | os.PathLike[str],
+    tokenizer_dir: str | os.PathLike[str],
+    vae_checkpoint: str | os.PathLike[str],
+) -> dict[str, Path]:
+    """Resolve and validate the model assets shared by Stage-1 runners."""
+
+    paths = {
+        "base_checkpoint": Path(base_checkpoint).expanduser().resolve(),
+        "architecture_root": Path(architecture_root).expanduser().resolve(),
+        "t5_checkpoint": Path(t5_checkpoint).expanduser().resolve(),
+        "tokenizer_dir": Path(tokenizer_dir).expanduser().resolve(),
+        "vae_checkpoint": Path(vae_checkpoint).expanduser().resolve(),
+    }
+    for name, path in paths.items():
+        expected = (
+            path.is_dir()
+            if name in {"architecture_root", "tokenizer_dir"}
+            else path.is_file()
+        )
+        if not expected:
+            raise FileNotFoundError(f"Missing {name}: {path}")
+    return paths
+
+
 def prepare_causal_testsets(
     *,
     metadata_path: str | os.PathLike[str],
@@ -358,17 +386,13 @@ def prepare_causal_testsets(
         )
     output_root.mkdir(parents=True, exist_ok=True)
 
-    paths = {
-        "base_checkpoint": Path(base_checkpoint).expanduser().resolve(),
-        "architecture_root": Path(architecture_root).expanduser().resolve(),
-        "t5_checkpoint": Path(t5_checkpoint).expanduser().resolve(),
-        "tokenizer_dir": Path(tokenizer_dir).expanduser().resolve(),
-        "vae_checkpoint": Path(vae_checkpoint).expanduser().resolve(),
-    }
-    for name, path in paths.items():
-        expected = path.is_dir() if name in {"architecture_root", "tokenizer_dir"} else path.is_file()
-        if not expected:
-            raise FileNotFoundError(f"Missing {name}: {path}")
+    paths = resolve_stage1_model_paths(
+        base_checkpoint=base_checkpoint,
+        architecture_root=architecture_root,
+        t5_checkpoint=t5_checkpoint,
+        tokenizer_dir=tokenizer_dir,
+        vae_checkpoint=vae_checkpoint,
+    )
 
     records = load_causal_testset_records(
         metadata_path,
@@ -713,6 +737,64 @@ def _video_pixel_metrics(video_path: Path, source_image_path: Path) -> dict[str,
     }
 
 
+def validate_causal_video_output(
+    video_path: str | os.PathLike[str],
+    source_image_path: str | os.PathLike[str],
+    *,
+    row_id: int,
+    expected_width: int,
+    expected_height: int,
+    expected_frames: int,
+    expected_fps: float,
+    minimum_first_frame_psnr_db: float = 12.0,
+    minimum_frame_std: float = 5.0,
+    minimum_temporal_abs_diff: float = 0.05,
+    probe: Callable[[str | os.PathLike[str]], dict[str, Any]] = probe_video,
+    pixel_metrics: Callable[[Path, Path], dict[str, float]] = _video_pixel_metrics,
+) -> dict[str, Any]:
+    """Apply the shared Stage-1 technical gate to one explicitly mapped MP4."""
+
+    video_path = Path(video_path)
+    source_image_path = Path(source_image_path)
+    stream = probe(video_path)
+    expected_geometry = (int(expected_width), int(expected_height))
+    actual_geometry = (int(stream["width"]), int(stream["height"]))
+    if actual_geometry != expected_geometry:
+        raise RuntimeError(
+            f"output geometry mismatch for row {row_id}: "
+            f"expected {expected_geometry}, got {actual_geometry}"
+        )
+    if int(stream["frame_count"]) != int(expected_frames):
+        raise RuntimeError(
+            f"output frame count mismatch for row {row_id}: "
+            f"expected {expected_frames}, got {stream['frame_count']}"
+        )
+    if abs(float(stream["fps"]) - float(expected_fps)) > 0.01:
+        raise RuntimeError(
+            f"output FPS mismatch for row {row_id}: "
+            f"expected {expected_fps}, got {stream['fps']}"
+        )
+    metrics = pixel_metrics(video_path, source_image_path)
+    if int(metrics["decoded_frame_count"]) != int(expected_frames):
+        raise RuntimeError(f"decoder did not read every frame from {video_path}")
+    if metrics["first_frame_psnr_db"] < minimum_first_frame_psnr_db:
+        raise RuntimeError(
+            f"first-frame reconstruction PSNR is too low for row {row_id}: "
+            f"{metrics['first_frame_psnr_db']:.3f} dB"
+        )
+    if metrics["mean_frame_std"] < minimum_frame_std:
+        raise RuntimeError(
+            f"output is nearly flat for row {row_id}: "
+            f"std={metrics['mean_frame_std']:.3f}"
+        )
+    if metrics["mean_temporal_abs_diff"] < minimum_temporal_abs_diff:
+        raise RuntimeError(
+            f"output is temporally frozen for row {row_id}: "
+            f"mean_abs_diff={metrics['mean_temporal_abs_diff']:.6f}"
+        )
+    return {"stream": stream, "metrics": metrics}
+
+
 def validate_causal_testset_outputs(
     prepared_manifest_path: str | os.PathLike[str],
     *,
@@ -747,41 +829,22 @@ def validate_causal_testset_outputs(
             )
         for record in bucket["records"]:
             video_path = output_dir / f"rank0-{record['bucket_index']}-0_regular.mp4"
-            stream = probe(video_path)
-            expected_geometry = (int(bucket["width"]), int(bucket["height"]))
-            actual_geometry = (int(stream["width"]), int(stream["height"]))
-            if actual_geometry != expected_geometry:
-                raise RuntimeError(
-                    f"output geometry mismatch for row {record['row_id']}: "
-                    f"expected {expected_geometry}, got {actual_geometry}"
-                )
-            if int(stream["frame_count"]) != expected_frames:
-                raise RuntimeError(
-                    f"output frame count mismatch for row {record['row_id']}: "
-                    f"expected {expected_frames}, got {stream['frame_count']}"
-                )
-            if abs(float(stream["fps"]) - expected_fps) > 0.01:
-                raise RuntimeError(
-                    f"output FPS mismatch for row {record['row_id']}: "
-                    f"expected {expected_fps}, got {stream['fps']}"
-                )
-            metrics = pixel_metrics(video_path, Path(record["input_image"]))
-            if int(metrics["decoded_frame_count"]) != expected_frames:
-                raise RuntimeError(f"decoder did not read every frame from {video_path}")
-            if metrics["first_frame_psnr_db"] < minimum_first_frame_psnr_db:
-                raise RuntimeError(
-                    f"first-frame reconstruction PSNR is too low for row {record['row_id']}: "
-                    f"{metrics['first_frame_psnr_db']:.3f} dB"
-                )
-            if metrics["mean_frame_std"] < minimum_frame_std:
-                raise RuntimeError(
-                    f"output is nearly flat for row {record['row_id']}: std={metrics['mean_frame_std']:.3f}"
-                )
-            if metrics["mean_temporal_abs_diff"] < minimum_temporal_abs_diff:
-                raise RuntimeError(
-                    f"output is temporally frozen for row {record['row_id']}: "
-                    f"mean_abs_diff={metrics['mean_temporal_abs_diff']:.6f}"
-                )
+            gate = validate_causal_video_output(
+                video_path,
+                record["input_image"],
+                row_id=int(record["row_id"]),
+                expected_width=int(bucket["width"]),
+                expected_height=int(bucket["height"]),
+                expected_frames=expected_frames,
+                expected_fps=expected_fps,
+                minimum_first_frame_psnr_db=minimum_first_frame_psnr_db,
+                minimum_frame_std=minimum_frame_std,
+                minimum_temporal_abs_diff=minimum_temporal_abs_diff,
+                probe=probe,
+                pixel_metrics=pixel_metrics,
+            )
+            stream = gate["stream"]
+            metrics = gate["metrics"]
             samples.append(
                 {
                     "row_id": int(record["row_id"]),

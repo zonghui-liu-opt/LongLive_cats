@@ -3,6 +3,7 @@
 
 from tqdm import tqdm
 from typing import List, Optional
+from contextlib import contextmanager
 import os
 import statistics
 import threading
@@ -155,6 +156,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.use_relative_rope = getattr(args, "use_relative_rope", False)
         self._rope_method_override = getattr(args, "rope_method", None)
         self._original_seq_len_override = getattr(args, "original_seq_len", None)
+        self._continuation_lock = threading.RLock()
+        self._active_continuation_session = None
 
     @property
     def _dit_model(self):
@@ -171,7 +174,157 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             return model.base_model.model
         return model
 
+    def _get_continuation_lock(self) -> threading.RLock:
+        """Return the lock serializing independent and stateful inference."""
+
+        lock = getattr(self, "_continuation_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._continuation_lock = lock
+        return lock
+
+    @contextmanager
+    def _inference_runtime_overrides(
+        self,
+        *,
+        sink_size: Optional[int] = None,
+        global_sink_size: Optional[int] = None,
+    ):
+        """Apply inference-only model state and restore it exactly afterward."""
+
+        dit = self._dit_model
+        dit_state = {
+            "local_attn_size": dit.local_attn_size,
+            "t_scale": getattr(dit, "t_scale", 1.0),
+            "rope_method": getattr(dit, "rope_method", "linear"),
+            "original_seq_len": getattr(dit, "original_seq_len", None),
+            "use_relative_rope": getattr(dit, "use_relative_rope", False),
+            "rope_temporal_offset": getattr(dit, "rope_temporal_offset", 0.0),
+        }
+        modules = [module for _, module in self.generator.model.named_modules()]
+        missing = object()
+        module_state = [
+            (
+                module,
+                {
+                    name: getattr(module, name, missing)
+                    for name in (
+                        "max_attention_size",
+                        "sink_size",
+                        "global_sink_size",
+                    )
+                },
+            )
+            for module in modules
+        ]
+
+        selected_sink = self.sink_size if sink_size is None else int(sink_size)
+        selected_global_sink = (
+            self.global_sink_size
+            if global_sink_size is None
+            else int(global_sink_size)
+        )
+        try:
+            dit.local_attn_size = self.local_attn_size
+            print(f"[inference] local_attn_size set on model: {dit.local_attn_size}")
+            self._set_all_modules_max_attention_size(self.local_attn_size)
+
+            self._set_all_modules_sink_size(selected_sink)
+            print(
+                f"[inference] sink_size set to: {selected_sink}"
+                f"{', multi_shot_sink enabled (pinned position)' if self.multi_shot_sink else ''}"
+                f"{', shot_clean_recache enabled' if self.shot_clean_recache else ''}"
+            )
+            self._set_all_modules_global_sink_size(selected_global_sink)
+            if selected_global_sink > 0:
+                print(
+                    "[inference] auto_global_sink_size set to: "
+                    f"{selected_global_sink} (first {selected_global_sink} frames "
+                    "permanently anchored)"
+                )
+
+            if self.inference_t_scale is not None:
+                dit.t_scale = self.inference_t_scale
+                print(f"[inference] t_scale overridden to: {dit.t_scale}")
+            if self._rope_method_override is not None:
+                dit.rope_method = self._rope_method_override
+            if self._original_seq_len_override is not None:
+                dit.original_seq_len = self._original_seq_len_override
+            print(
+                f"[inference] rope_method={dit.rope_method}, "
+                f"original_seq_len={dit.original_seq_len}"
+            )
+
+            dit.use_relative_rope = self.use_relative_rope
+            if self.use_relative_rope:
+                print("[inference] use_relative_rope enabled")
+            dit.rope_temporal_offset = 0.0
+            if self.multi_shot_rope_offset != 0.0:
+                print(
+                    f"[inference] multi_shot_rope_offset={self.multi_shot_rope_offset} "
+                    "(multi-shot RoPE offset enabled)"
+                )
+            yield
+        finally:
+            for module, state in module_state:
+                for name, value in state.items():
+                    try:
+                        if value is missing:
+                            if hasattr(module, name):
+                                delattr(module, name)
+                        else:
+                            setattr(module, name, value)
+                    except Exception:
+                        pass
+            for name, value in dit_state.items():
+                setattr(dit, name, value)
+
+    def begin_session(
+        self,
+        *,
+        initial_latent: torch.Tensor,
+        sink_size: int,
+        noise_plan: Optional[torch.Tensor] = None,
+    ):
+        """Begin one exclusive stateful continuation session.
+
+        Ordinary :meth:`inference` calls remain independent and are rejected
+        while the returned session is active.
+        """
+
+        from pipeline.causal_diffusion_continuation import ContinuationSession
+
+        return ContinuationSession.begin(
+            self,
+            initial_latent=initial_latent,
+            sink_size=sink_size,
+            noise_plan=noise_plan,
+        )
+
     def inference(
+        self,
+        noise: torch.Tensor,
+        text_prompts: List[List[str]],
+        initial_latent: Optional[torch.Tensor] = None,
+        return_latents: bool = False,
+        start_frame_index: Optional[int] = 0
+    ) -> torch.Tensor:
+        """Generate one independent video while excluding active sessions."""
+
+        with self._get_continuation_lock():
+            if getattr(self, "_active_continuation_session", None) is not None:
+                raise RuntimeError(
+                    "ordinary inference is unavailable while a continuation session is active"
+                )
+            return self._inference_independent(
+                noise=noise,
+                text_prompts=text_prompts,
+                initial_latent=initial_latent,
+                return_latents=return_latents,
+                start_frame_index=start_frame_index,
+            )
+
+    def _inference_independent(
         self,
         noise: torch.Tensor,
         text_prompts: List[List[str]],
@@ -270,65 +423,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         current_start_frame = start_frame_index
         cache_start_frame = 0
 
-        # Save model state before overriding for inference.
-        # Use _dit_model to reach the real CausalWanModel (PeftModel wrapping
-        # intercepts attribute writes, so self.generator.model.xxx would land
-        # on the wrapper instead of the model that reads them in forward()).
-        dit = self._dit_model
-        prev_local_attn_size = dit.local_attn_size
-        prev_t_scale = getattr(dit, 't_scale', 1.0)
-        prev_rope_method = getattr(dit, 'rope_method', 'linear')
-        prev_original_seq_len = getattr(dit, 'original_seq_len', None)
-        prev_use_relative_rope = getattr(dit, 'use_relative_rope', False)
-        prev_rope_temporal_offset = getattr(dit, 'rope_temporal_offset', 0.0)
-        prev_max_attention_sizes = {}
-        prev_sink_sizes = {}
-        prev_global_sink_sizes = {}
-        for name, module in self.generator.model.named_modules():
-            if hasattr(module, 'max_attention_size'):
-                prev_max_attention_sizes[name] = module.max_attention_size
-            if hasattr(module, 'sink_size'):
-                prev_sink_sizes[name] = module.sink_size
-            if hasattr(module, 'global_sink_size'):
-                prev_global_sink_sizes[name] = module.global_sink_size
-
-        dit.local_attn_size = self.local_attn_size
-        print(f"[inference] local_attn_size set on model: {dit.local_attn_size}")
-        self._set_all_modules_max_attention_size(self.local_attn_size)
-
-        if self.sink_size is not None:
-            self._set_all_modules_sink_size(self.sink_size)
-            print(f"[inference] sink_size set to: {self.sink_size}"
-                  f"{', multi_shot_sink enabled (pinned position)' if self.multi_shot_sink else ''}"
-                  f"{', shot_clean_recache enabled' if self.shot_clean_recache else ''}")
-
-        # Propagate the internally derived global sink length.
-        self._set_all_modules_global_sink_size(self.global_sink_size)
-        if self.global_sink_size and self.global_sink_size > 0:
-            print(f"[inference] auto_global_sink_size set to: {self.global_sink_size} "
-                  f"(first {self.global_sink_size} frames permanently anchored)")
-
-        if self.inference_t_scale is not None:
-            dit.t_scale = self.inference_t_scale
-            print(f"[inference] t_scale overridden to: {dit.t_scale}")
-
-        if self._rope_method_override is not None:
-            dit.rope_method = self._rope_method_override
-        if self._original_seq_len_override is not None:
-            dit.original_seq_len = self._original_seq_len_override
-        print(f"[inference] rope_method={dit.rope_method}, "
-              f"original_seq_len={dit.original_seq_len}")
-
-        dit.use_relative_rope = self.use_relative_rope
-        if self.use_relative_rope:
-            print(f"[inference] use_relative_rope enabled")
-
-        dit.rope_temporal_offset = 0.0
-        if self.multi_shot_rope_offset != 0.0:
-            print(f"[inference] multi_shot_rope_offset={self.multi_shot_rope_offset} "
-                  f"(multi-shot RoPE offset enabled)")
-
-        try:
+        with self._inference_runtime_overrides():
             raw_prompts = text_prompts[0] if isinstance(text_prompts[0], (list, tuple)) else text_prompts
             return self._inference_inner(
                 noise=noise, batch_size=batch_size, num_frames=num_frames,
@@ -345,29 +440,6 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 cache_start_frame=cache_start_frame,
                 raw_prompts=raw_prompts,
             )
-        finally:
-            dit.local_attn_size = prev_local_attn_size
-            dit.t_scale = prev_t_scale
-            dit.rope_method = prev_rope_method
-            dit.original_seq_len = prev_original_seq_len
-            dit.use_relative_rope = prev_use_relative_rope
-            dit.rope_temporal_offset = prev_rope_temporal_offset
-            for name, module in self.generator.model.named_modules():
-                if name in prev_max_attention_sizes:
-                    try:
-                        module.max_attention_size = prev_max_attention_sizes[name]
-                    except Exception:
-                        pass
-                if name in prev_sink_sizes:
-                    try:
-                        module.sink_size = prev_sink_sizes[name]
-                    except Exception:
-                        pass
-                if name in prev_global_sink_sizes:
-                    try:
-                        module.global_sink_size = prev_global_sink_sizes[name]
-                    except Exception:
-                        pass
 
     def _inference_inner(
         self, noise, batch_size, num_frames, num_channels, height, width,
@@ -436,6 +508,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     )
                 current_start_frame += self.num_frame_per_block
                 cache_start_frame += self.num_frame_per_block
+
+        # The ordinary one-shot path and explicit continuation sessions share
+        # the exact same block denoise / anchor-clamp / clean-recache kernel.
 
         # Step 3: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
@@ -541,12 +616,6 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 _ev_e = torch.cuda.Event(enable_timing=True)
                 _ev_s.record()
             conditional_dict = conditional_dict_list[chunk_index]
-            # Reset the cross-attention cache when each chunk uses a different
-            # prompt; otherwise the model reuses the previous chunk's k/v and
-            # ignores the current conditional_dict.
-            for block_index in range(self.num_transformer_blocks):
-                self.crossattn_cache_pos[block_index]["is_init"] = False
-                self.crossattn_cache_neg[block_index]["is_init"] = False
 
             # Update RoPE phase offset on shot boundaries.
             is_shot_boundary = self._is_shot_boundary(raw_prompts, chunk_index)
@@ -566,101 +635,24 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 :,
                 noise_start_frame:noise_start_frame + current_num_frames,
             ]
-            latents = noisy_input
-
-            # Step 3.1: Spatial denoising loop
-            sample_scheduler = self._initialize_sample_scheduler(noise)
-            for _, t in enumerate(tqdm(sample_scheduler.timesteps)):
-                timestep = t * torch.ones(
-                    [batch_size, current_num_frames], device=noise.device, dtype=torch.float32
-                )
-                if first_i2v_block:
-                    latents = _overwrite_i2v_context(
-                        latents, initial_latent, num_input_frames
-                    )
-                    timestep = _zero_i2v_context_timestep(
-                        timestep, num_input_frames
-                    )
-                latent_model_input = latents
-
-                flow_pred_cond, _ = self.generator(
-                    noisy_image_or_video=latent_model_input,
-                    conditional_dict=conditional_dict,
-                    timestep=timestep,
-                    kv_cache=self.kv_cache_pos,
-                    crossattn_cache=self.crossattn_cache_pos,
-                    current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
-                )
-                if use_cfg:
-                    flow_pred_uncond, _ = self.generator(
-                        noisy_image_or_video=latent_model_input,
-                        conditional_dict=unconditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache_neg,
-                        crossattn_cache=self.crossattn_cache_neg,
-                        current_start=current_start_frame * self.frame_seq_length,
-                        cache_start=cache_start_frame * self.frame_seq_length
-                    )
-                    flow_pred = flow_pred_uncond + self.guidance_scale * (
-                        flow_pred_cond - flow_pred_uncond)
-                else:
-                    flow_pred = flow_pred_cond
-
-                temp_x0 = sample_scheduler.step(
-                    flow_pred,
-                    t,
-                    latents,
-                    return_dict=False)[0]
-                latents = temp_x0
-                if first_i2v_block:
-                    latents = _overwrite_i2v_context(
-                        latents, initial_latent, num_input_frames
-                    )
-                # iter-34: removed per-step debug print of kv_cache scalar
-                # tensors (was forcing GPU→CPU sync every sampling step ×
-                # 4 steps × 48 chunks = 192 stalls per prompt). Re-enable
-                # behind LLV2_DEBUG_KV=1 if needed for debugging.
-                if os.environ.get("LLV2_DEBUG_KV", "0") == "1":
-                    print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
-                    print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
-
-            # Step 3.2: record the model's output
-            if first_i2v_block:
-                latents = _overwrite_i2v_context(
-                    latents, initial_latent, num_input_frames
-                )
-            output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
-
-            # Step 3.3: rerun with timestep zero to update KV cache using clean context
             is_scene_cut = self._is_scene_cut(raw_prompts, chunk_index)
-
             if is_scene_cut and self.shot_clean_recache:
                 print(f"[inference] Scene cut at chunk {chunk_index}, zeroing KV before recache")
-                current_start_tokens = current_start_frame * self.frame_seq_length
-                self._zero_kv_data(self.kv_cache_pos, current_start_tokens)
-                if use_cfg:
-                    self._zero_kv_data(self.kv_cache_neg, current_start_tokens)
-
-            self.generator(
-                noisy_image_or_video=latents,
+            latents = self._denoise_and_recache_block(
+                noise_block=noisy_input,
                 conditional_dict=conditional_dict,
-                timestep=timestep * 0,
-                kv_cache=self.kv_cache_pos,
-                crossattn_cache=self.crossattn_cache_pos,
-                current_start=current_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length
+                unconditional_dict=unconditional_dict,
+                use_cfg=use_cfg,
+                global_start_frame=current_start_frame,
+                cache_start_frame=cache_start_frame,
+                kv_cache_pos=self.kv_cache_pos,
+                kv_cache_neg=self.kv_cache_neg,
+                crossattn_cache_pos=self.crossattn_cache_pos,
+                crossattn_cache_neg=self.crossattn_cache_neg,
+                anchor_latent=initial_latent if first_i2v_block else None,
+                zero_kv_before_recache=is_scene_cut and self.shot_clean_recache,
             )
-            if use_cfg:
-                self.generator(
-                    noisy_image_or_video=latents,
-                    conditional_dict=unconditional_dict,
-                    timestep=timestep * 0,
-                    kv_cache=self.kv_cache_neg,
-                    crossattn_cache=self.crossattn_cache_neg,
-                    current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
-                )
+            output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
 
             # Step 3.3b: pin the current chunk for multi-shot sink on scene cut.
             if is_scene_cut:
@@ -770,9 +762,180 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             video = (video * 0.5 + 0.5).clamp(0, 1)
             return video
 
-    def _initialize_kv_cache(self, batch_size, dtype, device):
+    def _denoise_and_recache_block(
+        self,
+        *,
+        noise_block: torch.Tensor,
+        conditional_dict: dict,
+        unconditional_dict: Optional[dict],
+        use_cfg: bool,
+        global_start_frame: int,
+        cache_start_frame: int,
+        kv_cache_pos,
+        kv_cache_neg,
+        crossattn_cache_pos,
+        crossattn_cache_neg,
+        anchor_latent: Optional[torch.Tensor] = None,
+        zero_kv_before_recache: bool = False,
+    ) -> torch.Tensor:
+        """Denoise one causal block and recache its final clean latents.
+
+        This is the single cache-mutating generation kernel used by both the
+        ordinary independent-video API and explicit continuation sessions.
+        ``global_start_frame`` drives absolute RoPE/cache indices, while
+        ``cache_start_frame`` remains the caller's local output offset.
         """
-        Initialize a Per-GPU KV cache for the Wan model.
+
+        if noise_block.ndim != 5:
+            raise ValueError(
+                f"noise_block must be [B,T,C,H,W], got {tuple(noise_block.shape)}"
+            )
+        batch_size, current_num_frames = noise_block.shape[:2]
+        if current_num_frames <= 0:
+            raise ValueError("noise_block must contain at least one latent frame")
+        if global_start_frame < 0 or cache_start_frame < 0:
+            raise ValueError("block start indices must be non-negative")
+        if use_cfg and unconditional_dict is None:
+            raise ValueError("CFG requires unconditional conditioning")
+        if len(kv_cache_pos) != self.num_transformer_blocks or len(
+            crossattn_cache_pos
+        ) != self.num_transformer_blocks:
+            raise RuntimeError("positive cache layer count does not match the model")
+        if use_cfg and (
+            len(kv_cache_neg) != self.num_transformer_blocks
+            or len(crossattn_cache_neg) != self.num_transformer_blocks
+        ):
+            raise RuntimeError("negative cache layer count does not match the model")
+
+        anchor_frames = 0
+        if anchor_latent is not None:
+            if anchor_latent.ndim != 5:
+                raise ValueError(
+                    f"anchor_latent must be [B,T,C,H,W], got {tuple(anchor_latent.shape)}"
+                )
+            if (
+                anchor_latent.shape[0] != batch_size
+                or anchor_latent.shape[2:] != noise_block.shape[2:]
+            ):
+                raise ValueError("anchor_latent batch/shape must match noise_block")
+            # Preserve the ordinary inference API's historical behavior:
+            # callers may supply an initial latent on another device/dtype and
+            # the I2V clamp normalizes it to the sampled noise.  Continuation
+            # sessions enforce exact dtype/device before entering this shared
+            # kernel.
+            anchor_latent = anchor_latent.to(
+                device=noise_block.device,
+                dtype=noise_block.dtype,
+            )
+            anchor_frames = int(anchor_latent.shape[1])
+            if anchor_frames <= 0 or anchor_frames > current_num_frames:
+                raise ValueError("anchor_latent frame count must fit inside one block")
+
+        # Cross-attention currently bypasses these tensors, but clearing the
+        # flags preserves the established prompt-switch behavior if that
+        # implementation changes later.
+        for block_index in range(self.num_transformer_blocks):
+            crossattn_cache_pos[block_index]["is_init"] = False
+            crossattn_cache_neg[block_index]["is_init"] = False
+
+        latents = noise_block
+        sample_scheduler = self._initialize_sample_scheduler(noise_block)
+        if len(sample_scheduler.timesteps) == 0:
+            raise RuntimeError("sample scheduler returned no timesteps")
+        for t in tqdm(sample_scheduler.timesteps):
+            timestep = t * torch.ones(
+                [batch_size, current_num_frames],
+                device=noise_block.device,
+                dtype=torch.float32,
+            )
+            if anchor_latent is not None:
+                latents = _overwrite_i2v_context(
+                    latents, anchor_latent, anchor_frames
+                )
+                timestep = _zero_i2v_context_timestep(timestep, anchor_frames)
+
+            flow_pred_cond, _ = self.generator(
+                noisy_image_or_video=latents,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+                kv_cache=kv_cache_pos,
+                crossattn_cache=crossattn_cache_pos,
+                current_start=global_start_frame * self.frame_seq_length,
+                cache_start=cache_start_frame * self.frame_seq_length,
+            )
+            if use_cfg:
+                flow_pred_uncond, _ = self.generator(
+                    noisy_image_or_video=latents,
+                    conditional_dict=unconditional_dict,
+                    timestep=timestep,
+                    kv_cache=kv_cache_neg,
+                    crossattn_cache=crossattn_cache_neg,
+                    current_start=global_start_frame * self.frame_seq_length,
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                )
+                flow_pred = flow_pred_uncond + self.guidance_scale * (
+                    flow_pred_cond - flow_pred_uncond
+                )
+            else:
+                flow_pred = flow_pred_cond
+
+            latents = sample_scheduler.step(
+                flow_pred,
+                t,
+                latents,
+                return_dict=False,
+            )[0]
+            if anchor_latent is not None:
+                latents = _overwrite_i2v_context(
+                    latents, anchor_latent, anchor_frames
+                )
+            if os.environ.get("LLV2_DEBUG_KV", "0") == "1":
+                print(
+                    "kv_cache['local_end_index']: "
+                    f"{kv_cache_pos[0]['local_end_index']}"
+                )
+                print(
+                    "kv_cache['global_end_index']: "
+                    f"{kv_cache_pos[0]['global_end_index']}"
+                )
+
+        if anchor_latent is not None:
+            latents = _overwrite_i2v_context(latents, anchor_latent, anchor_frames)
+        if zero_kv_before_recache:
+            current_start_tokens = global_start_frame * self.frame_seq_length
+            self._zero_kv_data(kv_cache_pos, current_start_tokens)
+            if use_cfg:
+                self._zero_kv_data(kv_cache_neg, current_start_tokens)
+
+        clean_timestep = torch.zeros(
+            [batch_size, current_num_frames],
+            device=noise_block.device,
+            dtype=torch.float32,
+        )
+        self.generator(
+            noisy_image_or_video=latents,
+            conditional_dict=conditional_dict,
+            timestep=clean_timestep,
+            kv_cache=kv_cache_pos,
+            crossattn_cache=crossattn_cache_pos,
+            current_start=global_start_frame * self.frame_seq_length,
+            cache_start=cache_start_frame * self.frame_seq_length,
+        )
+        if use_cfg:
+            self.generator(
+                noisy_image_or_video=latents,
+                conditional_dict=unconditional_dict,
+                timestep=clean_timestep,
+                kv_cache=kv_cache_neg,
+                crossattn_cache=crossattn_cache_neg,
+                current_start=global_start_frame * self.frame_seq_length,
+                cache_start=cache_start_frame * self.frame_seq_length,
+            )
+        return latents
+
+    def _build_kv_cache(self, batch_size, dtype, device):
+        """
+        Build an independent positive/negative Per-GPU KV cache pair.
         """
         kv_cache_pos = []
         kv_cache_neg = []
@@ -858,12 +1021,18 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
                 })
 
-        self.kv_cache_pos = kv_cache_pos  # always store the clean cache
-        self.kv_cache_neg = kv_cache_neg  # always store the clean cache
+        return kv_cache_pos, kv_cache_neg
 
-    def _initialize_crossattn_cache(self, batch_size, dtype, device):
+    def _initialize_kv_cache(self, batch_size, dtype, device):
+        self.kv_cache_pos, self.kv_cache_neg = self._build_kv_cache(
+            batch_size=batch_size,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _build_crossattn_cache(self, batch_size, dtype, device):
         """
-        Initialize a Per-GPU cross-attention cache for the Wan model.
+        Build an independent positive/negative cross-attention cache pair.
         """
         crossattn_cache_pos = []
         crossattn_cache_neg = []
@@ -881,8 +1050,16 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 "is_init": False
             })
 
-        self.crossattn_cache_pos = crossattn_cache_pos  # always store the clean cache
-        self.crossattn_cache_neg = crossattn_cache_neg  # always store the clean cache
+        return crossattn_cache_pos, crossattn_cache_neg
+
+    def _initialize_crossattn_cache(self, batch_size, dtype, device):
+        self.crossattn_cache_pos, self.crossattn_cache_neg = (
+            self._build_crossattn_cache(
+                batch_size=batch_size,
+                dtype=dtype,
+                device=device,
+            )
+        )
 
     def clear_cache(self):
         """
@@ -890,10 +1067,15 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         Safe to call between independent inference calls; caches will be
         re-created on demand by _initialize_kv_cache/_initialize_crossattn_cache.
         """
-        self.kv_cache_pos = None
-        self.kv_cache_neg = None
-        self.crossattn_cache_pos = None
-        self.crossattn_cache_neg = None
+        with self._get_continuation_lock():
+            if getattr(self, "_active_continuation_session", None) is not None:
+                raise RuntimeError(
+                    "cannot clear pipeline caches while a continuation session is active"
+                )
+            self.kv_cache_pos = None
+            self.kv_cache_neg = None
+            self.crossattn_cache_pos = None
+            self.crossattn_cache_neg = None
 
     def _initialize_sample_scheduler(self, noise):
         if self.sample_solver == 'unipc':
