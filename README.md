@@ -83,7 +83,7 @@ The default git clone fetches objects from all branches, including our demopage 
 
 ### Quick Start
 
-内网 H100 上运行猫咪首帧 BF16 TI2V 测试，请参阅[中文快速指南](docs/H100_TI2V_QUICKSTART_ZH.md)。
+内网 H100 上运行猫咪 BF16 T2V/TI2V 测试，请参阅[中文快速指南](docs/H100_TI2V_QUICKSTART_ZH.md)。
 
 #### BF16
 

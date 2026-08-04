@@ -1,8 +1,9 @@
-# H100 内网 BF16 TI2V 快速推理
+# H100 内网 BF16 T2V/TI2V 快速推理
 
-本指南使用仓库内已准备好的猫咪首帧和动作提示词，生成“向前跳跃 → 玩逗猫棒 → 玩毛线球”的约 10.54 秒、24 FPS 视频。
+本指南使用仓库内已准备好的动作提示词，生成“向前跳跃 → 玩逗猫棒 → 玩毛线球”的约 10.54 秒、24 FPS 视频：
 
-> 注意：公开的 `model_bf16.pt` 是 AR generator 与 4-step DMD LoRA 的 BF16 合并权重，但其发布训练没有使用 I2V 数据。它可以运行当前 I2V 条件链路，首帧一致性与动作质量属于实验性结果，并非官方 I2V checkpoint 的质量保证。
+- **T2V**：只读取文本，从随机噪声生成视频，是公开权重的原生训练模式。
+- **TI2V**：同时读取猫咪首帧和文本；公开权重没有使用 I2V 数据训练，因此首帧一致性属于实验性结果。
 
 ## 1. 准备代码与模型
 
@@ -67,7 +68,9 @@ python -c 'import torch; print(torch.__version__, torch.cuda.get_device_name(0),
 
 最后一个值应为 `True`。
 
-## 3. 运行猫咪 TI2V 推理
+## 3. 运行推理
+
+### 3.1 TI2V：首帧图片 + 动作文本
 
 测试数据已在 `testsets/processed_bf16_ti2v/` 中，无需再次预处理。配置已指向上述 LongLive 权重，并且没有设置 `lora_ckpt` 或 `adapter`，避免对合并权重重复加载 LoRA。该 fixture 只有一个样本，请使用下面的单卡命令。
 
@@ -86,9 +89,35 @@ videos/cat_jump_wand_yarn_bf16/rank0-0-0_regular_prompts.txt
 
 配置生成 64 个 latent frames，解码为 253 帧，即约 10.54 秒。首次运行需要加载约 10 GB 的 LongLive generator，以及 Wan 的 T5、VAE 和 DiT 基础组件，启动时间较长属于正常现象。
 
+### 3.2 T2V：仅使用动作文本
+
+T2V 配置将 `i2v` 设为 `false`，并直接读取：
+
+```text
+testsets/processed_bf16_ti2v/prompts/russian_forest_jump_wand_yarn.txt
+```
+
+该文件只有一条非空行，因此会生成一个视频；同一动作时间线会自动用于全部 8 个生成 block。T2V 不会加载 `images/russian_forest_jump_wand_yarn.png`，所以生成猫咪的外观由文字和随机种子决定，不会严格复现原首帧。
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 \
+python inference.py \
+  --config_path configs/inference_t2v_cat_sequence_bf16.yaml
+```
+
+输出位于：
+
+```text
+videos/cat_jump_wand_yarn_t2v_bf16/rank0-0-0_regular.mp4
+videos/cat_jump_wand_yarn_t2v_bf16/rank0-0-0_regular_prompts.txt
+```
+
+两种配置都使用相同的 4-step BF16 合并权重；不要添加 `lora_ckpt` 或 `adapter`。
+
 ## 4. 常见问题
 
 - 报 `No such file or directory: wan_models/...`：基础 Wan2.2 组件没有放到仓库根目录下的固定相对路径。
 - 报 checkpoint key 不匹配：确认使用的是合并版 `model_bf16.pt`，且配置中没有 `lora_ckpt` 和 `adapter`。
 - 显存不足：先关闭同卡其他进程；仍不足时可将配置中的 `save_latents_only` 设为 `true`，先确认去噪链路，再单独解码 latent。
-- 首帧约束或动作质量不理想：这是公开权重没有使用 I2V 数据训练的已知限制；正式质量验证需要 I2V AR → I2V DMD/LoRA 专训权重。
+- TI2V 首帧约束不理想：这是公开权重没有使用 I2V 数据训练的已知限制；正式质量验证需要 I2V AR → I2V DMD/LoRA 专训权重。
+- T2V 结果与原猫咪图片不同：T2V 本来就不读取图片；需要固定身份时请使用 TI2V 配置或专训 I2V 权重。
