@@ -30,7 +30,7 @@ stage1_python="${LONG_LIVE_STAGE1_PYTHON:-python}"
 project_root="${LONG_LIVE_STAGE1_PROJECT_ROOT%/}"
 work_dir="${1:-${LONG_LIVE_STAGE1_TWO_ACTION_WORK_DIR:-}}"
 training_checkpoint="${LONG_LIVE_STAGE1_TRAIN_DIR%/}/checkpoint_model_003750"
-metadata_path="$project_root/testsets/metadata_16cases_two_actions_480x832_253frames.csv"
+metadata_path="$project_root/testsets/metadata_12cases_two_actions_480x832_253frames.csv"
 
 if [[ -z "$work_dir" ]]; then
   usage >&2

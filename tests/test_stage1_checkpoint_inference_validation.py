@@ -99,6 +99,11 @@ def _prompt_style_rows() -> list[dict[str, object]]:
             "prompt": "顺序提示 & 完整保留。",
             "prompt_style": "sequential",
         },
+        {
+            **common,
+            "prompt": "阶段相对时间提示，第二阶段重新归零。",
+            "prompt_style": "phase_relative",
+        },
     ]
 
 
@@ -338,8 +343,8 @@ def test_prompt_style_review_metadata_parser_accepts_generic_valid_groups(tmp_pa
 
     records = _load_prompt_style_review_records(metadata)
 
-    assert len(records) == 4
-    assert [record.row_id for record in records] == [0, 1, 2, 3]
+    assert len(records) == 6
+    assert [record.row_id for record in records] == [0, 1, 2, 3, 4, 5]
     assert {record.case_group for record in records} == {
         "ragdoll_jump_then_toy",
         "tabby_toy_then_jump",
@@ -357,8 +362,8 @@ def test_prompt_style_review_metadata_rejects_missing_review_column(tmp_path):
 @pytest.mark.parametrize(
     "styles",
     [
-        ["absolute_timeline", "absolute_timeline"],
-        ["absolute_timeline"],
+        ["absolute_timeline", "sequential", "sequential"],
+        ["absolute_timeline", "sequential"],
     ],
 )
 def test_prompt_style_review_metadata_rejects_duplicate_or_missing_style(
@@ -399,8 +404,10 @@ def test_prompt_style_html_uses_exact_row_ids_and_relative_urls(tmp_path):
     output_dir.mkdir(parents=True)
     absolute_video = output_dir / "absolute clip.mp4"
     sequential_video = output_dir / "sequential clip.mp4"
+    phase_relative_video = output_dir / "phase relative clip.mp4"
     absolute_video.write_bytes(b"absolute")
     sequential_video.write_bytes(b"sequential")
+    phase_relative_video.write_bytes(b"phase-relative")
     report = {
         "checkpoints": [
             {
@@ -408,6 +415,7 @@ def test_prompt_style_html_uses_exact_row_ids_and_relative_urls(tmp_path):
                 "status": "pass",
                 # Deliberately reverse the samples: the HTML must map by row_id.
                 "samples": [
+                    {"row_id": 2, "output_video": str(phase_relative_video)},
                     {"row_id": 1, "output_video": str(sequential_video)},
                     {"row_id": 0, "output_video": str(absolute_video)},
                 ],
@@ -427,17 +435,27 @@ def test_prompt_style_html_uses_exact_row_ids_and_relative_urls(tmp_path):
     sequential_url = (
         "checkpoint_model_003750/prepared/videos/sequential%20clip.mp4"
     )
+    phase_relative_url = (
+        "checkpoint_model_003750/prepared/videos/phase%20relative%20clip.mp4"
+    )
     assert absolute_url in comparison
     assert sequential_url in comparison
-    assert comparison.index(absolute_url) < comparison.index(sequential_url)
+    assert phase_relative_url in comparison
+    assert (
+        comparison.index(absolute_url)
+        < comparison.index(sequential_url)
+        < comparison.index(phase_relative_url)
+    )
     assert str(work_dir.resolve()) not in comparison
     assert "ragdoll_jump_then_toy" in comparison
     assert "cat: ragdoll" in comparison
     assert "action order: jump_then_toy" in comparison
     assert "绝对 &lt;时间轴&gt; 提示，完整保留。" in comparison
     assert "顺序提示 &amp; 完整保留。" in comparison
+    assert "阶段相对时间提示，第二阶段重新归零。" in comparison
     assert "absolute_timeline</strong> · row 0" in comparison
     assert "sequential</strong> · row 1" in comparison
+    assert "phase_relative</strong> · row 2" in comparison
 
     duplicate = {
         "checkpoints": [
@@ -570,7 +588,7 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
     metadata = (
         project_root
         / "testsets"
-        / "metadata_16cases_two_actions_480x832_253frames.csv"
+        / "metadata_12cases_two_actions_480x832_253frames.csv"
     )
     expected_fields = [
         "input_image",
@@ -588,16 +606,15 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
         assert reader.fieldnames == expected_fields
         rows = list(reader)
 
-    assert len(rows) == 16
+    assert len(rows) == 12
     assert Counter(row["cat_id"] for row in rows) == {
-        "ragdoll": 4,
-        "russian_forest": 4,
-        "siamese": 4,
-        "tabby": 4,
+        "ragdoll": 3,
+        "russian_forest": 3,
+        "siamese": 3,
+        "tabby": 3,
     }
     assert Counter(row["action_order"] for row in rows) == {
-        "jump_then_toy": 8,
-        "toy_then_jump": 8,
+        "jump_then_toy": 12,
     }
     expected_images = {
         "ragdoll": (
@@ -642,7 +659,7 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
         ) == expected_images[row["cat_id"]]
         assert cat_identity[row["cat_id"]] in row["prompt"]
         groups.setdefault(row["case_group"], []).append(row)
-    assert len(groups) == 8
+    assert len(groups) == 4
 
     absolute_anchors = (
         "0-1秒：",
@@ -660,6 +677,11 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
         "短暂停顿",
         "随后",
         "恢复最终坐姿",
+        "剩余视频保持静止",
+    )
+    phase_relative_anchors = (
+        "第一阶段（相对于该阶段起点）",
+        "短暂停顿后进入第二阶段（重新以该阶段起点为0秒）",
         "剩余视频保持静止",
     )
     jump = (
@@ -684,9 +706,9 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
         toy,
         final_still,
     )
-    for case_group, pair in groups.items():
-        assert len(pair) == 2
-        assert {row["prompt_style"] for row in pair} == set(
+    for case_group, trio in groups.items():
+        assert len(trio) == 3
+        assert {row["prompt_style"] for row in trio} == set(
             checkpoint_runner.PROMPT_STYLE_ORDER
         )
         assert len(
@@ -699,12 +721,13 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
                     row["cat_id"],
                     row["action_order"],
                 )
-                for row in pair
+                for row in trio
             }
         ) == 1
-        by_style = {row["prompt_style"]: row for row in pair}
+        by_style = {row["prompt_style"]: row for row in trio}
         absolute = by_style["absolute_timeline"]["prompt"]
         sequential = by_style["sequential"]["prompt"]
+        phase_relative = by_style["phase_relative"]["prompt"]
         assert all(absolute.count(anchor) == 1 for anchor in absolute_anchors)
         absolute_positions = [absolute.index(anchor) for anchor in absolute_anchors]
         assert absolute_positions == sorted(absolute_positions)
@@ -713,12 +736,17 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
             sequential.index(anchor) for anchor in sequential_anchors
         ]
         assert sequential_positions == sorted(sequential_positions)
-        for prompt in (absolute, sequential):
+        phase_relative_positions = [
+            phase_relative.index(anchor) for anchor in phase_relative_anchors
+        ]
+        assert phase_relative_positions == sorted(phase_relative_positions)
+        for anchor in ("0-1秒：", "1-3秒：", "3-4秒："):
+            assert phase_relative.count(anchor) == 2
+        for global_anchor in ("4-5秒：", "5-7秒：", "7-8秒：", "8-10.54秒："):
+            assert global_anchor not in phase_relative
+        for prompt in (absolute, sequential, phase_relative):
             assert all(invariant in prompt for invariant in common_invariants)
-            if by_style["absolute_timeline"]["action_order"] == "jump_then_toy":
-                assert prompt.index(jump) < prompt.index(toy), case_group
-            else:
-                assert prompt.index(toy) < prompt.index(jump), case_group
+            assert prompt.index(jump) < prompt.index(toy), case_group
 
     with pytest.raises(ValueError, match="duplicate input image"):
         checkpoint_runner.load_causal_testset_records(metadata)
@@ -727,8 +755,8 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
         allow_repeated_input_images=True,
     )
     review_records = _load_prompt_style_review_records(metadata)
-    assert len(causal_records) == len(review_records) == 16
-    assert [record.row_id for record in causal_records] == list(range(16))
+    assert len(causal_records) == len(review_records) == 12
+    assert [record.row_id for record in causal_records] == list(range(12))
 
     work_dir = tmp_path / "validation"
     samples = [
@@ -757,14 +785,15 @@ def test_two_action_metadata_matches_locked_experiment_contract(tmp_path):
         review_records=review_records,
         work_dir=work_dir,
     )
-    assert comparison.count('<tr><td class="case">') == 8
-    assert comparison.count("<video ") == 16
-    assert comparison.count("absolute_timeline</strong>") == 8
-    assert comparison.count("sequential</strong>") == 8
+    assert comparison.count('<tr><td class="case">') == 4
+    assert comparison.count("<video ") == 12
+    assert comparison.count("absolute_timeline</strong>") == 4
+    assert comparison.count("sequential</strong>") == 4
+    assert comparison.count("phase_relative</strong>") == 4
     assert str(work_dir.resolve()) not in comparison
     for case_group in groups:
         assert f"<strong>{case_group}</strong>" in comparison
-    for row_id in range(16):
+    for row_id in range(12):
         assert f"row_{row_id:04d}.mp4" in comparison
 
     legacy_metadata = project_root / "testsets" / "metadata_6cases_480x832.csv"

@@ -36,7 +36,7 @@ from utils.stage1_io import atomic_write_bytes, atomic_write_json  # noqa: E402
 
 REPORT_SCHEMA_VERSION = 1
 NUM_FRAME_PER_BLOCK = 8
-PROMPT_STYLE_ORDER = ("absolute_timeline", "sequential")
+PROMPT_STYLE_ORDER = ("absolute_timeline", "sequential", "phase_relative")
 PROMPT_STYLE_REVIEW_COLUMNS = (
     "input_image",
     "prompt",
@@ -461,9 +461,12 @@ video{display:block;max-width:360px;max-height:360px;background:#111}.prompt{max
     groups: dict[str, dict[str, PromptStyleReviewRecord]] = {}
     for record in review_records:
         groups.setdefault(record.case_group, {})[record.prompt_style] = record
+    prompt_style_headers = "".join(
+        f"<th>{html.escape(prompt_style)}</th>" for prompt_style in PROMPT_STYLE_ORDER
+    )
     lines.append(
         "<table><thead><tr><th>case group</th>"
-        "<th>absolute_timeline</th><th>sequential</th></tr></thead><tbody>"
+        f"{prompt_style_headers}</tr></thead><tbody>"
     )
     work_dir = work_dir.resolve()
     for case_group, styles in groups.items():

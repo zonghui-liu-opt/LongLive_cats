@@ -1,7 +1,8 @@
 # Stage-1 3750 EMA：10.54 秒双动作推理
 
-本入口只验证 `checkpoint_model_003750` 的 EMA adapter，生成 4 只猫、2 种动作顺序、2 种
-prompt 风格组成的 16 条视频。每条视频为 64 latent 帧，经 VAE 解码为 253 pixel 帧，24fps，
+本入口只验证 `checkpoint_model_003750` 的 EMA adapter，生成 4 只猫、固定“先跳跃、再玩逗猫棒”
+的动作顺序，以及 3 种 prompt 风格组成的 12 条视频。每条视频为 64 latent 帧，经 VAE 解码为
+253 pixel 帧，24fps，
 约 10.54 秒。
 
 本地代码测试不能替代真实 H100 推理。本流程的自动检查只验证文件、帧数、尺寸、FPS、首帧、
@@ -110,7 +111,7 @@ PY
 通过时应看到：
 
 - 顶层 `status=pass`、checkpoint count 为 1、optimizer step 为 3750；
-- 输出报告 `status=pass`、sample count 为 16，且没有缺失或额外 MP4；
+- 输出报告 `status=pass`、sample count 为 12，且没有缺失或额外 MP4；
 - frame policy 为 64 latent、253 expected pixel frames、253 carrier frames、24fps、8-frame blocks；
 - sampling 为 UniPC、50 steps、CFG 5.0、seed 1；
 - 每条视频恰好 253 帧，分辨率与对应首帧一致，并通过首帧、非纯色、非冻结技术门禁。
@@ -123,8 +124,15 @@ PY
 xdg-open /local_nvme/stage1_two_actions_3750_seed1_run01/comparison.html
 ```
 
-页面每行是一个 `case_group`，两列分别为 `absolute_timeline` 和 `sequential`，共 8 行、16 条
-视频，并显示猫、动作顺序和完整 prompt。请人工重点判断：
+页面每行是一只猫的 `case_group`，三列分别为 `absolute_timeline`、`sequential` 和
+`phase_relative`，共 4 行、12 条视频，并显示猫、动作顺序和完整 prompt。其中：
+
+- `absolute_timeline` 使用完整视频的 0–10.54 秒绝对时间轴；
+- `sequential` 只描述动作先后，不使用时间数字；
+- `phase_relative` 把每个动作视为独立阶段，第二阶段重新以 0 秒为起点，仅复用训练中出现过的
+  `0-1秒`、`1-3秒`、`3-4秒` 描述。
+
+请人工重点判断：
 
 - 跳跃与逗猫棒动作是否按指定顺序各完成一次；
 - 两个动作之间的恢复和短暂停顿是否自然；
