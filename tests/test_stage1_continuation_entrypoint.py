@@ -6,6 +6,23 @@ import subprocess
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = PROJECT_ROOT / "infer_stage1_two_actions_continuation_10s.sh"
+RETIRED_ARTIFACTS = (
+    PROJECT_ROOT / "infer_stage1_two_actions_10s.sh",
+    PROJECT_ROOT / "docs" / "STAGE1_TWO_ACTION_LONG_INFERENCE_ZH.md",
+    PROJECT_ROOT
+    / "testsets"
+    / "metadata_12cases_two_actions_480x832_253frames.csv",
+)
+
+
+def test_only_continuation_two_action_entrypoint_is_retained():
+    assert ENTRYPOINT.is_file()
+    assert all(not path.exists() for path in RETIRED_ARTIFACTS)
+
+    checkpoint_runner = (
+        PROJECT_ROOT / "scripts" / "run_stage1_training_checkpoints_validation.py"
+    ).read_text(encoding="utf-8")
+    assert "prompt-style" not in checkpoint_runner
 
 
 def _shell_fixture(tmp_path: Path):

@@ -92,7 +92,7 @@ data:
   prompt_mode: repeat_global
 
 training:
-  seed: 42
+  seed: 1
   gradient_accumulation_steps: 2
   reset_optimizer_between_phases: false
   optimizer:

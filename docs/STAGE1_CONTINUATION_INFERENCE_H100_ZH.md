@@ -1,5 +1,8 @@
 # Stage-1 Continuation：内网 H100 快速运行
 
+这是 step 3750、10 秒双动作推理当前唯一保留和支持的工程入口。旧的
+uniform-prompt 双动作脚本、prompt-style 对比元数据及专用报告链路已经移除。
+
 本入口使用 `checkpoint_model_003750` 的 EMA，在单张 H100 上生成固定矩阵：
 
 - 4 只猫 × 2 个动作顺序 × `sink=0/1`，共 16 条视频；

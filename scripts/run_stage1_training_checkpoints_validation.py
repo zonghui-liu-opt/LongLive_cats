@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
-from dataclasses import dataclass
 import html
 import json
 import os
@@ -36,33 +34,6 @@ from utils.stage1_io import atomic_write_bytes, atomic_write_json  # noqa: E402
 
 REPORT_SCHEMA_VERSION = 1
 NUM_FRAME_PER_BLOCK = 8
-PROMPT_STYLE_ORDER = ("absolute_timeline", "sequential", "phase_relative")
-PROMPT_STYLE_REVIEW_COLUMNS = (
-    "input_image",
-    "prompt",
-    "height",
-    "width",
-    "bucket",
-    "case_group",
-    "prompt_style",
-    "cat_id",
-    "action_order",
-)
-PROMPT_STYLE_ACTION_ORDERS = {"jump_then_toy", "toy_then_jump"}
-
-
-@dataclass(frozen=True)
-class PromptStyleReviewRecord:
-    row_id: int
-    input_image: str
-    prompt: str
-    height: int
-    width: int
-    bucket: str
-    case_group: str
-    prompt_style: str
-    cat_id: str
-    action_order: str
 
 
 def _env(name: str) -> str | None:
@@ -103,110 +74,6 @@ def _parse_num_latent_frames(value: str | int) -> int:
     return num_latent_frames
 
 
-def _load_prompt_style_review_records(
-    metadata_path: str | os.PathLike[str],
-) -> list[PromptStyleReviewRecord]:
-    """Load and validate the review-only metadata used by prompt-style HTML."""
-
-    metadata_path = Path(metadata_path).expanduser().resolve()
-    if not metadata_path.is_file():
-        raise FileNotFoundError(metadata_path)
-    with metadata_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = tuple(reader.fieldnames or ())
-        missing = [name for name in PROMPT_STYLE_REVIEW_COLUMNS if name not in fieldnames]
-        if missing:
-            raise ValueError(
-                f"Prompt-style metadata is missing required columns {missing}: {metadata_path}"
-            )
-        rows = list(reader)
-    if not rows:
-        raise ValueError(f"Prompt-style metadata is empty: {metadata_path}")
-
-    records: list[PromptStyleReviewRecord] = []
-    grouped: dict[str, list[PromptStyleReviewRecord]] = {}
-    for row_id, raw_row in enumerate(rows):
-        if None in raw_row:
-            raise ValueError(f"row {row_id}: prompt-style metadata has unexpected extra columns")
-        row = {str(key): "" if value is None else str(value) for key, value in raw_row.items()}
-
-        empty = [name for name in PROMPT_STYLE_REVIEW_COLUMNS if not row[name].strip()]
-        if empty:
-            raise ValueError(f"row {row_id}: prompt-style metadata has empty fields {empty}")
-        try:
-            height = int(row["height"])
-            width = int(row["width"])
-        except ValueError as exc:
-            raise ValueError(f"row {row_id}: height/width must be integers") from exc
-        if height <= 0 or width <= 0:
-            raise ValueError(f"row {row_id}: height/width must be positive")
-
-        prompt_style = row["prompt_style"].strip()
-        if prompt_style not in PROMPT_STYLE_ORDER:
-            raise ValueError(
-                f"row {row_id}: unsupported prompt_style {prompt_style!r}; "
-                f"expected one of {list(PROMPT_STYLE_ORDER)}"
-            )
-        action_order = row["action_order"].strip()
-        if action_order not in PROMPT_STYLE_ACTION_ORDERS:
-            raise ValueError(
-                f"row {row_id}: unsupported action_order {action_order!r}; "
-                f"expected one of {sorted(PROMPT_STYLE_ACTION_ORDERS)}"
-            )
-        cat_id = row["cat_id"].strip()
-        case_group = row["case_group"].strip()
-        expected_case_group = f"{cat_id}_{action_order}"
-        if case_group != expected_case_group:
-            raise ValueError(
-                f"row {row_id}: case_group {case_group!r} must equal "
-                f"{expected_case_group!r}"
-            )
-
-        image_path = Path(row["input_image"].strip()).expanduser()
-        if not image_path.is_absolute():
-            image_path = metadata_path.parent / image_path
-        record = PromptStyleReviewRecord(
-            row_id=row_id,
-            input_image=os.fspath(image_path.resolve()),
-            prompt=row["prompt"].strip(),
-            height=height,
-            width=width,
-            bucket=row["bucket"].strip().lower(),
-            case_group=case_group,
-            prompt_style=prompt_style,
-            cat_id=cat_id,
-            action_order=action_order,
-        )
-        records.append(record)
-        grouped.setdefault(case_group, []).append(record)
-
-    expected_styles = set(PROMPT_STYLE_ORDER)
-    for case_group, group_records in grouped.items():
-        observed_styles = [record.prompt_style for record in group_records]
-        if len(group_records) != len(PROMPT_STYLE_ORDER) or set(observed_styles) != expected_styles:
-            raise ValueError(
-                f"case_group {case_group!r} must contain exactly one row for each "
-                f"prompt_style {list(PROMPT_STYLE_ORDER)}; got {observed_styles}"
-            )
-        group_contracts = {
-            (
-                record.input_image,
-                record.height,
-                record.width,
-                record.bucket,
-                record.cat_id,
-                record.action_order,
-            )
-            for record in group_records
-        }
-        if len(group_contracts) != 1:
-            raise ValueError(
-                f"case_group {case_group!r} must use one input image, geometry, "
-                "bucket, cat_id, and action_order"
-            )
-    return records
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metadata", default="testsets/metadata_6cases_480x832.csv")
@@ -220,12 +87,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-repeated-input-images",
         action="store_true",
         help="Allow multiple metadata rows to reuse the same validated input image.",
-    )
-    parser.add_argument(
-        "--comparison-mode",
-        choices=("checkpoint", "prompt-style"),
-        default="checkpoint",
-        help="Render checkpoints as columns or compare two prompt styles per case group.",
     )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument(
@@ -410,109 +271,6 @@ video{display:block;max-width:300px;max-height:300px;background:#111}.metrics{fo
     return "".join(lines)
 
 
-def _prompt_style_comparison_html(
-    report: dict[str, Any],
-    *,
-    review_records: list[PromptStyleReviewRecord],
-    work_dir: Path,
-) -> str:
-    checkpoints = report.get("checkpoints", [])
-    if len(checkpoints) != 1:
-        raise ValueError("prompt-style comparison requires exactly one checkpoint")
-    checkpoint = checkpoints[0]
-    title = "Stage-1 two-action prompt-style comparison"
-    style = """
-body{font-family:system-ui,sans-serif;margin:24px;color:#202124;background:#fafafa}
-table{border-collapse:collapse;background:white;width:100%}th,td{border:1px solid #ddd;padding:10px;vertical-align:top}
-th{position:sticky;top:0;background:#f1f3f4;z-index:1}.case{min-width:210px;max-width:280px}
-video{display:block;max-width:360px;max-height:360px;background:#111}.prompt{max-width:520px;white-space:pre-wrap}
-.metrics{font-size:12px;color:#555;margin-top:6px}.failed{color:#b3261e}code{font-size:12px}
-"""
-    lines = [
-        "<!doctype html>",
-        '<html lang="zh-CN"><head><meta charset="utf-8">',
-        f"<title>{html.escape(title)}</title><style>{style}</style></head><body>",
-        f"<h1>{html.escape(title)}</h1>",
-        f"<p>step {int(checkpoint['optimizer_step']):06d} EMA。自动指标只做技术门禁；视觉效果需人工判断。</p>",
-    ]
-    if checkpoint.get("status") != "pass":
-        lines.append(
-            '<p class="failed">checkpoint failed: '
-            f"{html.escape(str(checkpoint.get('error', 'unknown error')))}</p></body></html>"
-        )
-        return "".join(lines)
-
-    samples_by_row: dict[int, dict[str, Any]] = {}
-    for sample in checkpoint.get("samples", []):
-        row_id = int(sample["row_id"])
-        if row_id in samples_by_row:
-            raise RuntimeError(f"duplicate output row_id in prompt-style comparison: {row_id}")
-        samples_by_row[row_id] = sample
-    expected_row_ids = {record.row_id for record in review_records}
-    if len(expected_row_ids) != len(review_records):
-        raise RuntimeError("prompt-style review metadata contains duplicate row_id values")
-    if set(samples_by_row) != expected_row_ids:
-        raise RuntimeError(
-            "prompt-style output row_id set mismatch: "
-            f"missing={sorted(expected_row_ids - set(samples_by_row))}, "
-            f"unexpected={sorted(set(samples_by_row) - expected_row_ids)}"
-        )
-
-    groups: dict[str, dict[str, PromptStyleReviewRecord]] = {}
-    for record in review_records:
-        groups.setdefault(record.case_group, {})[record.prompt_style] = record
-    prompt_style_headers = "".join(
-        f"<th>{html.escape(prompt_style)}</th>" for prompt_style in PROMPT_STYLE_ORDER
-    )
-    lines.append(
-        "<table><thead><tr><th>case group</th>"
-        f"{prompt_style_headers}</tr></thead><tbody>"
-    )
-    work_dir = work_dir.resolve()
-    for case_group, styles in groups.items():
-        first = styles[PROMPT_STYLE_ORDER[0]]
-        lines.append(
-            '<tr><td class="case"><strong>'
-            f"{html.escape(case_group)}</strong><br>cat: {html.escape(first.cat_id)}"
-            f"<br>action order: {html.escape(first.action_order)}</td>"
-        )
-        for prompt_style in PROMPT_STYLE_ORDER:
-            record = styles[prompt_style]
-            sample = samples_by_row[record.row_id]
-            video_path = Path(sample["output_video"]).resolve()
-            try:
-                relative = video_path.relative_to(work_dir).as_posix()
-            except ValueError as exc:
-                raise ValueError(
-                    f"prompt-style output video must be inside work dir: {video_path}"
-                ) from exc
-            source = quote(relative, safe="/._-")
-            metrics = sample.get("metrics", {})
-            metrics_html = ""
-            if {
-                "first_frame_psnr_db",
-                "mean_frame_std",
-                "mean_temporal_abs_diff",
-            }.issubset(metrics):
-                metrics_html = (
-                    '<div class="metrics">'
-                    f"PSNR {float(metrics['first_frame_psnr_db']):.2f} dB · "
-                    f"std {float(metrics['mean_frame_std']):.2f} · "
-                    f"temporal Δ {float(metrics['mean_temporal_abs_diff']):.3f}"
-                    "</div>"
-                )
-            lines.append(
-                "<td>"
-                f"<strong>{html.escape(prompt_style)}</strong> · row {record.row_id}"
-                f'<video controls loop preload="metadata" src="{html.escape(source)}"></video>'
-                f'<p class="prompt">{html.escape(record.prompt)}</p>'
-                f"{metrics_html}</td>"
-            )
-        lines.append("</tr>")
-    lines.append("</tbody></table></body></html>")
-    return "".join(lines)
-
-
 def run_validation(
     args: argparse.Namespace,
     *,
@@ -531,10 +289,6 @@ def run_validation(
     allow_repeated_input_images = bool(
         getattr(args, "allow_repeated_input_images", False)
     )
-    comparison_mode = getattr(args, "comparison_mode", "checkpoint")
-    if comparison_mode not in {"checkpoint", "prompt-style"}:
-        raise ValueError(f"unsupported comparison mode: {comparison_mode!r}")
-
     work_dir = Path(args.work_dir).expanduser().resolve()
     if work_dir.exists() and any(work_dir.iterdir()):
         raise FileExistsError(
@@ -561,34 +315,10 @@ def run_validation(
         )
         base_sha256 = str(base_report["output_sha256"])
         checkpoints = _resolve_checkpoints(args, base_sha256)
-        if comparison_mode == "prompt-style" and len(checkpoints) != 1:
-            raise ValueError("prompt-style comparison requires exactly one checkpoint")
         records = load_causal_testset_records(
             args.metadata,
             allow_repeated_input_images=allow_repeated_input_images,
         )
-        review_records = (
-            _load_prompt_style_review_records(args.metadata)
-            if comparison_mode == "prompt-style"
-            else None
-        )
-        if review_records is not None:
-            if len(review_records) != len(records):
-                raise RuntimeError(
-                    "prompt-style review metadata row count differs from causal metadata"
-                )
-            for record, review_record in zip(records, review_records, strict=True):
-                if (
-                    record.row_id != review_record.row_id
-                    or record.input_image != review_record.input_image
-                    or record.prompt != review_record.prompt
-                    or record.height != review_record.height
-                    or record.width != review_record.width
-                    or record.bucket != review_record.bucket
-                ):
-                    raise RuntimeError(
-                        f"prompt-style review row {review_record.row_id} differs from causal metadata"
-                    )
         report.update(
             {
                 "status": "running",
@@ -713,15 +443,7 @@ def run_validation(
         report["failed_checkpoint_count"] = failed_count
         report["status"] = "pass" if failed_count == 0 else "failed"
         comparison_path = work_dir / "comparison.html"
-        if comparison_mode == "prompt-style":
-            assert review_records is not None
-            comparison_html = _prompt_style_comparison_html(
-                report,
-                review_records=review_records,
-                work_dir=work_dir,
-            )
-        else:
-            comparison_html = _comparison_html(report, records=records, work_dir=work_dir)
+        comparison_html = _comparison_html(report, records=records, work_dir=work_dir)
         atomic_write_bytes(
             comparison_path,
             comparison_html.encode("utf-8"),
