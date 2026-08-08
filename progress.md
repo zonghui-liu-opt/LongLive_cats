@@ -3,7 +3,7 @@
 ## 会话：2026-08-08
 
 ### Phase 9：Stage-2 分批实现与 H100 门禁
-- **状态：** paused（H100配置契约与103项Stage‑2测试通过；相关回归63 passed但删除了1项，等待测试名/原因确认，未开始Step 2）
+- **状态：** paused（Batch 2 / Step 2 已完成并推送；等待用户执行 H100‑002 init-only 门禁）
 - 已确认：
   - 用户要求正式编码前先完成任务划分。
   - 首批代码必须进入新建远程 `stage-2` 分支；推送后立即暂停，等待用户在内网 H100 验证成功。
@@ -27,7 +27,20 @@
   - review修订后的Stage-2契约测试为103 passed；修改前相关回归再次为14+50 passed，共167个本地测试无失败。
   - Black、Ruff、py_compile、tracked/untracked whitespace与CLI help/JSON解析全部通过；关键派生值为capacity17、seq_len9750、G280/F1400，EMA target为generator adapter。
   - 三路独立最终review提出的P0/P1已全部闭环；精确提交/推送范围不含`results/`，后续实现按用户要求暂停。
-  - 用户回报内网H100：Stage‑2 tests为103 passed，配置契约全部通过；相关回归为63 passed，因为删除了原64项中的1项。删除项名称与原因尚未记录，因此整体门禁暂记“待确认”，不把未执行测试伪记为通过。
+  - 用户回报内网H100：Stage‑2 tests为103 passed，配置契约全部通过；相关回归为63 passed。
+  - 被排除项为`test_release_stage1_config_has_one_locked_source_of_truth`。该测试锁定公开仓库Stage‑1 release YAML，与实际内网Stage‑1训练参数不一致；Batch 1未修改Stage‑1 YAML或其解析路径，因此接受为内网门禁的显式例外，仓库测试文件本身不删除。
+  - Batch 1总门禁判定为通过；按用户授权开始Batch 2，范围严格限定为Step 2三角色初始化、独立LoRA、checkpoint/manifest与FSDP init-only审计。
+  - Batch 2修改前共享基础件基线：`test_stage2_config`、`test_lora_utils`、`test_stage1_fsdp2`、`test_merge_lora_generator`与`test_stage1_lazy_imports`合计128 passed；运行时禁用pytest cache与bytecode。
+  - 已先新增Batch 2三组红测骨架，覆盖生产shape target公式、PEFT角色隔离、teacher/init manifest、world8 1D FULL_SHARD与lazy init-only CLI；首次运行按预期因三个待实现模块缺失而在collect阶段失败，未出现规格外失败。
+  - 新增`Stage2DMD`三角色容器、严格role initializer、LoRA角色契约、world8一维FSDP2 helper、teacher/role-init manifest与独立`preflight_stage2_roles.py`；未注册trainer或修改`train.py`。
+  - Stage‑1 EMA merge升级为不可覆盖源文件、前后source snapshot一致、正式raw/EMA metadata、180 target/360 tensor schema、自哈希与strict fresh reload的v2 producer；Stage‑2 validator会重新核验原Stage‑1 `_SUCCESS`、manifest、拓扑与所有来源SHA。
+  - Teacher入口绑定architecture config、完整Wan无权重语义、operator attestation与可信provenance；native index的全部shards逐tensor必须BF16，LongLive wrapper payload只允许一个manifest指定state dict和标量metadata。
+  - 三角色按G→real→F顺序meta构造和严格物化，real/F不共享Parameter或storage；G/F LoRA master为FP32且B全0，real为BF16 frozen/0 trainable。每个role独立wrap root+30 blocks，post-FSDP审计全部参数的1D `Shard(0)`、mesh、dtype、FQN与计数。
+  - init-only入口在任何模型前拒绝resume/dirty或错误commit，所有rank逐阶段共识失败；运行时哨兵覆盖标准/直接forward、optimizer、EMA、T5、VAE与DataLoader，角色隔离、side effects、资产SHA和FSDP证据进入全rank consensus与原子manifest，marker为`ROLE_INIT_COMPLETE`而非训练`_SUCCESS`。
+  - 三路独立终审发现的native shard哈希、source BF16、FSDP frozen-base假阳性、资产TOCTOU、merge destructive路径、CUDA RNG污染、architecture漂移、world hang、legacy mmap、metadata token误判等问题均已用正反测试闭环。
+  - 最终本地Batch 2相关门禁为212 passed（14条已知`torch.jit` deprecation）；用户指定Stage‑1/DMD回归复跑为63 passed、1 deselected；Ruff、Black、三个CLI help、仓库外CLI bootstrap与`git diff --check`通过。
+  - `docs/STAGE2_H100_QUICK_DEPLOY_ZH.md`已新增`H100-002`：精确覆盖merge v2、teacher两种格式、环境变量、8卡torchrun、原子manifest验收、失败即停及“只证明init、不证明训练”边界。
+  - Batch 2提交范围严格为18个代码/测试/文档文件并推送到`longlive-cats/stage-2`；用户未跟踪的`results/`及其中资产文件未暂存、未提交、未推送。按分批约定暂停，不开始Batch 3。
 
 ## 会话：2026-08-07
 

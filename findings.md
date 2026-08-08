@@ -40,6 +40,14 @@
 - 配置fingerprint分为`launch_hash`与`contract_hash`：前者覆盖本次完整路径/初始化，后者排除operator-local路径和init/resume差异，供合法resume比较；资产内容SHA将在Step 2/3并入正式manifest门禁。
 - Resolver现已typed暴露architecture/checkpoint/manifest/data/negative/jsonl等后续步骤运行输入，无需回钻raw dict；saved-tensor offload scope锁为`generator_grad_exit_only`。等价数值写法共享语义hash，超大数字与非字符串key统一fail-fast。
 - review修订后的本地证据为Stage-2 103 passed、Stage-1/DMD相关回归64 passed；Black、Ruff、py_compile、CLI与空白检查通过。本机无CUDA，不能把这些结果表述为H100模型/算子/训练通过。
+- Batch 1内网结果为Stage‑2 103 passed、配置契约全部通过、相关回归63 passed。用户显式排除`test_release_stage1_config_has_one_locked_source_of_truth`，因为它约束公开仓库Stage‑1 YAML而非真实内网Stage‑1训练参数；该排除不掩盖Batch 1改动，因为本批未改Stage‑1 YAML/解析路径，仍保留其余共享config/LoRA/FSDP/scheduler回归。
+- Batch 1门禁据此通过。Batch 2只进入任务文档Step 2；不得提前实现数据、score adapter、rollout、loss、optimizer、EMA或trainer注册。
+- Batch 2修改前共享基础件基线为128 passed。Stage‑1 FSDP2实现锁定DP2×SP3的6卡HSDP，不能复用其拓扑常量或wrapper到Stage‑2 world8/SP1/FULL_SHARD；可以复用通用LoRA exact-target、canonical adapter与DTensor审计思想，但Stage‑2必须有隔离的8卡FSDP2契约。
+- Batch 2最终严格停在init-only：G读取step3750 EMA merge v2，real/F分别重新物化同一独立teacher SHA，G/F各自注入r32/r64 fresh LoRA，real无adapter；三角色分别以root+30 blocks执行1D FULL_SHARD并审计全部冻结/可训练参数为`Shard(0)` DTensor。
+- Teacher native入口只接受BF16 safetensors单文件/index/目录，manifest绑定index、全部shards、逐tensor schema/dtype与architecture config；LongLive wrapper `.pt`接受`generator/real_score/model`唯一selector和受限legacy serialization，但未知格式、`.bin`、裸root `.pt`与训练状态payload均fail-closed。
+- init-only preflight要求clean HEAD、单机world8 H100/BF16/NCCL；每个阶段做WORLD错误共识，运行时tripwire同时拦截标准Module调用与直接`.forward()`、optimizer/EMA/T5/VAE/DataLoader，角色对象/存储隔离和所有rank副作用结果明文写入原子`ROLE_INIT_COMPLETE` manifest。
+- 本机最终Batch 2相关门禁为212 passed、14条已知`torch.jit` deprecation；用户指定Stage‑1/DMD回归为63 passed、1 deselected。无CUDA/真实5B资产，因此必须由`H100-002`验证实际strict load、8卡DTensor拓扑和主机内存峰值后才进入Step 3。
+- 外部仍需内网确认：正式step3750 checkpoint是否具备新版raw/EMA metadata与完整源目录；real teacher真实物理格式、可信训练/转换来源SHA及cat-domain/video-global flow人工attestation。任一缺失均应停止，而不是自动猜格式或补写原件。
 
 ## 需求
 - 2026-08-04 continuation 新任务：实现显式单样本有状态 session，按 `A×3 → HOLD×2 → B×3` 生成 64 latent；A/HOLD/B 切换文本 conditioning，但 positive/negative self-KV、global cursor 与 temporal RoPE 连续。

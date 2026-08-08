@@ -4,7 +4,7 @@
 完整落实 `TASK-stage1-continuation-inference.md` 中的有状态 continuation inference 要求，形成可运行、可验证、可复现的实现、测试和内网 H100 快速部署文档，同时保持已有 uniform-prompt 推理语义不变。
 
 ## 当前阶段
-Phase 9 已暂停：H100配置契约通过；相关回归63 passed但删除1项，等待记录该测试名称与原因后判定Batch 1总门禁
+Phase 9 已暂停：Batch 2 / Step 2 已完成并推送，等待用户执行 H100‑002 三角色 init-only 门禁
 
 ## 各阶段
 
@@ -81,12 +81,14 @@ Phase 9 已暂停：H100配置契约通过；相关回归63 passed但删除1项�
 - [x] 9.4 仅实现首批最小闭环，完成本地针对性测试与回归审计
 - [x] 9.5 审查 diff，提交并推送首批代码到远程 `stage-2` 分支
 - [x] 9.6 暂停后续 production 实现，交付内网 H100 验证命令与通过标准
-- [ ] 9.7 收到用户 H100 验证成功后，再按批次继续后续代码任务
-- **Status:** in_progress
+- [x] 9.7 收到用户 H100 验证成功，并记录单项 Stage‑1 release YAML 测试的排除理由
+- [x] 9.8 仅实现 Batch 2 / Step 2 三角色初始化、LoRA/FSDP/manifest 审计
+- [x] 9.9 完成 Batch 2 本地审计、推送并再次暂停等待 H100 init-only 验证
+- **Status:** paused
 
 #### Phase 9 分批门禁
-1. **Batch 1 / Step 1（本轮唯一实现范围）**：Stage-2 YAML、严格 resolver、派生公式/计数和错误配置测试；不接 registry，不改任何既有 production trainer/model/pipeline/wrapper。
-2. **Batch 2 / Step 2**：G/real/F 三角色独立初始化、LoRA/FSDP/manifest 审计。
+1. **Batch 1 / Step 1（已通过 H100 门禁）**：Stage-2 YAML、严格 resolver、派生公式/计数和错误配置测试；不接 registry，不改任何既有 production trainer/model/pipeline/wrapper。
+2. **Batch 2 / Step 2（当前唯一实现范围）**：G/real/F 三角色独立初始化、LoRA/FSDP/manifest 审计；完成推送后暂停。
 3. **Batch 3 / Step 3**：600-cache gate、negative conditioning 与 F/G 独立 balanced sampler。
 4. **Batch 4 / Step 4**：显式 1+24 pack、dynamic seq_len 9750 与 mixed token timestep adapter。
 5. **Batch 5 / Steps 5–7**：24-new rollout、W16/S1/reset、KV autograd 安全、4-step UniPC/random exit；作为 cache-safety 原子批，不交付半安全 cache 路径。
@@ -123,6 +125,10 @@ Batch 1 推送后必须暂停。首次内网门禁只验证正式依赖栈、raw
 | 第二次规划更新补丁把 task plan 清单上下文误放进 `progress.md` | 1 | 重新读取三份规划文件并按文件分别应用正确上下文 |
 | 新文件 whitespace 验收发现 shell 末尾多一个空行 | 1 | 删除多余 EOF 空行并重新运行全部验收命令 |
 | 最终契约审计发现 shell 的未文档化 checkpoint override 可绕过固定 3750 | 1 | 删除 override，专用入口始终显式选择 `$LONG_LIVE_STAGE1_TRAIN_DIR/checkpoint_model_003750`；同时收紧 runbook 对 merged 保留时点的措辞 |
+| Batch 2 搜索meta-init路径时首个`rg`组合正则缺少闭合括号 | 1 | 改用多个`-e`固定子表达式重新搜索，定位到仓库已有`accelerate.init_empty_weights`路径 |
+| 直接导入`wan_5b.configs.WAN_CONFIGS`探查TI2V规格时本地缺少`easydict` | 1 | 不改变本地环境，改为只读`wan_5b/configs/wan_ti2v_5B.py`确认30层、dim3072、ffn14336、C48 |
+| teacher checkpoint篡改负例同时改变了文件大小，先触发size门禁而非预期SHA门禁 | 1 | 将fixture改为等长字节篡改，分别独立验证size与SHA失败路径 |
+| 首次格式检查误用当前Anaconda `python -m black`，该解释器未安装Black | 1 | 改用系统已安装的`black`/`ruff`可执行文件；根据报告机械格式化并清理新增代码lint |
 | planning 完成检查脚本不识别中文版 `阶段/状态` 标记，首次报告 0/0 | 1 | 将 plan 标题/状态改为脚本支持的 `Phase`/`Status`，复查为 5/5 complete |
 | Phase 6 首次 planning 补丁把 findings 决策行误用为 task_plan 上下文 | 1 | 读取各文件实际段落后按文件分别应用 |
 | Phase 7 首次规划补丁的 findings 上下文与实际文本不一致 | 1 | 读取三个文件的准确段落后拆分补丁并使用精确上下文 |

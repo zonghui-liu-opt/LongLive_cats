@@ -1,6 +1,6 @@
 # LongLive‑2.0：猫咪 TI2V 4‑Step Self‑Forcing DMD/DFD Stage‑2
 
-> 状态：Batch 1配置契约已通过内网验证；相关回归删除1项待确认，未开始 Step 2
+> 状态：Batch 1已通过内网验证；Batch 2 / Step 2已推送，暂停等待8×H100 init-only验证
 >
 > 最后确认日期：2026‑08‑08
 >
@@ -593,15 +593,17 @@ C4,K2: 1 + 6*(2+1) = 19
 - [x] **结果**：明确当前DMD/Stage‑1相关测试基线、工作区保护范围和所有新配置字段。
 - **主要区域**：新增 `configs/train_i2v_stage2.yaml`、`utils/stage2_config.py` 与Stage‑2 test骨架；只读对照现有DMD/pipeline/wrapper。
 - **验证**：运行相关现有测试；新增只描述baseline config/计数/公式的失败测试，不改production。
-- **完成证据**：Stage‑2配置正反契约103项与相关Stage‑1/DMD回归64项合并为167 passed；Black、Ruff、py_compile、CLI与whitespace检查通过。path-independent contract hash为`aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`。
+- **完成证据**：本地Stage‑2配置正反契约103项与相关Stage‑1/DMD回归64项通过；内网Stage‑2为103 passed，相关回归显式排除仅锁定公开Stage‑1 YAML的`test_release_stage1_config_has_one_locked_source_of_truth`后为63 passed，配置契约全部通过。Black、Ruff、py_compile、CLI与whitespace检查通过。path-independent contract hash为`aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`。
 - **暂停边界**：本步未接`train.py`/registry，未加载CUDA、模型、权重或600-cache；UniPC测试仅characterize仓库scheduler。内网确认raw配置解析、contract hash和本测试集后，才可开始Step 2。
 - **内网记录**：每次快速部署与实验按[Stage‑2 H100运行手册](docs/STAGE2_H100_QUICK_DEPLOY_ZH.md)追加真实命令、结果和产物路径。
 
 ### Step 2：角色配置、初始化manifest与独立LoRA
 
-- [ ] **结果**：G/real/F独立checkpoint与adapter schema；strict target/count/hash审计；init与resume分离。
+- [x] **结果**：G/real/F独立checkpoint与adapter schema；strict target/count/hash审计；init与resume分离。
 - **主要区域**：`model/stage2_dmd.py`、角色初始化helper、通用LoRA/FSDP基础件；不要把新角色语义塞回legacy trainer。
 - **验证**：tiny/CPU模型断言G180/r32、F180/r64、real0 trainable；错误role/rank/key/hash全部失败。
+- **完成证据**：新增严格Stage‑1 merge v2与teacher provenance、三角色顺序meta初始化、G/F独立LoRA、world8/SP1一维FSDP2 FULL_SHARD、全参数DTensor与init-only副作用/8-rank共识manifest。Batch 2相关与共享回归合计212 passed；用户指定Stage‑1/DMD集合为63 passed、1项显式deselect；Ruff、Black、CLI、whitespace检查通过。
+- **暂停边界**：本步未接`train.py`/trainer/score/rollout/loss/data/optimizer/EMA；推送后只执行`H100-002`三角色init-only，不代表C0/C1/C2或训练可用。
 
 ### Step 3：Stage‑2 cache preflight与balanced loader
 
