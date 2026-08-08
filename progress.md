@@ -3,7 +3,7 @@
 ## 会话：2026-08-08
 
 ### Phase 9：Stage-2 分批实现与 H100 门禁
-- **状态：** paused（Batch 1/Step 1已发布到`stage-2`；等待用户内网配置契约验证，未开始Step 2）
+- **状态：** paused（H100配置契约与103项Stage‑2测试通过；相关回归63 passed但删除了1项，等待测试名/原因确认，未开始Step 2）
 - 已确认：
   - 用户要求正式编码前先完成任务划分。
   - 首批代码必须进入新建远程 `stage-2` 分支；推送后立即暂停，等待用户在内网 H100 验证成功。
@@ -27,6 +27,7 @@
   - review修订后的Stage-2契约测试为103 passed；修改前相关回归再次为14+50 passed，共167个本地测试无失败。
   - Black、Ruff、py_compile、tracked/untracked whitespace与CLI help/JSON解析全部通过；关键派生值为capacity17、seq_len9750、G280/F1400，EMA target为generator adapter。
   - 三路独立最终review提出的P0/P1已全部闭环；精确提交/推送范围不含`results/`，后续实现按用户要求暂停。
+  - 用户回报内网H100：Stage‑2 tests为103 passed，配置契约全部通过；相关回归为63 passed，因为删除了原64项中的1项。删除项名称与原因尚未记录，因此整体门禁暂记“待确认”，不把未执行测试伪记为通过。
 
 ## 会话：2026-08-07
 

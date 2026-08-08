@@ -4,7 +4,7 @@
 完整落实 `TASK-stage1-continuation-inference.md` 中的有状态 continuation inference 要求，形成可运行、可验证、可复现的实现、测试和内网 H100 快速部署文档，同时保持已有 uniform-prompt 推理语义不变。
 
 ## 当前阶段
-Phase 9 已暂停：Batch 1 / Step 1 已发布到 `stage-2`，等待用户在内网 H100 完成配置契约验证
+Phase 9 已暂停：H100配置契约通过；相关回归63 passed但删除1项，等待记录该测试名称与原因后判定Batch 1总门禁
 
 ## 各阶段
 

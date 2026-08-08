@@ -1,6 +1,6 @@
 # LongLive‑2.0：猫咪 TI2V 4‑Step Self‑Forcing DMD/DFD Stage‑2
 
-> 状态：Batch 1 / Step 1 已完成；暂停在内网配置契约验证门禁，未开始 Step 2
+> 状态：Batch 1配置契约已通过内网验证；相关回归删除1项待确认，未开始 Step 2
 >
 > 最后确认日期：2026‑08‑08
 >
