@@ -595,6 +595,7 @@ C4,K2: 1 + 6*(2+1) = 19
 - **验证**：运行相关现有测试；新增只描述baseline config/计数/公式的失败测试，不改production。
 - **完成证据**：Stage‑2配置正反契约103项与相关Stage‑1/DMD回归64项合并为167 passed；Black、Ruff、py_compile、CLI与whitespace检查通过。path-independent contract hash为`aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`。
 - **暂停边界**：本步未接`train.py`/registry，未加载CUDA、模型、权重或600-cache；UniPC测试仅characterize仓库scheduler。内网确认raw配置解析、contract hash和本测试集后，才可开始Step 2。
+- **内网记录**：每次快速部署与实验按[Stage‑2 H100运行手册](docs/STAGE2_H100_QUICK_DEPLOY_ZH.md)追加真实命令、结果和产物路径。
 
 ### Step 2：角色配置、初始化manifest与独立LoRA
 
