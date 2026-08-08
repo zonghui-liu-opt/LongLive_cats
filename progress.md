@@ -1,5 +1,56 @@
 # 进度日志
 
+## 会话：2026-08-08
+
+### Phase 9：Stage-2 分批实现与 H100 门禁
+- **状态：** paused（Batch 1/Step 1已发布到`stage-2`；等待用户内网配置契约验证，未开始Step 2）
+- 已确认：
+  - 用户要求正式编码前先完成任务划分。
+  - 首批代码必须进入新建远程 `stage-2` 分支；推送后立即暂停，等待用户在内网 H100 验证成功。
+  - 后续批次不得在首批 H100 门禁通过前提前实现。
+- 当前工作：
+  - 已完整阅读任务文档、Git状态、配置系统、legacy DMD trainer/model/pipeline/Wan wrapper与相关测试。
+  - 三路独立只读复核完成：批次依赖、仓库映射、Git/测试安全均已交叉校验。
+  - 已定稿8个实现批次；本轮只实现Batch 1/Step 1，推送后暂停。
+  - 已从 `stage-1@4c0bb6a` 创建`stage-2`，发布目标严格为用户远程`longlive-cats/stage-2`；未触碰上游`origin`。
+  - 修改前相关回归基线为64 passed（14+50）；UniPC K4/shift5 timetable与negative prompt hash均和规格一致。
+  - 新增 `configs/train_i2v_stage2.yaml`：仅保存baseline原始参数与后续资产槽位，不复制派生计数或UniPC timetable。
+  - 新增 `utils/stage2_config.py`：纯静态严格resolver、canonical hash、派生公式和只读CLI；未接registry，未导入torch/model/CUDA。
+  - 静态CLI、py_compile与pure-import首次自检通过。
+  - 新增 `tests/test_stage2_config.py`，覆盖release派生值、A/B计数、EMA时钟、LoRA契约、真实UniPC timetable、hash/幂等，以及unknown/legacy/missing/非法数值与拓扑反例。
+  - 新增测试首轮71 passed；修改前64-test相关回归复跑仍为14+50 passed。
+  - 首次Black check仅报告两个新增Python文件需格式化；下一步执行机械格式化并继续Ruff/py_compile/diff审计。
+  - Black已格式化两个新增Python文件；Ruff发现并已删除一个未使用的`math`导入。
+  - 修正后Black、Ruff、py_compile、`git diff --check`全部通过；新增测试保持71 passed。
+  - 三路初审提出的schema碰撞、raw-before-normalize边界、CFG/EMA角色语义、candidate措辞、seed、Phase-B matched control、fallback、manifest-first action标签、双hash、typed字段和严格字符串问题均已逐项修订。
+  - 当前resolver输出launch hash与跨init/resume可比的contract hash；补齐Generator self/cross KV单conditional cache、typed runtime输入、generator-grad-exit offload scope与语义数值规范化后，本地默认占位路径下分别为`7b6ad0163d75e94f86b8836a9d0a9aa1aa904964fb30dbb7bac90e98febf5e1c`与`aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`。
+  - review修订后的Stage-2契约测试为103 passed；修改前相关回归再次为14+50 passed，共167个本地测试无失败。
+  - Black、Ruff、py_compile、tracked/untracked whitespace与CLI help/JSON解析全部通过；关键派生值为capacity17、seq_len9750、G280/F1400，EMA target为generator adapter。
+  - 三路独立最终review提出的P0/P1已全部闭环；精确提交/推送范围不含`results/`，后续实现按用户要求暂停。
+
+## 会话：2026-08-07
+
+### Phase 8：Stage-2 LongLive-2.0 Self-Forcing DMD/DFD
+- **状态：** complete（任务文档已交付，production code未开始）
+- 执行的操作：
+  - 完整读取 `grill-me` 与 `planning-with-files-zh` 技能说明，恢复既有 planning 文件。
+  - 完成 Stage-1/Stage-2 代码、配置、缓存、CFG、LoRA、score timestep、loss、resume 与 H100 只读审计。
+  - 与用户逐项锁定 baseline、Phase A/B、DMD/DFD、5F→1G、KV梯度边界、checkpoint、预检和压缩消融方案。
+  - 用户确认头脑风暴结束并授权生成任务文档，新增要求为参考 Stage-1 实现 generator/fake-score loss 与吞吐可视化。
+  - 审计 `utils/jsonl_logger.py`、`scripts/plot_stage1_training.py`、Stage-1 trainer logging/config/tests，确定复用 append-only lineage JSONL、raw+rolling PNG/SVG 和角色拆分吞吐的方案。
+  - 独立复核发现Stage-1 producer/plotter字段漂移及本地metrics artifact损坏；已把共享schema、producer→plotter契约测试、logical substep lineage与必需图fail-fast写入Stage-2任务文档。
+  - 创建 `TASK-stage2-self-forcing-dmd-dfd.md`，覆盖目标、non-goals、全部锁定决策、P0、15步实现/验证计划、H100门禁、推理与压缩消融。
+  - 补充隔离Stage‑2入口的文件映射，以及本地CSV仅1条且无action label时必须使用冻结sidecar的正式数据门禁。
+  - 完成两轮独立复核：无P0；收紧了continuous sigma、negative conditioning、F/G独立sampler、global-mean梯度等价、B1概率端点、partial-run绘图、压缩EMA/matched-control与multi-sink KV snapshot契约。
+  - 执行Markdown结构、重复行、空白与 `git diff --check` 审计，722行/78标题/15步/26个成对代码fence全部通过；planning完成检查为8/8。用户既有 `results/` 未跟踪数据保持不变。
+- 下一步：
+  - 等待用户审阅并明确授权后，从任务文档 Step 1 开始实现。
+- 创建/修改的文件：
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+  - `TASK-stage2-self-forcing-dmd-dfd.md`
+
 ## 会话：2026-08-04
 
 ### Phase 7：Stage-1 有状态 Continuation Inference
@@ -192,6 +243,7 @@
 | 2026-08-04 | 记录上述错误的首次补丁上下文与 progress 实际行不一致 | 1 | 读取文件尾部后使用准确上下文补写 |
 | 2026-08-04 | 最终审计暴露 manifest 写前路径与 inference/session 并发边界 | 1 | 先写失败测试，再实现写前路径门禁与全调用周期 RLock；独立复核无残留 P0/P1 |
 | 2026-08-04 | Anaconda Python 无 `black` 模块 | 1 | 改用现有系统 Black 可执行文件并以 Ruff/py_compile 复核 |
+| 2026-08-07 | 文档静态检查首次循环变量误用zsh特殊 `path`，导致当前shell的PATH被覆盖而找不到git | 1 | 改用任务专用 `file_item` 后在新shell重跑，全部静态检查通过 |
 
 ## 五问重启检查
 | 问题 | 答案 |

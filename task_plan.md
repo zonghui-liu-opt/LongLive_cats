@@ -4,7 +4,7 @@
 完整落实 `TASK-stage1-continuation-inference.md` 中的有状态 continuation inference 要求，形成可运行、可验证、可复现的实现、测试和内网 H100 快速部署文档，同时保持已有 uniform-prompt 推理语义不变。
 
 ## 当前阶段
-Phase 7：本地实现与验证完成，等待用户执行 H100 Step 10
+Phase 9 已暂停：Batch 1 / Step 1 已发布到 `stage-2`，等待用户在内网 H100 完成配置契约验证
 
 ## 各阶段
 
@@ -65,6 +65,38 @@ Phase 7：本地实现与验证完成，等待用户执行 H100 Step 10
 - [x] 7.10 编写简洁中文 H100 快速部署/实验文档并完成最终审计
 - **Status:** complete
 
+### Phase 8：Stage-2 LongLive-2.0 Self-Forcing DMD/DFD
+- [x] 只读审计 Stage-1 训练、推理、缓存、CFG、指标与现有 Stage-2 DMD 路径
+- [x] 通过 grill-me 逐项锁定 baseline、数据、模型、损失、更新时钟、H100 与压缩消融方案
+- [x] 审计并映射 Stage-1 loss/吞吐可视化实现
+- [x] 生成可独立交给 Codex 执行的 Stage-2 任务文档
+- [x] 复核任务文档覆盖全部锁定决策、P0 风险、验收标准与逐步验证
+- 下一步（需用户授权）：按文档开始 Step 1；本轮未实现production code。
+- **Status:** complete
+
+### Phase 9：Stage-2 分批实现与 H100 门禁
+- [x] 9.1 完整阅读 Stage-2 任务文档、仓库状态与适用约束
+- [x] 9.2 将 15 步规格映射为相互可验证的代码批次，并锁定首批范围/验收命令
+- [x] 9.3 创建独立 `stage-2` 分支，保护用户既有改动与 Stage-1 行为
+- [x] 9.4 仅实现首批最小闭环，完成本地针对性测试与回归审计
+- [x] 9.5 审查 diff，提交并推送首批代码到远程 `stage-2` 分支
+- [x] 9.6 暂停后续 production 实现，交付内网 H100 验证命令与通过标准
+- [ ] 9.7 收到用户 H100 验证成功后，再按批次继续后续代码任务
+- **Status:** in_progress
+
+#### Phase 9 分批门禁
+1. **Batch 1 / Step 1（本轮唯一实现范围）**：Stage-2 YAML、严格 resolver、派生公式/计数和错误配置测试；不接 registry，不改任何既有 production trainer/model/pipeline/wrapper。
+2. **Batch 2 / Step 2**：G/real/F 三角色独立初始化、LoRA/FSDP/manifest 审计。
+3. **Batch 3 / Step 3**：600-cache gate、negative conditioning 与 F/G 独立 balanced sampler。
+4. **Batch 4 / Step 4**：显式 1+24 pack、dynamic seq_len 9750 与 mixed token timestep adapter。
+5. **Batch 5 / Steps 5–7**：24-new rollout、W16/S1/reset、KV autograd 安全、4-step UniPC/random exit；作为 cache-safety 原子批，不交付半安全 cache 路径。
+6. **Batch 6 / Step 8**：DMD、DFD、fake raw-flow 与 continuous-sigma loss。
+7. **Batch 7 / Steps 9–11**：严格 5F→1G、phase/EMA/nonfinite、原子 resume、JSONL/plot；完成后才可执行正式 C0/C1/C2 H100 预检。
+8. **Batch 8 / Steps 12–14**：baseline inference、通用压缩/sink接口、全量本地验收与 H100 runbook。
+9. **Step 15**：始终由用户在内网 H100 执行。
+
+Batch 1 推送后必须暂停。首次内网门禁只验证正式依赖栈、raw配置解析/派生值、仓库UniPC scheduler只读characterization与相关回归；不得把它称为生产rollout runtime gate，不得加载三模型、启动训练或宣称 C0/C1/C2 通过。
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -99,6 +131,13 @@ Phase 7：本地实现与验证完成，等待用户执行 H100 Step 10
 | 新增 CSV 的 no-index whitespace 检查把 CRLF 表头判为 trailing whitespace | 1 | 仅将正式 continuation CSV 的换行标准化为 LF；严格 loader/artifact/HTML 48 tests 复跑通过，随后 no-index 检查通过 |
 | 最终审计发现 manifest 写前路径校验与 ordinary/session 互斥存在边界缺口 | 1 | 先新增逃逸路径与并发红测，再前移 canonical/containment 校验并让普通 inference、session、clear_cache 复用同一 RLock；相关 71 tests 通过 |
 | 指定 Anaconda Python 没有 `black` 模块 | 1 | 使用系统已安装的 Black 可执行文件格式化本任务新文件，随后 Ruff 与 py_compile 通过 |
+| Phase 9 首次组合 planning 补丁错误假设了 `findings.md` 的相邻标题 | 1 | 读取三个文件的真实标题位置后拆成精确小补丁，不重复原失败操作 |
+| Batch 1 首次 Black check 发现两个新增Python文件需格式化 | 1 | 使用仓库现有Black机械格式化后再运行Black/Ruff/py_compile/diff-check；产品逻辑测试当时已71 passed |
+| Batch 1 格式化后的首次Ruff检查发现测试文件未使用`math`导入 | 1 | 删除单个无用导入后重跑完整静态检查，不使用自动修复扩大修改面 |
+| Batch 1 review修订的大组合补丁因Black后的精确上下文不匹配失败 | 1 | 确认未发生部分写入后，按职责拆成小型精确补丁逐项应用 |
+| review修订后误用系统`pytest`可执行文件，Python3.11环境缺少OmegaConf而收集失败 | 1 | 核对shebang后改用项目依赖所在的Anaconda Python执行`python -m pytest`；96个Stage-2测试通过 |
+| review修订后的Black check报告两个Python文件需重新格式化 | 1 | 仅运行Black机械格式化，再跑Ruff、py_compile、测试与diff检查 |
+| 将`git diff --no-index --check`直接串入成功链时，正常“文件不同”退出码1被误当失败 | 1 | 对每个未跟踪文件单独接受0/1，仅把大于1视为检查异常；空白审计通过 |
 
 ## 备注
 - 重大决策前重新读取本计划。

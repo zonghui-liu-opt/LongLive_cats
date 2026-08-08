@@ -1,5 +1,46 @@
 # 发现与决策
 
+## 2026-08-08 Stage-2 分批执行约束
+
+- 恢复上下文确认：Stage-2 任务规格已完成，production code 尚未开始。
+- 本轮必须先产出任务拆分，再开始首批实现；拆分需把文档步骤映射到具体文件、CPU 本地测试、H100 门禁和暂停点。
+- 第一批只能形成最小可验证闭环；推送远程 `stage-2` 分支后停止后续实现，直到用户明确反馈内网 H100 验证成功。
+- Git 发布前必须核对并隔离工作树中已有用户改动，只暂存本轮确认范围。
+- 已完整阅读 723 行任务规格；文档的 Step 1 明确要求只新增 baseline config、严格 config resolver 和 Stage-2 测试骨架，建立当前相关测试基线，不改 production 训练路径。
+- 最终批次边界：Batch 1=Step 1配置契约；Batch 2=Step 2角色；Batch 3=Step 3数据/sampler；Batch 4=Step 4 score边界；Batch 5=Steps 5–7 cache-safety原子rollout；Batch 6=Step 8损失；Batch 7=Steps 9–11训练脊柱；Batch 8=Steps 12–14推理/压缩/runbook；Step 15 始终由用户执行。
+- Batch 1 的合理 H100 门禁不是正式训练，而是确认配置能在内网解析真实路径/拓扑、修改前回归与新增契约测试行为一致；在该门禁通过前不进入任何模型角色或算法 production 实现。
+- Git 基线：当前分支 `stage-1` 位于 `4c0bb6a`，跟踪 `longlive-cats/stage-1`；用户远程是 `longlive-cats=https://github.com/zonghui-liu-opt/LongLive_cats.git`，`origin` 是只应视为上游的 `NVlabs/LongLive.git`。新 `stage-2` 必须从当前 Stage-1 commit 分出并推到 `longlive-cats`，不能误推 upstream `origin`。
+- 当前既有工作树包含三份 planning 文件修改、未跟踪的 Stage-2 任务文档以及未跟踪 `results/` 用户数据。`results/` 必须永不暂存；任务文档和 planning 文件属于本轮/前序 Stage-2 交付，可在最终审查后与首批契约代码一起显式暂存。
+- `gh` 已安装且登录为 `zonghui-liu-opt`。用户只授权创建/推送分支，没有授权开 PR，因此首批只 commit/push，不扩大到 PR。
+- 仓库目前没有 Stage-2 文件。`train.py` 只注册 `score_distillation`/`diffusion`，Step 1 不要求接入新 trainer；现有 legacy `configs/train_i2v_dmd.yaml` 使用旧 score-distillation 语义，正式 baseline 配置必须独立新增且不让 legacy normalize 默认值掩盖缺字段。
+- 现有 Stage-1 正式配置是 `configs/train_i2v_ar.yaml`（不是 `configs/train_stage1.yaml`）；已有 `tests/test_stage1_config.py`、DMD conditioning、lazy import、JSONL plot 等可作为修改前回归集合。
+- `utils/config.py::normalize_config()` 会把 grouped sections 展平，并对 `trainer=score_distillation` 自动注入 legacy DMD defaults（如 real guidance 3、all-causal 角色kwargs）。Stage-2 必须在调用legacy normalize之前识别raw YAML并走专用resolver；Batch 1用characterization测试明确锁住normalized mapping会被strict resolver拒绝，后续接`train.py`时不得颠倒顺序。
+- `train.py` 当前只有 Stage-1 `stage1_i2v_cache`/FSDP2 gate 和两个 trainer 分支；按 Step 1 本批不改 registry。真正注册 `stage2_distillation` 应留到后续 trainer batch，避免一个不可执行的半接入口。
+- Stage-1 config test的既有风格是：从正式 YAML 经 `normalize_config` 读取，断言锁定拓扑/shape/计数，并用独立 resolver 推导稳定时钟/hash。Stage-2 可沿用“frozen dataclass + derived fields + stable hash + fail-fast”的方式，但必须是独立 schema。
+- Legacy I2V DMD config 明确是 32 latent、local_attn_size32、all-causal、共享 r128、旧 CFG 参数；Stage-2 config 测试应显式断言这些字段不存在或被拒绝，防止误启动旧路径。
+- Legacy `trainer/distillation.py` 的结构进一步证明隔离必要：初始化时共享一份 `config.adapter` 扫描全部 attention-block Linear；LoRA resume只含G/F adapters与单一`step`；LoRA模式禁用EMA；dataset会现场加载/编码视频和T5；训练loop以 `step % ratio` 决定G并在同一accumulation batch中先G后F，和锁定的五个独立F成功更新后再G完全不同。
+- Legacy trainer的异常处理只打印 traceback 而不重新抛出，可能让作业返回成功；checkpoint也不是完整cycle原子目录协议。Stage-2不得复用其主loop/checkpoint实现，首批 config 应把新 trainer 名称、init/resume互斥入口与完整原子checkpoint字段写死，真正接入留到后续批次。
+- Legacy trainer会给text encoder和VAE分配训练进程资源，并为real/fake/G套旧FSDP1 wrapper；Stage-2 baseline明确要求T5/VAE不驻留、三role独立wrap、单机world8/full-shard。首批配置应把这些作为可静态断言的契约。
+- Legacy `model/dmd.py` 的I2V helper会把initial覆盖进现有序列slot0；score timestep按block抽样/reshape；normalizer按block；real guidance用 `cond + legacy_scale*(cond-uncond)`；grad使用`nan_to_num`；fake loss把x0再转回flow。这些正是规格P0，Stage-2 config/契约测试必须禁止旧helper/旧CFG字段承担新语义。
+- Legacy `pipeline/self_forcing_training.py` 由`num_max_frames * frame_seq_length`直接分配cache，random exit在pipeline内部按block抽样；noisy/exit forward默认会写共享cache；clean recache还会额外加`context_noise`。Stage-2需要显式派生`capacity=S+W=17`、外部exit、noisy discard与exact clean recache接口，不能仅参数化旧类即宣称正确。
+- 现有pipeline在独立首帧I2V时把noise长度仍当整个24槽并将initial覆盖首槽，因此输出只有23个新latent；首批必须以静态配置/公式契约锁定`generated=24`、`score=25`、`decode=25→drop1→96`，实际修复推迟到rollout/pack批次。
+- `WanDiffusionWrapper` 对noncausal模型固定 `uniform_timestep=True`，forward直接取`timestep[:,0]`；`seq_len`硬编码28160；flow↔x0通过离散scheduler nearest lookup并回到原dtype。后续Step 4/8需新增显式mixed-token timestep与continuous-sigma接口，同时保留旧uniform-time parity；首批只能锁定配置/公式，不能修改wrapper。
+- Wrapper已有延迟cache-update环境变量协议，但仍会最终应用更新，不能表达Stage-2 noisy forward的discard语义；后续应设计正式`commit_self_kv`接口而非依赖环境变量。
+- 本地环境与正式requirements有显著漂移（agent审计为macOS arm64/Python3.10、无CUDA、diffusers0.38/transformers5.9/peft0.19；requirements锁定diffusers0.31、transformers<5）。本机通过只能作为CPU契约证据，首批推送后仍需用户在内网H100正式环境验证依赖/解析。
+- 修改前最小相关回归已由只读测试审计跑出两组合计64 passed；全`tests/` collect为262。第一批改后必须复跑相同集合，并新增Stage-2 config契约测试；不能把本机无CUDA结果包装成H100通过。
+- 独立批次审查建议把Step 5–7作为不可拆的cache-safety原子批；Step 9–11完成前不得执行正式C0/C1/C2。该依赖已吸收进正式分批计划。
+- 为最大限度缩小第一次变更面，本轮首批严格限定为文档Step 1，而不是提前实现角色或真实数据路径。首次H100门禁只核对正式环境中的配置/派生契约；真实600-cache和三角色init-only门禁分别留到Batch 2/3完成后。
+- Balanced sampler尚有需在Batch 3固化的确定性细节：10个G batches消费640样本，必须显式定义每动作队列wrap/reshuffle、额外名额相位和resume state；Step 1只声明策略枚举，不实现或静默猜测数据标签。
+- 主代理在修改前复跑两组正式首批相关回归：14 passed + 50 passed，共64 passed；运行时禁用pytest cache和bytecode，未改工作树。
+- 当前仓库实际UniPC scheduler在CPU以K4/shift5解析为`[999,937,833,624]`且terminal sigma为0；`DEFAULT_NEGATIVE_PROMPT` UTF-8 SHA256实算为规格锁定的`ce96e0324e4b54ce4b6e867f669ca520952e1a34cc116543516b1897f0d3c47e`。
+- Batch 1最终配置只保存原始研究输入，所有chunks/history/capacity/token/update totals与UniPC timetable均不作为YAML第二真相；UniPC测试仅是仓库scheduler characterization，生产启动漂移门禁明确延期到Step 7。
+- CFG执行路径已静态锁定：Generator与fake-score均为conditional-only单forward，Generator仅一套self-KV和一套cross-KV；real-score为顺序cond/uncond双forward并使用`uncond+5*(cond-uncond)`。EMA显式只指向Generator adapter，fake/real无EMA。
+- H100 batch配置统一使用candidate而非approved措辞；训练seed允许任意非负值并纳入hash，fsync允许任意正整数；saved-tensor CPU offload只允许micro1×acc8候选，compile仅允许无cudagraph安全mode。
+- Phase-B schema同时表达release `A24+B4 dmd_dfd`、A-only终止和相同40G/200F预算的`dmd_only` matched control，且明确A/B不重置optimizer。
+- 配置fingerprint分为`launch_hash`与`contract_hash`：前者覆盖本次完整路径/初始化，后者排除operator-local路径和init/resume差异，供合法resume比较；资产内容SHA将在Step 2/3并入正式manifest门禁。
+- Resolver现已typed暴露architecture/checkpoint/manifest/data/negative/jsonl等后续步骤运行输入，无需回钻raw dict；saved-tensor offload scope锁为`generator_grad_exit_only`。等价数值写法共享语义hash，超大数字与非字符串key统一fail-fast。
+- review修订后的本地证据为Stage-2 103 passed、Stage-1/DMD相关回归64 passed；Black、Ruff、py_compile、CLI与空白检查通过。本机无CUDA，不能把这些结果表述为H100模型/算子/训练通过。
+
 ## 需求
 - 2026-08-04 continuation 新任务：实现显式单样本有状态 session，按 `A×3 → HOLD×2 → B×3` 生成 64 latent；A/HOLD/B 切换文本 conditioning，但 positive/negative self-KV、global cursor 与 temporal RoPE 连续。
 - B 复用 HOLD 的 global latent 39 作为 global latent 40 的 soft anchor；A 的 global latent 0 使用 initial image latent。两处 anchor 均在每个采样 step 模型前和 scheduler 后 clamp，且各段长度仍分别为 24/16/24。
@@ -157,3 +198,46 @@
 
 ---
 *重要发现应在形成后及时更新。*
+
+## 2026-08-07 Stage-2 LongLive-2.0 任务文档
+
+### 已锁定目标
+- 使用 Stage-1 checkpoint 3750 EMA merged causal generator 初始化 Stage-2，训练 4-step UniPC、24 个全新 latent、3×8 chunk 的 Self-Forcing DMD/DFD baseline。
+- 永久保留原始首帧 global sink；baseline 非 sink 局部窗口 W16 包含当前 chunk8 与最近历史8，物理 self-KV 容量17。
+- 每个新动作清除上一动作 local self-KV 与 cross-KV，保留 sink，并输出24个新 latent；25-latent VAE输入只用于解码，丢弃 sink 对应像素帧后输出96帧。
+- real-score 为冻结 bidirectional TI2V teacher、标准 CFG5；fake-score 为 teacher 副本上的 core r64 LoRA；generator 为 fresh core r32 LoRA，训练/部署 CFG1。
+- Score 输入显式为 `[initial_latent, future24]`；future 使用 video-global timestep，sink t=0、不加噪且不参与任何 loss/normalizer。
+- Phase A 为24个 generator epochs纯DMD；Phase B为4 epochs混合DMD/DFD；严格5个成功fake-score更新后1个generator更新，global batch64。
+- Generator noisy forward不提交 self-KV；每chunk仅最终 clean recache 在 no_grad 下提交并 detach，禁止跨chunk BPTT；Generator cache path关闭activation checkpoint，fake-score保留。
+- H100使用完整预检、micro2×8×acc4优先、micro1×8×acc8回退；global batch32不是OOM修复。
+- 仅使用当前 testsets、seeds 1–4正确推理并人工评估；暂不实现自动视觉质量指标。
+
+### 文档新增要求
+- 任务必须包含训练可视化实现，参考 Stage-1：分别可视化 generator loss、fake-score loss、梯度/非有限状态、F/G吞吐、完整5F→1G cycle吞吐、显存与各phase/branch统计。
+- 可视化必须使用独立的成功 F/G update 计数作为横轴，不能用混合 loop step；Phase A/B、DMD/DFD、raw/EMA与断点恢复边界必须可辨识。
+- 当前阶段只生成任务文档，不实现代码；待用户审阅后再逐步执行。
+- 当前本地600-clips CSV实际只有1条fixture且没有action label；正式22/21/21 balanced sampler必须依赖内网可靠cache字段或冻结的600行action sidecar，禁止用行顺序或模糊聚类猜标签。
+- Stage‑2建议新增隔离的config/trainer/model/rollout/data/checkpoint/metrics入口，只复用并最小扩展Wan、UniPC、LoRA/FSDP/JSONL底座，避免继续扩大legacy DMD条件分支并破坏Stage‑1。
+
+### 已知 P0
+- 现有I2V路径用sink覆盖24槽位的第0帧，实际仅23个新latent。
+- noncausal wrapper取首帧t=0作为整段t，必须实现9750-token TI2V timestep adapter和动态seq_len。
+- 当前generator/fake-score共享LoRA配置、LoRA resume不含optimizer/EMA/RNG、更新顺序不是严格F×5→G。
+- 当前带梯度KV提交会污染持久cache的autograd图；现有generator activation checkpoint还会在backward读取已变异cache。
+- 当前fake-score raw flow经过BF16 x0 round-trip，在低sigma放大量化误差。
+
+### Stage-1 可视化复用结论
+- `utils/jsonl_logger.py` 已提供 append-only JSONL、截断尾行容错、run lineage、resume 后 child 覆盖 parent stale suffix、attempt 单调编号、跨 rank step elapsed/straggler 和逻辑吞吐字段；Stage-2 应复用通用机制，但使用新 schema/version，不能把混合 F/G 时钟硬塞进 Stage-1 单 optimizer-step schema。
+- `trainer/diffusion.py` 的 Stage-1 正式路径每个成功 update 写一条 `train_step`，non-finite 重试另写 `nonfinite_attempt`；记录 phase、epoch、loss、pre-clip grad、EMA、吞吐、显存和 straggler，checkpoint I/O 前后恢复 RNG。Stage-2 应保持这一可审计风格。
+- `scripts/plot_stage1_training.py` 已实现 latest-lineage读取、raw+rolling mean、PNG/SVG无头渲染与 loss/throughput/time/optimization/memory 图；其中 phase marker 目前硬编码 Stage-1 step 300/480，Stage-2 必须改为由日志/config派生 A/B 边界。
+- `tests/test_jsonl_training_plot.py` 已覆盖 lineage覆盖、截断尾行、logical workload和12个PNG/SVG产物；Stage-2需新增双时钟、5F→1G cycle、DMD/DFD branch、resume重复/覆盖及图产物测试。
+- Stage-2 建议单一 JSONL 内使用 `fake_update`、`generator_update`、`cycle_summary`、`nonfinite_attempt` 等 record_type；横轴分别为 `completed_fake_updates`、`completed_generator_updates` 和 `completed_cycles`，禁止使用旧的混合 `step`。
+- Generator 图至少包含 DMD/DFD surrogate loss、raw score-difference/denominator诊断、grad norm、LR、DMD/DFD branch与exit histogram；Fake-score图至少包含raw-flow MSE、grad norm、LR和score timestep分布。
+- 吞吐必须按角色拆分：F rollout/score/backward/optimizer、G rollout/real CFG cond+uncond/fake score/backward/optimizer、完整5F→1G cycle；同时记录global samples/s、generated latent/s、DiT forward calls/s、step max/mean、straggler及allocated/reserved/free显存。
+- 需要生成一份可人工查看的静态汇总（PNG/SVG，建议再加HTML索引），但不实现自动视觉质量指标；训练可视化与推理质量评估是两个独立范围。
+- 当前Stage-1 artifact只有损坏的4500-step run尾部3条记录且无run lineage，不对应checkpoint3750，不能用于趋势判断或作为Stage-2 plot输入。
+- Stage-1 producer/plotter已有字段漂移：`preclip_grad_norm`/`pre_clip_grad_norm`、memory bytes/GiB、嵌套ER路径不一致，phase marker还硬编码300/480；Stage-2必须用共享schema helper和producer→plotter集成测试阻止同类空图。
+- Stage-2成功substep建议统一 `record_type=train_step` 加 `role`，并以 `logical_substep_id=cycle*6+substep` 做resume stale-partial覆盖；F/G角色step仍分别记录。
+- 最终文档复核无P0；已明确score连续sigma与rollout UniPC是独立契约、Stage‑1 negative prompt精确hash、F/G独立sample stream、global-mean梯度等价及B1十点概率序列。
+- 可视化终点和phase marker必须京eresolved config推导：A24纯DMD为G240/F1200，完整A24+B4为G280/F1400，partial/preflight仍可绘制但不可伪装complete。
+- 压缩适配的child raw G/EMA均从parent EMA启动，F从parent raw启动；branch/control成对使用A8+B2或A12+B2。W24 inference-only只是OOD full-context reference，不是质量上界。
