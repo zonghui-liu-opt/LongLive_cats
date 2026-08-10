@@ -1,9 +1,37 @@
 # 进度日志
 
+## 会话：2026-08-10
+
+### Phase 9 检查点A：用户检查通过，等待内网8×H100准备门禁
+- **状态：** waiting_for_h100_checkpoint_a
+- 用户已确认原始视频为97 pixel frames并锁定方案：Stage‑2保持24-new/F25；现有cache逐条严格检查，合格F25直接复用，F24从原始97帧确定性重提。禁止补帧、复制latent或改23-new。
+- 完成显式`initial1+future24` score pack、9750-token mixed timestep、FP32连续score noising/x0、DMD/DFD与fake raw-flow DSM。
+- 完成3×8 rollout、W16/H8/S1/capacity17、真实UniPC sigma、分层exit RNG、clean-only self-KV commit、真实单路cross-cache与episode reset。
+- 已修复FP32 noisy进入BF16 Conv3d、FSDP root误转FP32 timestep、rollout误用`t/1000`、NCCL CPU broadcast和方向混合microbatch；legacy Stage‑1 source manifest现有严格、原子、非覆盖式文本来源升级入口，正式CLI强制`python -I -B`并在项目导入前验证物理clean HEAD。
+- 最终本地计数：F25 focused 88 passed；全部Stage‑2 329 passed；全`tests/` 611 passed及2 subtests passed。14条warning均为既有`torch.jit.script_method`弃用提示。两位独立代码审计与H100指南终审均确认P0=0。
+- 最终静态检查：新增/Stage‑2 Python文件Black、Ruff、py_compile、tracked/untracked whitespace全部通过；contract hash为`aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`。最小扩展的legacy `causal_model.py`保留与HEAD完全相同的既有7项Ruff/Black债务，没有新增诊断或无关重排。
+- 已将旧434行历史式H100文档重写为单线检查点A手册，补齐clean/ignored门禁、外部600条metadata/action注入、F25→attestation→negative→formal audit、init-only成功信号和失败即停说明；未实现Steps9–14，`results/`用户数据保持未跟踪且未改动。
+
+### Phase 9：训练前准备检查点执行记录（历史，已完成）
+- **当时状态：** waiting_for_user_review
+- 已完成：
+  - 完整重读 `TASK-stage2-self-forcing-dmd-dfd.md`，确认文档首行、Step 2 与现有计划均要求等待 8×H100 init-only 验证。
+  - 核对当前分支为 `stage-2@bde0142`，远端 `longlive-cats/stage-2` 同步；仅有用户未跟踪的 `results/`，不得触碰。
+  - 核对 merge、teacher manifest、role preflight 三个 CLI 的真实 `--help` 与参数；确认 preflight 会拒绝 dirty worktree、既存输出目录及非 8-rank torchrun。
+  - 识别旧手册的主要可用性问题：434 行混合历史与当前步骤、路径占位缺少集中填写区、成功信号分散、没有把“clean code clone / repo 外资产与输出”说成人话。
+- 用户最新明确覆盖旧划分：只在“全部训练前准备”“训练+log/权重/可视化”“batch推理与其余任务”三个节点停；中间小Batch由Codex自行验证，不再逐个等待。
+- 已据此废止H100‑002单独暂停，将第一个检查点锁定为原Steps 1–8；训练主循环/JSONL/checkpoint/plot仍属于下一检查点，当前禁止提前实现。
+- 当时中间快照的212项Batch2门禁已复跑：`212 passed, 14 warnings in 21.86s`，警告均为已知`torch.jit.script_method` deprecation。
+- 后续结果：Step 3–8、native F25 producer与安全终审全部完成；本条“用户通过前不发布”是当时边界，现用户已通过并进入H100门禁等待阶段。
+- 错误记录：rollout RNG首轮测试错误地断言两条独立随机流的第一组`randperm`数值必不相同；不同随机流允许偶然产生相同排列。已改为断言底层RNG state不同，并分别验证两组都满足完整K4分层覆盖。
+- 格式检查首次报告新 rollout 实现和测试需要 Black 机械格式化；产品测试已通过，下一步仅格式化这两个新文件后重跑 Ruff/py_compile/diff。
+- Black后Ruff发现`typing.Sequence`未使用；已删除该单个导入，未运行扩大范围的自动修复。
+- 创建/修改的文件：`task_plan.md`、`progress.md`、`findings.md`。
+
 ## 会话：2026-08-08
 
-### Phase 9：Stage-2 分批实现与 H100 门禁
-- **状态：** paused（Batch 2 / Step 2 已完成并推送；等待用户执行 H100‑002 init-only 门禁）
+### Phase 9：Stage-2 分批实现与 H100 门禁（历史，已被2026‑08‑10三检查点覆盖）
+- **当时状态：** paused（Batch 2 / Step 2 已完成并推送；等待用户执行 H100‑002 init-only 门禁）
 - 已确认：
   - 用户要求正式编码前先完成任务划分。
   - 首批代码必须进入新建远程 `stage-2` 分支；推送后立即暂停，等待用户在内网 H100 验证成功。

@@ -2,6 +2,8 @@
 
 ## 2026-08-08 Stage-2 分批执行约束
 
+> **历史记录，非当前门禁。** 本节的逐Batch暂停与“H100‑002通过前不得进入Step 3”已被2026‑08‑10用户确认的三个检查点覆盖；当前状态只看本文后部“三个检查点”和 `task_plan.md`。
+
 - 恢复上下文确认：Stage-2 任务规格已完成，production code 尚未开始。
 - 本轮必须先产出任务拆分，再开始首批实现；拆分需把文档步骤映射到具体文件、CPU 本地测试、H100 门禁和暂停点。
 - 第一批只能形成最小可验证闭环；推送远程 `stage-2` 分支后停止后续实现，直到用户明确反馈内网 H100 验证成功。
@@ -206,6 +208,46 @@
 
 ---
 *重要发现应在形成后及时更新。*
+
+## 2026-08-10 H100‑002 历史手册审计（已失效）
+
+> 2026‑08‑10 用户后续指令已覆盖本节的“必须单独停在H100‑002”结论。保留以下内容只作历史审计；当前执行以 task_plan.md 的三个用户检查点为准。
+
+### 当时唯一允许范围
+- 任务文档第3行、Step 2暂停边界和既有 Phase 9 计划一致：Batch 2代码已经推送，必须先由用户在单机8×H100运行 init-only 门禁。
+- 在 H100‑002 成功前不得进入Step 3，不得实现cache loader/sampler，不得执行forward、backward、optimizer、EMA或训练，也不得声称C0/C1/C2通过。
+- 当前可复现代码基线为`stage-2@bde0142`；本地`results/`是用户未跟踪数据，保持原样。
+
+### 快速部署文档需要解决的问题
+- 旧文档434行，把已完成的H100‑001历史、当前H100‑002、资产生成细节和通用模板混在一起；操作者无法快速判断“现在只做什么”。
+- H100‑002真正需要操作者确认的输入应集中为：clean代码目录、Stage‑1 immutable base、Stage‑1 step3750 checkpoint、Wan2.2架构目录、cat-domain bidirectional teacher、teacher可信来源ID/SHA与仓库外资产/输出根目录。
+- `scripts/preflight_stage2_roles.py`会检查整个worktree（含未跟踪文件）必须clean；因此代码应使用独立clean clone，权重、cache、日志和输出全部放仓库外。
+- 成功不能靠“命令看起来跑完”判断；必须同时看到torchrun退出码0、`ROLE_INIT_COMPLETE`存在、`_SUCCESS`不存在、manifest审计脚本打印`H100-002 manifest audit: PASS`。
+- 当前门禁只验证三模型资产、G/F LoRA角色隔离和8卡FSDP2初始化；不读600-cache，也不验证训练显存、rollout/loss/resume。
+
+### AutoDL/H100边界
+- 本任务没有提供AutoDL SSH或AutoDL路径，也没有要求从AutoDL执行远程部署；因此不运行AutoDL命令、不创建虚构路径映射。只采用其安全原则：大资产不进Git、输出放数据盘/仓库外、先验证再复用、记录可恢复的真实命令与hash。
+
+## 2026-08-10 用户确认的 Stage-2 三个检查点
+
+- 旧的“Batch 2必须先单独停、Batch 3再单独停”等内部划分不再作为用户门禁；内部步骤由Codex运行正反测试与回归自行保证。
+- 检查点A覆盖原Steps 1–8：配置/角色、600-cache与balanced sampler、1+24 score pack、mixed timestep、24-new rollout、KV安全、UniPC random exit、DMD/DFD/fake-flow。完成后停止，不提前实现trainer。
+- 检查点B覆盖原Steps 9–11：5F→1G trainer、phase/EMA/nonfinite、checkpoint/resume、JSONL与PNG/SVG/HTML可视化。完成后停止，交给用户H100 smoke。
+- 检查点C在smoke通过后完成原Steps 12–14：batch推理、技术trace、压缩/sink通用接口及剩余验收。
+- 每个检查点的GitHub流程是：先让用户检查本地代码；用户确认后再写该节点简洁中文快速部署文档、提交并push `stage-2`，然后根据内网结果继续。
+
+## 2026-08-10 检查点A最终审计结论（用户已通过，等待内网H100门禁）
+
+- 官方Stage‑1 producer实际保存`video_latent[24,48,H,W]`，但其slot0是首帧sink，Stage‑1训练会用独立initial覆盖且不计loss；有效future只有slot1..23共23帧。Stage‑2锁定3×8=24个全新latent，因此正确监督仍需F25的`video[1:25]`。把完整F24的slot0误称future虽能让shape测试全绿，却会重复sink并缺失最后target；该路径及289/571快照均作废。
+- 三个要求无法同时成立：保留24-new算法、直接复用官方F24、不重编码600条视频。用户已选择保留24-new：合格F25原字节复用，F24从每条至少97帧的原视频固定取0..96并一次性编码F25。
+- 用户已明确选择并锁定：保持24-new算法；现有cache若为严格合格F25则直接使用，若为F24则从对应97帧原视频重新提取F25。方案不可修改，后续实现与验收均以此为唯一口径。
+- 数据侧不能只做22/21/21动作平衡；micro2还必须按30×52/52×30方向排成rank-local同形状组，否则collate会在正式训练首批失败。sampler状态现同时绑定action与shape hash，不可满足micro2时明确要求micro1×acc8。
+- score noising必须保留FP32，但送入Wan patch Conv3d前只转换模型输入到BF16；FSDP2 root也必须禁止自动cast语义输入，否则999/937等timestep会被BF16舍入。真实Wan回归已锁住这两个边界。
+- Generator exit x0只能使用UniPC运行时精确sigma；`t/1000`属于bidirectional score连续契约，两者不可混用。
+- Stage-2 cross-attention cache已从“分配但底层绕过”改成显式opt-in真实缓存；legacy/cudagraph路径仍保持原绕过语义。self-KV只在sink和每chunk clean recache提交，持久K/V均detached。
+- 正式训练启动不能只信任旧Stage-2 manifest自哈希；门禁现重新绑定当前metadata、source cache、negative artifact、action sidecar、config/code hash，并逐文件复核600个artifact SHA。legacy Stage‑1 source manifest使用严格、非覆盖式、带操作者证明的文本编码provenance升级；正式CLI强制`python -I -B`，dirty/untracked/ignored代码、Git环境重定向和读取期间文件替换均会fail-closed。
+- native F25整链已闭合：base manifest与`_F25_SUCCESS`、文本attestation、negative、formal audit和Dataset/runtime只接受同一来源；proven F25不加载VAE，缺旧帧声明的F25仅做全25帧bitwise复验且仍发布原字节，F24发布前必须满足前24帧bitwise parity并保留其余tensor。加入外部正式metadata/action路径绑定后，最终证据为F25 focused 88、Stage‑2 329、全tests 611及2 subtests passed；两次独立代码终审与H100指南终审均为P0=0。
+- 本地证据只能证明CPU/tiny逻辑和真实小模型接口；8×5B FSDP2/NCCL、H100 Triton/FlashAttention、真实600-cache及teacher猫域/video-global provenance仍必须由用户内网门禁确认。
 
 ## 2026-08-07 Stage-2 LongLive-2.0 任务文档
 

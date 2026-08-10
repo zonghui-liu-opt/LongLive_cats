@@ -424,7 +424,33 @@ def test_manifest_first_action_labels_accept_null_and_explicit_sidecar():
     with_sidecar = resolve_stage2_config(config)
     assert with_sidecar.action_labels_path == "/path/to/operator_confirmed.csv"
     assert with_sidecar.launch_hash() != without_sidecar.launch_hash()
-    assert with_sidecar.contract_hash() != without_sidecar.contract_hash()
+    assert with_sidecar.contract_hash() == without_sidecar.contract_hash()
+
+
+def test_release_data_paths_support_h100_environment_overrides(monkeypatch):
+    monkeypatch.delenv("LONG_LIVE_STAGE2_METADATA_PATH", raising=False)
+    monkeypatch.delenv("LONG_LIVE_STAGE2_ACTION_LABELS_PATH", raising=False)
+    baseline = load_stage2_config(CONFIG_PATH)
+
+    assert baseline.metadata_path == (
+        "training_sets/metadata_600clips_480x832_buckets.csv"
+    )
+    assert baseline.action_labels_path is None
+    assert (
+        baseline.contract_hash()
+        == "aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00"
+    )
+
+    monkeypatch.setenv("LONG_LIVE_STAGE2_METADATA_PATH", "/mnt/stage2/metadata_600.csv")
+    monkeypatch.setenv(
+        "LONG_LIVE_STAGE2_ACTION_LABELS_PATH", "/mnt/stage2/action_labels.csv"
+    )
+    overridden = load_stage2_config(CONFIG_PATH)
+
+    assert overridden.metadata_path == "/mnt/stage2/metadata_600.csv"
+    assert overridden.action_labels_path == "/mnt/stage2/action_labels.csv"
+    assert overridden.contract_hash() == baseline.contract_hash()
+    assert overridden.launch_hash() != baseline.launch_hash()
 
 
 def test_derived_values_and_unipc_timetable_are_not_yaml_sources_of_truth():

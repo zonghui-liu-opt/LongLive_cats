@@ -236,10 +236,11 @@ def _build_meta_role(resolved: Any, role: str) -> Stage2DiTRole:
             is_causal=is_causal,
             architecture_root=resolved.architecture_root,
             init_weights=False,
-            # W excludes the permanent sink.  Binding the new global-sink
-            # cache fields and physical capacity=17 is deliberately Step 5.
-            local_attn_size=(resolved.local_window_frames if is_causal else -1),
-            sink_size=0,
+            # The public W=16 excludes the permanent S=1 sink.  The causal
+            # transformer's internal attention span therefore uses the
+            # derived physical capacity S+W=17 and protects one sink frame.
+            local_attn_size=(resolved.physical_kv_capacity_frames if is_causal else -1),
+            sink_size=(resolved.global_sink_frames if is_causal else 0),
             num_frame_per_block=(resolved.chunk_frames if is_causal else 1),
         )
     return Stage2DiTRole(transformer, role=role, is_causal=is_causal)
@@ -509,8 +510,8 @@ def _audit_loaded_wan_contract(wrapper: Stage2DiTRole, resolved: Any) -> None:
     if wrapper.is_causal:
         expected.update(
             {
-                "local_attn_size": int(resolved.local_window_frames),
-                "sink_size": 0,
+                "local_attn_size": int(resolved.physical_kv_capacity_frames),
+                "sink_size": int(resolved.global_sink_frames),
                 "num_frame_per_block": int(resolved.chunk_frames),
                 "use_relative_rope": False,
                 "rope_method": "linear",

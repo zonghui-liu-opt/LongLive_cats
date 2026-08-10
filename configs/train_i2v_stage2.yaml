@@ -138,15 +138,18 @@ adapter:
 
 data:
   backend: stage2_i2v_cache
-  metadata_path: training_sets/metadata_600clips_480x832_buckets.csv
+  metadata_path: ${oc.env:LONG_LIVE_STAGE2_METADATA_PATH,training_sets/metadata_600clips_480x832_buckets.csv}
   action_label_source_policy: manifest_first_sidecar_fallback
   # Optional. Step 3 first checks a reliable action field in the cache manifest;
-  # set this to an operator-confirmed sidecar only when that field is absent.
-  action_labels_path: null
+  # set this environment variable to an operator-confirmed sidecar only when
+  # that field is absent. When unset, this resolves to null.
+  action_labels_path: ${oc.env:LONG_LIVE_STAGE2_ACTION_LABELS_PATH,null}
   cache_dir: ${oc.env:LONG_LIVE_STAGE2_CACHE_DIR,/path/to/stage2_i2v_600_bf16}
   expected_num_samples: 600
   expected_num_actions: 3
   expected_samples_per_action: 200
+  # Stage-2 requires source sink + 24 real future latents. The official
+  # Stage-1 F24 cache contains only sink + 23 futures and is insufficient.
   video_latent_frames: 25
   initial_latent_frames: 1
   future_latent_frames: 24

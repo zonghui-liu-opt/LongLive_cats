@@ -639,8 +639,10 @@ def _contract_config_view(config: Mapping[str, Any]) -> dict[str, Any]:
     contract["checkpoints"] = {"initialization": "<runtime-checkpoint>"}
     contract["data"]["metadata_path"] = "<runtime-asset>"
     contract["data"]["cache_dir"] = "<runtime-asset>"
-    if contract["data"]["action_labels_path"] is not None:
-        contract["data"]["action_labels_path"] = "<runtime-asset>"
+    # The manifest-first policy is the research contract. Selecting an optional
+    # operator-confirmed sidecar is a launch-local asset choice, just like the
+    # metadata and cache locations, so it must not change the contract hash.
+    contract["data"]["action_labels_path"] = None
     contract["data"]["negative_conditioning"]["artifact_manifest"] = "<runtime-asset>"
     contract["logging"]["jsonl_path"] = "<runtime-output>"
     return contract

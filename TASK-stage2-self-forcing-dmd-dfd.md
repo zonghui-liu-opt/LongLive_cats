@@ -1,8 +1,8 @@
 # LongLive‑2.0：猫咪 TI2V 4‑Step Self‑Forcing DMD/DFD Stage‑2
 
-> 状态：Batch 1已通过内网验证；Batch 2 / Step 2已推送，暂停等待8×H100 init-only验证
+> 状态：检查点A已获用户检查通过；中文H100指南与发布前终审已完成，等待内网8×H100准备门禁结果；尚未进入trainer/训练闭环
 >
-> 最后确认日期：2026‑08‑08
+> 最后确认日期：2026‑08‑10
 >
 > 目标硬件：内网单机 8×H100；本地只完成代码、单测、静态与轻量集成验证
 > 本文是 Stage‑2 的实现规格。不得用未记录的新假设替换已确认决策。
@@ -59,7 +59,7 @@
 - 不做任何权重、KV或activation量化；量化由专门同事负责。
 - 不实现DINO、VBench、CLIP、动作分类或其他自动视觉质量指标，不自动选择best checkpoint。
 - 不做raw flow-MSE anchor；真实数据只通过DFD teacher-input replacement进入Generator更新。
-- 不重编码现有600条视频，不生成离线teacher trajectory，不缓存rollout/noise，不做数据增强、裁剪、翻转、颜色抖动或跨视频拼接。
+- **已锁定的数据处理**：保持24个全新latent不变。逐条严格审计现有cache；F25且provenance/hash/schema全部匹配时直接复用，F24则从对应97帧原视频确定性重提F25。禁止补帧、复制latent或改成23-new。离线teacher trajectory、rollout/noise缓存和数据增强仍不做。
 - 不训练real-score，不给real-score挂LoRA。
 - baseline不启用sequence parallel、Generator cache-path activation checkpoint、CPU model offload、NVFP4或部署CFG>1。
 - 不在本任务中正式训练全部压缩变体；只完成通用接口、压力测试入口和后续实验规格。
@@ -187,15 +187,16 @@ pinned_len       = 0
 | 样本 | 600；3动作×200 |
 | cache dtype/channels | BF16 / C=48 |
 | latent空间 | 30×52或52×30 |
-| cached video latent | 必须每条恰好25帧 |
+| 官方Stage‑1已有cache | F24：slot0是sink，只有slot1..23共23个future；不能直接用于Stage‑2 24-new监督 |
+| Stage‑2所需cache | F25：slot0是source sink，slot1..24是24个真实future |
 | initial latent | 每条恰好1帧，来自显式input image缓存 |
 | prompt | cached positive T5 embedding；negative embedding只离线构造/缓存一次 |
 
 内网正式启动前扫描全部600条：
 
 - 600/600记录存在、可读、shape/dtype/channel/orientation合法；动作恰好200/200/200。
-- 所有video latent必须统一F=25；F=24或混合长度立即失败，不能补帧或重新编码。
-- `initial_latent` 与 `video_latent[:,0]` 的差异写入manifest，但永远不以video0静默替代initial。
+- Stage‑2训练video latent必须统一F=25；F24只能给出23个future，必须明确拒绝，不能把sink误称为future或静默补帧。
+- `initial_latent` 与 `video_latent[:,0]` 的差异写入manifest，但score输入永远使用显式initial作为sink，不以video0静默替代。
 - `real_future = video_latent[:,1:25]`；必须正好24帧。
 - cached prompt padding位置必须为0，因为Wan模型不消费prompt mask。
 - manifest记录每条shape/hash、公共schema hash、数据/config/code版本；T5/VAE不进入正式训练进程。
@@ -603,43 +604,45 @@ C4,K2: 1 + 6*(2+1) = 19
 - **主要区域**：`model/stage2_dmd.py`、角色初始化helper、通用LoRA/FSDP基础件；不要把新角色语义塞回legacy trainer。
 - **验证**：tiny/CPU模型断言G180/r32、F180/r64、real0 trainable；错误role/rank/key/hash全部失败。
 - **完成证据**：新增严格Stage‑1 merge v2与teacher provenance、三角色顺序meta初始化、G/F独立LoRA、world8/SP1一维FSDP2 FULL_SHARD、全参数DTensor与init-only副作用/8-rank共识manifest。Batch 2相关与共享回归合计212 passed；用户指定Stage‑1/DMD集合为63 passed、1项显式deselect；Ruff、Black、CLI、whitespace检查通过。
-- **暂停边界**：本步未接`train.py`/trainer/score/rollout/loss/data/optimizer/EMA；推送后只执行`H100-002`三角色init-only，不代表C0/C1/C2或训练可用。
+- **验证边界**：本步未接`train.py`/trainer/score/rollout/loss/data/optimizer/EMA；三角色init-only仍只证明初始化，不代表C0/C1/C2或训练可用。用户已取消本步单独暂停，继续实现Steps 3–8，由第一个统一检查点覆盖这些准备项。
 
 ### Step 3：Stage‑2 cache preflight与balanced loader
 
-- [ ] **结果**：600条F25 cache gate、explicit initial、real future1:25、prompt/action/hash manifest、精确Stage‑1 negative conditioning、F/G独立deterministic 22/21/21 sampler。
+- [x] **结果**：完成F25 cache gate、explicit initial、real future1:25、prompt/action/hash manifest、精确Stage‑1 negative conditioning、F/G独立deterministic 22/21/21 sampler，以及“合格F25原字节复用、F24从原始pixel帧0..96重提”的确定性native F25 producer。
 - **主要区域**：`utils/stage2_i2v_data.py`、`utils/stage2_sampler.py`、`scripts/audit_stage2_i2v_cache.py` 与tests；不改Stage‑1 loader语义。
-- **验证**：F25正例；F24/mixed/C/dtype/spatial/action-count/hash/padding/negative-text-or-encoder反例；F/G sampler独立性与resume cursor重复性。
+- **验证**：proven F25不加载VAE并原字节复用；缺旧97帧声明但其余provenance完整的F25用原视频0..96全量bitwise复验后仍复用原字节；只有F24发布新F25，且强制`new_F25[:24] == old_F24`并精确保留initial/prompt/mask。覆盖F23/mixed/C/dtype/spatial/action-count/hash/padding/negative/路径逃逸/TOCTOU/atomic resume反例，以及future第0/23帧、F/G sampler独立性和resume cursor。
 
 ### Step 4：显式1+24 pack与TI2V token timestep adapter
 
-- [ ] **结果**：bidirectional score接收25帧、dynamic seq_len9750、token t `[0×390,t×9360]`。
+- [x] **结果**：bidirectional score接收25帧、dynamic seq_len9750、token t `[0×390,t×9360]`。
 - **主要区域**：`utils/wan_5b_wrapper.py`、Stage‑2 I2V conditioning helper与 `model/stage2_dmd.py`；legacy `model/dmd.py` 仅作对照和回归保护。
 - **验证**：sentinel首尾future/梯度、spy model input、uniform-time parity、两orientation、无legacy8-frame reshape。
 
 ### Step 5：24-new-latent rollout、W16/S1与episode reset
 
-- [ ] **结果**：sink预写+3×8新latent；derived capacity17；prompt切换只保留sink；CFG1单cache。
+- [x] **结果**：sink预写+3×8新latent；derived capacity17；prompt切换只保留sink；CFG1单cache。
 - **主要区域**：`pipeline/stage2_rollout.py`，对causal model/wrapper增加最小cache接口；Stage‑1/legacy pipeline保持回归。
 - **验证**：tiny cache逐chunk可见帧、indices/RoPE、24输出、reset后无旧KV、Stage‑1旧推理回归。
 
 ### Step 6：只读noisy KV、clean-only commit与安全autograd
 
-- [ ] **结果**：显式discard/commit接口；持久cache永远detached；Generator cache checkpoint关闭。
+- [x] **结果**：显式discard/commit接口；持久cache永远detached；Generator cache checkpoint关闭。
 - **主要区域**：Wan causal model/wrapper、`pipeline/stage2_rollout.py` 与Stage‑2 inference session；legacy pipelines只接受通用底层扩展并必须回归。
 - **验证**：`CopyBackwards`回归、跨chunkgrad隔离、同chunk多UniPC step不append、clean recache唯一commit。
 
 ### Step 7：4-step UniPC与stratified random exit
 
-- [ ] **结果**：显式exit schedule、F/G独立RNG、acc4/acc8覆盖、scheduler timetable单一真相。
+- [x] **结果**：显式exit schedule、F/G独立RNG、acc4/acc8覆盖、scheduler timetable单一真相。
 - **主要区域**：`pipeline/stage2_rollout.py`、`trainer/stage2_distillation.py` 的RNG/state helpers；legacy `pipeline/self_forcing_training.py` 仅作对照和回归保护。
 - **验证**：每update exit histogram、跨rankbroadcast、resume、iid消融、K2通用接口。
 
 ### Step 8：DMD、DFD与fake raw-flow loss
 
-- [ ] **结果**：严格实现第8节公式、video-global t/noise、CFG5 real与FP32 holistic normalizer。
+- [x] **结果**：严格实现第8节公式、video-global t/noise、CFG5 real与FP32 holistic normalizer。
 - **主要区域**：`model/stage2_dmd.py`、Stage‑2 scheduler/loss helpers与通用wrapper扩展；legacy `model/dmd.py` 不承载新算法分支。
 - **验证**：解析式tiny tensors、连续sigma在t=20/980边界的noising/x0一致性、DFD shared-noise恒等式、sink mask、无sigma额外权重、raw-flow路径、real/fake参数无grad。
+- **检查点A最终本地证据**：F25 focused整链88 passed；全部`tests/test_stage2_*.py`为329 passed；仓库正式`tests/`范围为611 passed、2 subtests passed；14条warning均为既有`torch.jit.script_method`弃用提示。新增/Stage‑2 Python文件的Black、Ruff、py_compile、tracked/untracked whitespace均通过；被最小扩展的legacy `wan_5b/modules/causal_model.py`仅保留与HEAD相同的既有Black/Ruff债务，没有新增诊断。两次独立只读代码终审与一次H100指南终审均为P0=0。
+- **检查点A边界**：未实现Step 9–11 trainer/optimizer/EMA/checkpoint/log/plot，未写新的H100部署指南，未提交或推送，也未声称本地完成8×H100/FSDP2/NCCL/Triton或真实600-cache验证。
 
 ### Step 9：严格5F→1G trainer、phase、EMA与nonfinite
 
@@ -681,6 +684,14 @@ C4,K2: 1 + 6*(2+1) = 19
 
 - [ ] **结果**：600 cache gate、3-cycle profile、选定microbatch、正式A/B训练、图表与推理产物。
 - **验证**：保存真实manifest/JSONL/plots/checkpoints/trace；用户人工检查视频并决定后续压缩实验。
+
+### 用户指定的三个检查节点（2026‑08‑10，覆盖旧的逐Batch暂停）
+
+1. **训练前准备检查点**：完成Steps 1–8及本地正反测试/相关回归后停止。此时不得包含完整trainer、optimizer state machine、正式checkpoint、训练JSONL/plot或训练运行。
+2. **训练闭环检查点**：用户通过上一检查点并完成内网准备门禁后，实现Steps 9–11；包含严格5F→1G、log、权重/checkpoint/resume和可视化，本地验证后停止，交给用户运行H100 smoke。
+3. **推理与其余任务检查点**：smoke通过后实现Steps 12–14及batch推理/技术trace/通用压缩接口，完成剩余文档验收。
+
+每个检查节点先由用户检查本地代码；用户确认后再编写该节点的简洁中文内网指导、提交并上传GitHub `stage-2`。内部Step不再单独等待用户。
 
 ## 16. 全任务验收标准
 

@@ -1,10 +1,10 @@
-# 任务计划：Stage 1 模型长视频推理实验
+# 任务计划：LongLive‑2.0 Stage‑2 Self‑Forcing DMD/DFD
 
 ## 目标
-完整落实 `TASK-stage1-continuation-inference.md` 中的有状态 continuation inference 要求，形成可运行、可验证、可复现的实现、测试和内网 H100 快速部署文档，同时保持已有 uniform-prompt 推理语义不变。
+完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`，按用户指定的三个检查节点交付：训练前准备、训练/日志/权重/可视化、batch推理与其余验收；保持 Stage‑1 与 legacy DMD 行为不回归。
 
 ## 当前阶段
-Phase 9 已暂停：Batch 2 / Step 2 已完成并推送，等待用户执行 H100‑002 三角色 init-only 门禁
+Phase 9 检查点A：用户检查已通过，中文H100指南与发布前终审已完成；等待内网8×H100准备门禁结果，尚未进入trainer
 
 ## 各阶段
 
@@ -71,33 +71,30 @@ Phase 9 已暂停：Batch 2 / Step 2 已完成并推送，等待用户执行 H10
 - [x] 审计并映射 Stage-1 loss/吞吐可视化实现
 - [x] 生成可独立交给 Codex 执行的 Stage-2 任务文档
 - [x] 复核任务文档覆盖全部锁定决策、P0 风险、验收标准与逐步验证
-- 下一步（需用户授权）：按文档开始 Step 1；本轮未实现production code。
+- 当时下一步（历史，现已完成）：按文档开始 Step 1；该条不再代表当前状态。
 - **Status:** complete
 
-### Phase 9：Stage-2 分批实现与 H100 门禁
+### Phase 9：Stage‑2 按用户检查点实现
 - [x] 9.1 完整阅读 Stage-2 任务文档、仓库状态与适用约束
-- [x] 9.2 将 15 步规格映射为相互可验证的代码批次，并锁定首批范围/验收命令
+- [x] 9.2 完成配置契约与 G/real/F 三角色初始化、LoRA/FSDP/manifest 基础
 - [x] 9.3 创建独立 `stage-2` 分支，保护用户既有改动与 Stage-1 行为
-- [x] 9.4 仅实现首批最小闭环，完成本地针对性测试与回归审计
-- [x] 9.5 审查 diff，提交并推送首批代码到远程 `stage-2` 分支
-- [x] 9.6 暂停后续 production 实现，交付内网 H100 验证命令与通过标准
-- [x] 9.7 收到用户 H100 验证成功，并记录单项 Stage‑1 release YAML 测试的排除理由
-- [x] 9.8 仅实现 Batch 2 / Step 2 三角色初始化、LoRA/FSDP/manifest 审计
-- [x] 9.9 完成 Batch 2 本地审计、推送并再次暂停等待 H100 init-only 验证
-- **Status:** paused
+- [x] 9.4 完成数据/negative/balanced sampler，以及合格F25原字节复用、F24从97帧源视频确定性重提的native F25准备链
+- [x] 9.5 实现显式 1+24 pack、9750-token mixed timestep adapter（原 Step 4）
+- [x] 9.6 原子完成 24-new rollout、W16/S1 reset、KV autograd 安全与 UniPC random exit（原 Steps 5–7）
+- [x] 9.7 实现并解析验证 DMD、DFD、fake raw-flow 与 continuous-sigma loss（原 Step 8）
+- [x] 9.8 重跑训练前准备全量本地测试和相关回归，完成两轮独立终审，并在第一个用户检查点停止
+- [x] 9.9 用户检查通过后，写简洁中文 H100 指南并上传 `stage-2`；等待内网准备门禁结果
+- [ ] 9.10 内网准备通过后，实现严格5F→1G trainer、EMA/nonfinite、原子checkpoint、JSONL/plot（原 Steps 9–11），在第二个用户检查点停止
+- [ ] 9.11 用户检查通过后，写本节点指南并上传 `stage-2`；等待内网 H100 smoke 结果
+- [ ] 9.12 smoke通过后，实现baseline batch推理、压缩/sink通用接口和其余本地验收（原 Steps 12–14），按要求完成最终内网任务
+- **Status:** waiting_for_h100_checkpoint_a（检查点A；Phase 9整体仍未完成）
 
-#### Phase 9 分批门禁
-1. **Batch 1 / Step 1（已通过 H100 门禁）**：Stage-2 YAML、严格 resolver、派生公式/计数和错误配置测试；不接 registry，不改任何既有 production trainer/model/pipeline/wrapper。
-2. **Batch 2 / Step 2（当前唯一实现范围）**：G/real/F 三角色独立初始化、LoRA/FSDP/manifest 审计；完成推送后暂停。
-3. **Batch 3 / Step 3**：600-cache gate、negative conditioning 与 F/G 独立 balanced sampler。
-4. **Batch 4 / Step 4**：显式 1+24 pack、dynamic seq_len 9750 与 mixed token timestep adapter。
-5. **Batch 5 / Steps 5–7**：24-new rollout、W16/S1/reset、KV autograd 安全、4-step UniPC/random exit；作为 cache-safety 原子批，不交付半安全 cache 路径。
-6. **Batch 6 / Step 8**：DMD、DFD、fake raw-flow 与 continuous-sigma loss。
-7. **Batch 7 / Steps 9–11**：严格 5F→1G、phase/EMA/nonfinite、原子 resume、JSONL/plot；完成后才可执行正式 C0/C1/C2 H100 预检。
-8. **Batch 8 / Steps 12–14**：baseline inference、通用压缩/sink接口、全量本地验收与 H100 runbook。
-9. **Step 15**：始终由用户在内网 H100 执行。
+#### 用户指定的停止点（覆盖旧的逐Batch暂停）
+1. **检查点 A——训练前准备**：原 Steps 1–8、本地验证、用户检查、中文指南与分支发布均已完成；当前等待内网8×H100门禁，不写完整trainer、不训练。
+2. **检查点 B——训练闭环**：完成trainer、log、checkpoint/权重保存与可视化并本地验证；不做正式训练，停下给用户安排H100 smoke。
+3. **检查点 C——推理与其余任务**：smoke通过后完成batch推理、技术trace、通用压缩/sink接口及任务文档剩余验收。
 
-Batch 1 推送后必须暂停。首次内网门禁只验证正式依赖栈、raw配置解析/派生值、仓库UniPC scheduler只读characterization与相关回归；不得把它称为生产rollout runtime gate，不得加载三模型、启动训练或宣称 C0/C1/C2 通过。
+每个检查点均遵守：用户先审查本地代码；通过后再写该节点的简洁中文部署指导、提交并上传GitHub `stage-2`，随后等待对应内网结果。检查点之间的内部子步骤不再单独停下。
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
@@ -127,6 +124,8 @@ Batch 1 推送后必须暂停。首次内网门禁只验证正式依赖栈、raw
 | 最终契约审计发现 shell 的未文档化 checkpoint override 可绕过固定 3750 | 1 | 删除 override，专用入口始终显式选择 `$LONG_LIVE_STAGE1_TRAIN_DIR/checkpoint_model_003750`；同时收紧 runbook 对 merged 保留时点的措辞 |
 | Batch 2 搜索meta-init路径时首个`rg`组合正则缺少闭合括号 | 1 | 改用多个`-e`固定子表达式重新搜索，定位到仓库已有`accelerate.init_empty_weights`路径 |
 | 直接导入`wan_5b.configs.WAN_CONFIGS`探查TI2V规格时本地缺少`easydict` | 1 | 不改变本地环境，改为只读`wan_5b/configs/wan_ti2v_5B.py`确认30层、dim3072、ffn14336、C48 |
+| Stage‑2 exit RNG测试把“独立随机流”误写成“第一组排列必须不同” | 1 | 独立流仍可能偶然生成同一排列；改为比较RNG state，并分别验证分层覆盖 |
+| 新增Stage‑2 rollout文件首次Black check需格式化 | 1 | 仅对两个新增文件运行Black机械格式化，再复跑静态与产品测试 |
 | teacher checkpoint篡改负例同时改变了文件大小，先触发size门禁而非预期SHA门禁 | 1 | 将fixture改为等长字节篡改，分别独立验证size与SHA失败路径 |
 | 首次格式检查误用当前Anaconda `python -m black`，该解释器未安装Black | 1 | 改用系统已安装的`black`/`ruff`可执行文件；根据报告机械格式化并清理新增代码lint |
 | planning 完成检查脚本不识别中文版 `阶段/状态` 标记，首次报告 0/0 | 1 | 将 plan 标题/状态改为脚本支持的 `Phase`/`Status`，复查为 5/5 complete |

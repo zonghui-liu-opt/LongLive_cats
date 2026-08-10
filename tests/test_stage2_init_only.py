@@ -112,6 +112,11 @@ def test_fsdp_role_wrap_is_bottom_up_root_last_and_preserves_trainables():
     assert [module for module, _ in calls[:-1]] == list(root.blocks)
     assert calls[-1][0] is root
     assert all(call[1]["reshard_after_forward"] is True for call in calls)
+    assert all(
+        call[1]["mp_policy"]["cast_forward_inputs"] is True for call in calls[:-1]
+    )
+    assert calls[-1][1]["mp_policy"]["cast_forward_inputs"] is False
+    assert calls[-1][1]["mp_policy"]["reduce_dtype"] is torch.float32
 
 
 def test_post_fsdp_audit_does_not_claim_frozen_base_is_sharded_without_dtensor():

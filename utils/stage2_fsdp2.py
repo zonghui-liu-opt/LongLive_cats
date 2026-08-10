@@ -290,11 +290,22 @@ def fsdp2_wrap_stage2_role(
             f"found {len(blocks)}"
         )
     api = dict(fsdp_api or _fsdp2_api())
-    policy = api["MixedPrecisionPolicy"](
+    block_policy = api["MixedPrecisionPolicy"](
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
+    )
+    # The Stage2DiTRole root receives semantic FP32 tensors (score/rollout
+    # timesteps and exact UniPC sigmas).  Casting the whole pytree here would
+    # round values such as 999 -> 1000 in BF16 before the model can build its
+    # time embedding.  Latent/prompt compute tensors are cast explicitly by
+    # the role adapter; transformer blocks may still autocast their activations.
+    root_policy = api["MixedPrecisionPolicy"](
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=None,
+        cast_forward_inputs=False,
     )
     fully_shard = api["fully_shard"]
     for block in blocks:
@@ -302,7 +313,7 @@ def fsdp2_wrap_stage2_role(
             block,
             mesh=mesh,
             reshard_after_forward=True,
-            mp_policy=policy,
+            mp_policy=block_policy,
         )
     # All three 5B roots reshard after forward.  This init-only batch never
     # performs a forward; the setting prevents a full teacher root lingering
@@ -311,7 +322,7 @@ def fsdp2_wrap_stage2_role(
         module,
         mesh=mesh,
         reshard_after_forward=True,
-        mp_policy=policy,
+        mp_policy=root_policy,
     )
     trainable_after = {
         name: parameter

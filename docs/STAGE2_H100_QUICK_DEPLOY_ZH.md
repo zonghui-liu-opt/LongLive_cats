@@ -1,211 +1,150 @@
-# Stage‑2 内网 H100 快速部署与实验记录
+# Stage-2 检查点 A：内网 8×H100 快速部署
 
-本文是 Stage‑2 的滚动运行手册。每次内网部署都新增一条记录，写清代码版本、命令、通过标准、真实结果和产物路径；失败不得改写为通过。
+这份手册只完成 **Stage-2 训练前准备**：代码回归、模型资产、三角色初始化、F25 cache、文本条件、negative conditioning 和 600 条数据审计。
 
-约定：
+全部通过后，看到 `CHECKPOINT_A_H100_PREP_PASS` 就停下，把结果发回检查。**不要启动 Stage-2 训练。** 任一步非零退出、Traceback、OOM、NCCL 卡死、hash/bitwise 不一致，都立即停止；不要手改 manifest 或 tensor 绕过门禁。
 
-- 所有命令都在仓库根目录、正式 LongLive Python 环境中执行。
-- 每次实验使用新的 `run_id` 和输出目录，不覆盖旧目录。
-- 只提交文本日志、manifest 和结论；模型、cache、视频等大文件留在内网。
-- `待执行 / 待确认 / 失败 / 通过` 必须对应真实状态。当前门禁未通过前，不进入下一批代码。
+## 0. 只改这一块：填写真实绝对路径
 
-## 运行总览
-
-| run_id | 日期 | 代码基线 | 内容 | 状态 |
-|---|---|---|---|---|
-| `H100-001` | 2026‑08‑08 | `639ba658a3a7f40bb792fbca4100877d2f7554df` | Batch 1 配置契约 | 通过 |
-| `H100-002` | 待执行 | 运行时 `stage-2` clean HEAD | Batch 2 三角色 init-only | 待执行 |
-
-## 通用准备
-
-首次获取分支：
-
-```bash
-git fetch longlive-cats stage-2
-git switch --track -c stage-2 longlive-cats/stage-2
-```
-
-已有本地分支：
-
-```bash
-git switch stage-2
-git pull --ff-only longlive-cats stage-2
-test "$(git rev-parse --abbrev-ref HEAD)" = stage-2
-test "$(git rev-parse HEAD)" = "$(git rev-parse longlive-cats/stage-2)"
-```
-
-每次执行前记录环境，`STAGE2_RUN_DIR` 必须是本次新目录：
-
-```bash
-export STAGE2_RUN_ID=H100-001
-export STAGE2_RUN_DIR=/local_nvme/longlive_stage2_runs/$STAGE2_RUN_ID
-test ! -e "$STAGE2_RUN_DIR"
-mkdir -p "$STAGE2_RUN_DIR"
-
-git rev-parse HEAD | tee "$STAGE2_RUN_DIR/git_commit.txt"
-python --version 2>&1 | tee "$STAGE2_RUN_DIR/python_version.txt"
-python -m pip show torch diffusers transformers peft omegaconf \
-  > "$STAGE2_RUN_DIR/python_packages.txt"
-nvidia-smi --query-gpu=index,name,memory.total,driver_version \
-  --format=csv,noheader > "$STAGE2_RUN_DIR/gpu_inventory.csv"
-```
-
-## H100‑001：Batch 1 配置契约门禁
-
-### 目标与边界
-
-验证内网依赖栈能够解析 Stage‑2 raw YAML、得到固定派生值，并保持 Stage‑1/DMD 回归。
-
-本次不会加载 CUDA 模型、权重或 600 条 cache，不会启动训练，也不代表 C0/C1/C2 通过。UniPC 只验证仓库 scheduler 的只读 timetable characterization。
-
-### 1. 确认代码版本
-
-```bash
-export STAGE2_CODE_BASE=639ba658a3a7f40bb792fbca4100877d2f7554df
-git merge-base --is-ancestor "$STAGE2_CODE_BASE" HEAD
-git diff --exit-code "$STAGE2_CODE_BASE" HEAD -- \
-  configs/train_i2v_stage2.yaml \
-  utils/stage2_config.py \
-  tests/test_stage2_config.py
-git status --short --branch
-```
-
-通过标准：当前分支包含该代码基线，且其后的文档提交没有改变本批三个实现文件。
-
-### 2. 运行 Stage‑2 契约测试
-
-```bash
-set -o pipefail
-PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 \
-python -m pytest -q -p no:cacheprovider tests/test_stage2_config.py \
-  2>&1 | tee "$STAGE2_RUN_DIR/stage2_config_tests.log"
-```
-
-通过标准：`103 passed`，并验证 UniPC K4/shift5 timetable 为 `[999, 937, 833, 624]`、terminal sigma 为 0。
-
-### 3. 运行相关回归
-
-```bash
-set -o pipefail
-PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 \
-python -m pytest -q -p no:cacheprovider \
-  tests/test_stage1_config.py \
-  tests/test_stage1_lazy_imports.py \
-  tests/test_dmd_i2v_conditioning.py \
-  tests/test_i2v_sequence_parallel_config.py \
-  tests/test_i2v_teacher_forcing_context.py \
-  tests/test_stage1_schedule.py \
-  tests/test_stage1_loss_metrics.py \
-  tests/test_trainable_ema.py \
-  tests/test_lora_utils.py \
-  tests/test_error_buffer.py \
-  tests/test_stage1_i2v_cache.py \
-  tests/test_stage1_sampler.py \
-  tests/test_distributed_sampler_seed.py \
-  --deselect tests/test_stage1_config.py::test_release_stage1_config_has_one_locked_source_of_truth \
-  2>&1 | tee "$STAGE2_RUN_DIR/related_regression_tests.log"
-```
-
-通过标准：`63 passed`。显式排除的测试只锁定公开仓库 Stage‑1 release YAML；真实内网 Stage‑1 使用不同训练参数，且 Batch 1 未修改 Stage‑1 YAML 或其解析路径。其余共享基础设施回归必须全部通过。
-
-### 4. 导出配置契约
-
-```bash
-set -o pipefail
-PYTHONPATH="$PWD" python -m utils.stage2_config \
-  --config configs/train_i2v_stage2.yaml \
-  --contract-hash-only \
-  | tee "$STAGE2_RUN_DIR/contract_hash.txt"
-
-PYTHONPATH="$PWD" python -m utils.stage2_config \
-  --config configs/train_i2v_stage2.yaml \
-  > "$STAGE2_RUN_DIR/resolved_config.json"
-```
-
-通过标准：
-
-- contract hash 为 `aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`；
-- `capacity=17`、`score_seq_len=9750`、`G=280`、`F=1400`；
-- Generator EMA target 为 `generator_adapter`；
-- launch hash 可因内网绝对路径不同而变化，不要求与本地一致。
-
-### 5. 真实结果
-
-用户已回报：
-
-```text
-执行人：未提供
-执行时间：未提供
-节点/调度任务号：未提供
-当前HEAD：未提供
-代码基线：639ba658a3a7f40bb792fbca4100877d2f7554df
-Stage‑2 tests：103 passed
-相关回归：63 passed
-显式排除：test_release_stage1_config_has_one_locked_source_of_truth
-排除原因：公开Stage‑1 release YAML与实际内网Stage‑1训练参数不一致；本批未改Stage‑1配置路径
-配置契约：全部通过
-产物目录：未提供
-结论：Batch 1门禁通过，允许开始Batch 2
-失败摘要：无
-```
-
-## H100‑002：Batch 2 三角色 init-only 门禁
-
-### 目标与边界
-
-只验证以下闭环：Stage‑1 step3750 EMA 合并资产、独立 real-score teacher、G/real/F 三个独立 DiT、G/F 独立 LoRA，以及单机 8×H100 的一维 FSDP2 `FULL_SHARD`。
-
-本次不执行任何 forward/backward，不创建 optimizer、EMA、T5、VAE 或 DataLoader，也不验证显存候选、C0/C1/C2、cache、score、rollout、loss、checkpoint/resume 或训练。
-
-### 1. 固定 clean HEAD 与新目录
-
-本节是 H100‑002 的完整准备流程；不要先重复执行上面的通用运行目录创建块。
+为什么：这些路径会进入本次 launch hash。第一次解析配置后，整条流程中不能换路径、换权重或换数据。
 
 ```bash
 set -euo pipefail
-git switch stage-2
-git pull --ff-only longlive-cats stage-2
-test "$(git rev-parse --abbrev-ref HEAD)" = stage-2
-test "$(git rev-parse HEAD)" = "$(git rev-parse longlive-cats/stage-2)"
 
-export STAGE2_RUN_ID=H100-002
-export STAGE2_RUN_DIR=/local_nvme/longlive_stage2_runs/$STAGE2_RUN_ID
-export STAGE2_INIT_DIR=$STAGE2_RUN_DIR/role_init
-test ! -e "$STAGE2_RUN_DIR"
-mkdir -p "$STAGE2_RUN_DIR"
+# 使用与正式训练完全相同的 Python 环境。
+export STAGE2_PYTHON=/绝对路径/conda_env/bin/python
+export STAGE2_TORCHRUN="$(dirname "$STAGE2_PYTHON")/torchrun"
+export STAGE2_GIT_SOURCE=https://github.com/zonghui-liu-opt/LongLive_cats.git
 
-export STAGE2_CODE_BASE=$(git rev-parse HEAD)
-git status --porcelain=v1 --untracked-files=all \
-  > "$STAGE2_RUN_DIR/git_status_before.txt"
-test ! -s "$STAGE2_RUN_DIR/git_status_before.txt"
-printf '%s\n' "$STAGE2_CODE_BASE" > "$STAGE2_RUN_DIR/git_commit.txt"
-python --version 2>&1 | tee "$STAGE2_RUN_DIR/python_version.txt"
-python -m pip show torch accelerate diffusers transformers peft safetensors omegaconf \
-  > "$STAGE2_RUN_DIR/python_packages.txt"
-nvidia-smi --query-gpu=index,name,memory.total,driver_version \
-  --format=csv,noheader > "$STAGE2_RUN_DIR/gpu_inventory.csv"
+# fresh clone、日志和新产物；全部必须在仓库外使用独立目录。
+export STAGE2_REPO=/local_nvme/longlive_stage2_checkpoint_a
+export STAGE2_RUN_DIR=/local_nvme/longlive_stage2_runs/checkpoint_a_001
+export STAGE2_ASSET_DIR=/local_nvme/longlive_stage2_assets/checkpoint_a_001
+export STAGE2_CACHE_DIR=/local_nvme/longlive_stage2_cache/f25_600_v1
+export NEGATIVE_DIR=/local_nvme/longlive_stage2_negative/v1
+export ROLE_INIT_DIR="$STAGE2_RUN_DIR/role_init"
+
+# Stage-1 Generator：正式 step3750 checkpoint 及其不可变 base。
+export STAGE1_BASE=/绝对路径/stage1_immutable_base.pt
+export STAGE1_CKPT=/绝对路径/checkpoint_model_003750
+
+# real-score teacher 与 Wan 架构目录。
+export ARCH_ROOT=/绝对路径/Wan2.2-TI2V-5B
+export TEACHER_CKPT=/绝对路径/cat_domain_bidirectional_teacher
+export TEACHER_SOURCE_KIND=direct_internal_training_checkpoint
+export TEACHER_SOURCE_ID=替换为可信训练任务或转换任务ID
+export TEACHER_SOURCE_SHA256=替换为可信来源记录中的64位小写SHA256
+
+# 原始 Stage-1 cache、原视频 metadata 和同源模型。
+export STAGE1_CACHE_MANIFEST=/绝对路径/原始Stage1缓存/cache_manifest.json
+export VAE_CKPT=/绝对路径/Wan2.2_VAE.pth
+export T5_CKPT=/绝对路径/T5
+export TOKENIZER_DIR=/绝对路径/tokenizer
+export METADATA_600=/绝对路径/metadata_600.csv
+
+# 官方 Stage-1 manifest 没有 action_id，因此本次必须提供人工确认的 sidecar。
+# 精确表头：video,action_id；600 行；3 个 action 各 200 行；video 与 metadata 一一对应。
+export ACTION_SIDECAR_600=/绝对路径/action_labels_600.csv
+export ACTION_ID_1=替换为真实动作枚举1
+export ACTION_ID_2=替换为真实动作枚举2
+export ACTION_ID_3=替换为真实动作枚举3
+export OPERATOR_ID=替换为真实执行人或任务ID
 ```
 
-日志、权重和输出必须放在仓库外。preflight 会拒绝 dirty worktree，也会拒绝已经存在的 `STAGE2_INIT_DIR`。
+不要从 prompt、文件名或行号猜 action。不要把 `LONG_LIVE_STAGE2_ACTION_LABELS_PATH` 设为空字符串或字符串 `null`。
 
-### 2. 生成严格输入资产
+内网不能访问 GitHub 时：先在联网机器的最新 `stage-2` clone 中执行 `git bundle create LongLive-stage2.bundle stage-2`，把 bundle 拷入内网，再把 `STAGE2_GIT_SOURCE` 改成该 bundle 的绝对路径。必须通过 Git 克隆并保留 `.git`，不能只复制源码目录。
 
-#### 2.1 重生 Stage‑1 step3750 EMA merge v2
+## 1. 获取 clean `stage-2`，确认 8 张 H100
+
+做什么：fresh clone 已上传的 `stage-2`，禁止 Python bytecode 写进仓库，并核对 GPU。
+
+为什么：正式 cache 工具会拒绝任何 tracked、untracked **或 ignored** 文件；8 卡拓扑也是锁定契约。
 
 ```bash
-set -euo pipefail
-export STAGE1_BASE=/path/to/stage1_immutable_base.pt
-export STAGE1_CKPT=/path/to/checkpoint_model_003750
-export STAGE2_ASSET_DIR=/local_nvme/longlive_stage2_assets
-mkdir -p "$STAGE2_ASSET_DIR"
+test -x "$STAGE2_PYTHON"
+test -x "$STAGE2_TORCHRUN"
+test ! -e "$STAGE2_REPO"
+test ! -e "$STAGE2_RUN_DIR"
+test ! -e "$STAGE2_ASSET_DIR"
+test ! -e "$STAGE2_CACHE_DIR"
+test ! -e "$NEGATIVE_DIR"
 
-export G_MERGED=$STAGE2_ASSET_DIR/stage1_step3750_ema_merged.pt
-export G_MANIFEST=${G_MERGED%.pt}.manifest.json
+git clone --branch stage-2 --single-branch \
+  "$STAGE2_GIT_SOURCE" "$STAGE2_REPO"
+cd "$STAGE2_REPO"
+git fetch origin stage-2
+test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)"
+export STAGE2_COMMIT="$(git rev-parse HEAD)"
+
+mkdir -p "$STAGE2_RUN_DIR" "$STAGE2_ASSET_DIR" \
+  "$(dirname "$STAGE2_CACHE_DIR")" "$(dirname "$NEGATIVE_DIR")"
+
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
+export PYTHONPYCACHEPREFIX="$STAGE2_RUN_DIR/pycache"
+export OMP_NUM_THREADS=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$(git ls-files --others --ignored --exclude-standard)"
+echo CLEAN_CHECKOUT_PASS
+
+nvidia-smi -L | tee "$STAGE2_RUN_DIR/gpus.txt"
+"$STAGE2_PYTHON" -I -B - <<'PY'
+import torch
+
+assert torch.cuda.device_count() == 8, torch.cuda.device_count()
+names = [torch.cuda.get_device_name(i) for i in range(8)]
+assert all("H100" in name for name in names), names
+assert all(
+    torch.cuda.get_device_properties(i).total_memory >= 79 * 1024**3
+    for i in range(8)
+)
+assert torch.cuda.is_bf16_supported()
+print("GPU_ENV_PASS", torch.__version__, torch.version.cuda, names)
+PY
+```
+
+成功输出：
+
+- `CLEAN_CHECKOUT_PASS`；两个 Git 检查都没有内容。
+- `GPU_ENV_PASS`，后面列出 8 张 H100；每张显存至少约 79 GiB，BF16 可用。
+
+## 2. 跑完整 Stage-2 CPU/接口回归
+
+做什么：在加载 5B 权重前验证配置、F25 数据链、sampler、真实 tiny Wan 接口、rollout 和 DMD/DFD loss。
+
+为什么：先排除代码和依赖问题，避免浪费 H100 时间。
+
+```bash
+PYTHONPATH="$PWD" \
+"$STAGE2_PYTHON" -B -m pytest -q -p no:cacheprovider \
+  tests/test_stage2_*.py \
+  2>&1 | tee "$STAGE2_RUN_DIR/stage2_tests.log"
+
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$(git ls-files --others --ignored --exclude-standard)"
+```
+
+成功输出：`329 passed`、`0 failed`。14 条现有 `torch.jit.script_method` 弃用 warning 不影响通过；出现其他失败就停。
+
+## 3. 准备 Generator 和 real-score teacher
+
+### 3.1 合并 Stage-1 step3750 EMA Generator
+
+做什么：只选择正式 checkpoint 中的 `adapter_ema.safetensors`，严格合并回不可变 causal base。
+
+为什么：Stage-2 的 G 必须从 Stage-1 step3750 EMA 起步，不能误用 raw adapter 或其他 step。
+
+```bash
+export G_MERGED="$STAGE2_ASSET_DIR/stage1_step3750_ema_merged.pt"
+export G_MANIFEST="$STAGE2_ASSET_DIR/stage1_step3750_ema_merged.manifest.json"
 test ! -e "$G_MERGED"
 test ! -e "$G_MANIFEST"
 
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD" \
-python scripts/merge_lora_generator.py \
+CUDA_VISIBLE_DEVICES=0 \
+"$STAGE2_PYTHON" -I -B scripts/merge_lora_generator.py \
   --base-checkpoint "$STAGE1_BASE" \
   --training-checkpoint "$STAGE1_CKPT" \
   --output-path "$G_MERGED" \
@@ -216,39 +155,31 @@ test -s "$G_MERGED"
 test -s "$G_MANIFEST"
 ```
 
-输出必须位于 Stage‑1 checkpoint 目录之外。脚本要求正式 `_SUCCESS`、6/3/2 拓扑、step3750、raw/EMA 两份 safetensors 的正式 metadata、180 targets/360 tensors，并在发布前后重验全部来源。若历史 checkpoint 缺字段，立即停止并保留原件，不得手工补 metadata 或绕过校验。
+成功输出：
 
-#### 2.2 为独立 real-score teacher 建立 sidecar
+```text
+Merged EMA adapter to ...
+SHA256: <64位sha256>
+```
 
-先由操作者确认它确实是 cat-domain、bidirectional TI2V、video-global flow teacher；这两个语义不能从权重键名自动推断。
+`_SUCCESS`、step、EMA metadata、target 数量或 strict reload 任一不匹配，脚本会失败；不要手补旧 checkpoint。
+
+### 3.2 建立 real-score teacher 的可信 provenance
+
+做什么：下面命令适用于“未转换的原生 Wan safetensors teacher”。
+
+为什么：代码能检查权重结构和 hash，但“猫域、双向 TI2V、video-global flow”只能由掌握训练来源的人确认。
 
 ```bash
-set -euo pipefail
-export ARCH_ROOT=/path/to/Wan2.2-TI2V-5B
-export TEACHER_CKPT=/path/to/cat_domain_bidirectional_teacher
-export TEACHER_MANIFEST=$STAGE2_ASSET_DIR/real_score_teacher.manifest.json
-export TEACHER_SOURCE_KIND=direct_internal_training_checkpoint
-export TEACHER_SOURCE_ID=REPLACE_WITH_TRUSTED_JOB_OR_CONVERSION_ID
-export TEACHER_SOURCE_SHA256=REPLACE_WITH_TRUSTED_64_HEX_SHA256
-
-# 原生 Wan safetensors：TEACHER_CKPT 可为单文件、index.json 或目录。
-export TEACHER_FORMAT=wan_native_transformer
-export TEACHER_SELECTOR=root
-
-# 若是 LongLive .pt 包装，可改为：
-# export TEACHER_FORMAT=longlive_wrapper_pt
-# export TEACHER_SELECTOR=real_score  # 优先使用real_score或model
-# legacy payload只有在可信bidirectional teacher确实保存到generator键时才选generator；
-# 绝不能把Stage-1 causal Generator冒充real-score teacher。
-
+export TEACHER_MANIFEST="$STAGE2_ASSET_DIR/real_score_teacher.manifest.json"
 test ! -e "$TEACHER_MANIFEST"
 
-PYTHONPATH="$PWD" python scripts/create_stage2_teacher_manifest.py \
+"$STAGE2_PYTHON" -I -B scripts/create_stage2_teacher_manifest.py \
   --checkpoint "$TEACHER_CKPT" \
   --architecture-root "$ARCH_ROOT" \
   --output "$TEACHER_MANIFEST" \
-  --checkpoint-format "$TEACHER_FORMAT" \
-  --state-dict-selector "$TEACHER_SELECTOR" \
+  --checkpoint-format wan_native_transformer \
+  --state-dict-selector root \
   --source-kind "$TEACHER_SOURCE_KIND" \
   --source-identifier "$TEACHER_SOURCE_ID" \
   --source-sha256 "$TEACHER_SOURCE_SHA256" \
@@ -260,175 +191,256 @@ PYTHONPATH="$PWD" python scripts/create_stage2_teacher_manifest.py \
 test -s "$TEACHER_MANIFEST"
 ```
 
-原生路径只接受 BF16 safetensors，并绑定 index 与全部 shards；LongLive包装内的浮点tensor也必须全为BF16且不得含LoRA。`.bin`、FP16/FP32、裸 `.pt` state dict 或未知格式会 fail-closed。需要转换时，先在独立目录生成规范资产，再用多个 `--conversion-command <argv项>` 记录真实转换命令；不得写 `none` 冒充未转换。
+成功输出：
 
-### 3. 绑定 Stage‑2 raw YAML 的运行时路径
+```text
+Wrote ...
+Manifest SHA256: <64位sha256>
+```
+
+如果 teacher 是 LongLive wrapper 或经过转换，不要照抄上面的格式/`none`；必须按真实格式、selector 和完整转换 argv 重建 manifest。来源语义无法确认就停。
+
+## 4. 锁定同一份运行配置，做 8 卡三角色 init-only
+
+做什么：一次性导出正式路径，确认 contract hash，然后初始化 G、frozen real-score 和 F 三个独立 5B 角色。
+
+为什么：先验证权重、LoRA、对象隔离和 FSDP2，避免先花时间重提 cache 才发现模型资产不可用。
 
 ```bash
-set -euo pipefail
+export NEGATIVE_MANIFEST="$NEGATIVE_DIR/negative_conditioning_manifest.json"
+export STAGE2_CONFIG="$PWD/configs/train_i2v_stage2.yaml"
+
 export LONG_LIVE_STAGE2_ARCHITECTURE_ROOT="$ARCH_ROOT"
 export LONG_LIVE_STAGE2_GENERATOR_BASE="$G_MERGED"
 export LONG_LIVE_STAGE2_GENERATOR_MANIFEST="$G_MANIFEST"
 export LONG_LIVE_STAGE2_REAL_SCORE_BASE="$TEACHER_CKPT"
 export LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST="$TEACHER_MANIFEST"
+export LONG_LIVE_STAGE2_METADATA_PATH="$METADATA_600"
+export LONG_LIVE_STAGE2_ACTION_LABELS_PATH="$ACTION_SIDECAR_600"
+export LONG_LIVE_STAGE2_CACHE_DIR="$STAGE2_CACHE_DIR"
+export LONG_LIVE_STAGE2_NEGATIVE_MANIFEST="$NEGATIVE_MANIFEST"
 
-# 本批不读取下面两项，但仍应绑定未来正式资产，确保launch hash可追溯。
-export LONG_LIVE_STAGE2_CACHE_DIR=/path/to/stage2_i2v_600_bf16
-export LONG_LIVE_STAGE2_NEGATIVE_MANIFEST=/path/to/stage2_negative_conditioning_manifest.json
-```
+CONTRACT_HASH="$(
+  PYTHONPATH="$PWD" "$STAGE2_PYTHON" -B -m utils.stage2_config \
+    --config "$STAGE2_CONFIG" --contract-hash-only
+)"
+test "$CONTRACT_HASH" = \
+  aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00
 
-### 4. 运行 Batch 2 本地契约门禁
+PYTHONPATH="$PWD" "$STAGE2_PYTHON" -B -m utils.stage2_config \
+  --config "$STAGE2_CONFIG" > "$STAGE2_RUN_DIR/resolved_config.json"
+echo "CONFIG_BINDING_PASS contract=$CONTRACT_HASH"
 
-```bash
-set -euo pipefail
-PYTHONPATH="$PWD" PYTHONDONTWRITEBYTECODE=1 \
-python -m pytest -q -p no:cacheprovider \
-  tests/test_stage2_config.py \
-  tests/test_stage2_role_initialization.py \
-  tests/test_stage2_role_manifest.py \
-  tests/test_stage2_init_only.py \
-  tests/test_lora_utils.py \
-  tests/test_merge_lora_generator.py \
-  tests/test_diffsynth_causal_converter.py \
-  tests/test_stage1_lazy_imports.py \
-  tests/test_stage1_fsdp2.py \
-  2>&1 | tee "$STAGE2_RUN_DIR/batch2_tests.log"
-```
-
-通过标准：`212 passed`，无失败。警告必须逐条确认仅为已知的 `torch.jit` deprecation。
-
-### 5. 启动 8×H100 init-only preflight
-
-```bash
-set -euo pipefail
-PYTHONPATH="$PWD" torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+test ! -e "$ROLE_INIT_DIR"
+"$STAGE2_TORCHRUN" \
+  --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+  --no-python "$STAGE2_PYTHON" -I -B \
   scripts/preflight_stage2_roles.py \
-  --config configs/train_i2v_stage2.yaml \
-  --output-dir "$STAGE2_INIT_DIR" \
-  --expected-git-commit "$STAGE2_CODE_BASE" \
-  2>&1 | tee "$STAGE2_RUN_DIR/role_init_torchrun.log"
+  --config "$STAGE2_CONFIG" \
+  --output-dir "$ROLE_INIT_DIR" \
+  --expected-git-commit "$STAGE2_COMMIT" \
+  2>&1 | tee "$STAGE2_RUN_DIR/role_init.log"
+
+test -s "$ROLE_INIT_DIR/role_init_manifest.json"
+test -f "$ROLE_INIT_DIR/ROLE_INIT_COMPLETE"
+test ! -e "$ROLE_INIT_DIR/_SUCCESS"
 ```
 
-任何 hash/provenance/shape/dtype/LoRA/FSDP/8-rank consensus 错误、OOM、NCCL hang、tripwire、fallback 或非零退出码都判失败，不得继续 Batch 3。
+成功输出：rank 0 最后一条 JSON 含：
 
-### 6. 验收原子产物
+```json
+{"status":"passed","manifest_sha256":"...","rank_consensus_sha256":"..."}
+```
+
+这一步同时严格检查：单机 world size 8、1D `FULL_SHARD`、G 的 r32 LoRA、real-score 全冻结、F 的 r64 LoRA、三角色参数/存储隔离，以及 forward/optimizer/EMA/T5/VAE/DataLoader 全部未创建或未调用。`ROLE_INIT_COMPLETE` 只是初始化审计，不是训练 `_SUCCESS`。
+
+## 5. 检查真实 tensor，并生成 native F25 cache
+
+做什么：逐条读取原 cache 的实际 safetensors，而不是相信 manifest 声明；按实际 latent 帧数处理 600 条数据。
+
+为什么：Stage-2 固定需要 1 个 sink + 24 个真实 future latent，共 F25。方案不变：F25 复用，F24 必须从原 pixel 视频的 0–96 帧重新提取。
+
+输入要求：不能只拷 `cache_manifest.json`。原 cache 的全部 safetensors，以及 `METADATA_600` 引用的 600 个原视频和 input image，都必须保持原路径可读且 hash 不变；即使已有 proven F25，脚本也会逐条复核这些来源。
 
 ```bash
-set -euo pipefail
-test -s "$STAGE2_INIT_DIR/role_init_manifest.json"
-test -f "$STAGE2_INIT_DIR/ROLE_INIT_COMPLETE"
-test ! -e "$STAGE2_INIT_DIR/_SUCCESS"
+test ! -e "$STAGE2_CACHE_DIR"
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$(git ls-files --others --ignored --exclude-standard)"
 
-PYTHONPATH="$PWD" python - "$STAGE2_INIT_DIR/role_init_manifest.json" <<'PY'
-import json, os, sys
-from utils.stage1_io import canonical_json_sha256
+"$STAGE2_TORCHRUN" \
+  --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+  --no-python "$STAGE2_PYTHON" -I -B \
+  scripts/prepare_stage2_i2v_f25_cache.py \
+  --config-path "$STAGE2_CONFIG" \
+  --source-cache-manifest "$STAGE1_CACHE_MANIFEST" \
+  --vae-checkpoint "$VAE_CKPT" \
+  2>&1 | tee "$STAGE2_RUN_DIR/f25_prepare.log"
 
-p = sys.argv[1]
-m = json.load(open(p, encoding="utf-8"))
-body = {k: v for k, v in m.items() if k != "manifest_sha256"}
-assert m["manifest_sha256"] == canonical_json_sha256(body)
-assert m["artifact_kind"] == "init_only_audit_not_training_checkpoint"
-assert m["code"]["git_commit"] == os.environ["STAGE2_CODE_BASE"]
-assert m["role_isolation"]["parameter_objects_disjoint"] is True
-assert m["role_isolation"]["parameter_storage_disjoint"] is True
-assert m["assets"]["real_score"]["checkpoint_sha256"] == m["assets"]["fake_score_base_sha256"]
+export F25_BASE="$STAGE2_CACHE_DIR/cache_manifest.json"
+export F25_SUCCESS="$STAGE2_CACHE_DIR/_F25_SUCCESS.json"
+test -s "$F25_BASE"
+test -s "$F25_SUCCESS"
 
-expected = {
-    "generator": (32, 180, 360, 57016320, False),
-    "real_score": (None, 0, 0, 0, False),
-    "fake_score": (64, 180, 360, 114032640, True),
-}
-for role, (rank, targets, tensors, params, checkpointing) in expected.items():
-    item = m["roles"][role]
-    assert item["strict_reload_succeeded"] is True
-    assert item["activation_checkpointing"] is checkpointing
-    assert item["pre_fsdp_adapter_tensor_count"] == tensors
-    assert item["pre_fsdp_trainable_parameters"] == params
-    if rank is not None:
-        assert item["target_audit"]["rank"] == rank
-        assert item["target_audit"]["target_module_count"] == targets
-    else:
-        assert item["target_audit"] is None
-    post = item["post_fsdp"]
-    assert post["all_parameters_are_dtensor"] is True
-    assert post["fsdp_module_count"] == 31
-    assert post["mesh_shape"] == [8]
-    assert post["mesh_dim_names"] == ["shard"]
-    assert post["placements"] == ["shard:0"]
+"$STAGE2_PYTHON" -I -B - "$F25_BASE" <<'PY'
+import json
+import sys
 
-assert m["fsdp"]["world_size"] == 8
-assert m["fsdp"]["sharding_strategy"] == "FULL_SHARD"
-assert m["fsdp"]["all_roles_independently_wrapped"] is True
-assert m["side_effects"]["forward_calls"] == 0
-for key in ("optimizer_created", "ema_created", "text_encoder_created", "vae_created", "dataloader_created"):
-    assert m["side_effects"][key] is False
-print("H100-002 manifest audit: PASS")
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+s = m["preparation"]["summary"]
+assert m["schema"] == "longlive_stage2_i2v_f25_source_cache"
+assert set(s) == {"reused_f25", "reverified_f25", "reencoded_f24"}
+assert sum(s.values()) == 600
+print("F25_CACHE_PASS", s, m["manifest_sha256"])
 PY
 ```
 
-通过只代表资产、三角色初始化、独立 LoRA 和 8 卡 FSDP2 拓扑闭环；它不是训练 checkpoint，也不放行 C0/C1/C2。
+成功输出：各 rank 有 `source_scan=...`、`assigned=...` 和 `completed=...` 进度；rank 0 有 `final_verify=...`；最后 JSON 含 `"status":"ok"`，并且 `F25_CACHE_PASS` 的三项总和为 600。
 
-### 7. 真实结果
+- `reused_f25`：proven F25，原 artifact 字节直接复用，不加载 VAE。
+- `reverified_f25`：已有 F25 缺少旧的 97 帧声明；用同一 VAE 对原视频 0–96 帧完整复验，逐 bit 一致后仍发布原 artifact 字节。
+- `reencoded_f24`：F24 用同一 VAE 对原视频 0–96 帧一次性重提 F25，并强制新 F25 的前 24 帧与旧 F24 逐 bit 一致；initial/prompt/mask 原样保留。
 
-```text
-状态：待执行
-执行人：
-执行时间：
-节点/调度任务号：
-当前HEAD：
-Batch 2 tests：
-generator merge manifest SHA256：
-teacher manifest SHA256：
-role-init manifest SHA256：
-产物目录：
-失败摘要：
-结论：通过后才允许开始Batch 3
-```
+禁止 padding、复制 latent、截断或把目标改成 23 个新 latent。原视频不足 97 帧、VAE 不同、F24 前缀不一致，都必须失败且不能产生成功 marker。
 
-## 后续运行记录模板
+## 6. 补齐 positive text provenance，并生成 negative conditioning
 
-复制本节并追加为新的 `H100-NNN`，同时更新“运行总览”。
+做什么：先证明 positive cache 使用锁定的 T5/tokenizer 文本设置，再用完全相同的 T5/tokenizer 编码统一 negative prompt。
 
-````markdown
-## H100-NNN：<批次/实验名>
-
-### 元信息
-
-- 日期：
-- 执行人：
-- branch / commit：
-- 节点 / GPU：
-- run_id / 输出目录：
-
-### 目标与明确不做
-
-- 本次验证：
-- 本次不验证：
-
-### 输入与资产
-
-- config / contract hash：
-- base / adapter / cache manifest hash：
-- checkpoint / resume来源：
-
-### 执行命令
+为什么：positive/negative 文本空间不同会让 CFG 和 DMD/DFD 训练失真。
 
 ```bash
-# 只填写实际执行过的命令
+export F25_ATTESTED="$STAGE2_CACHE_DIR/cache_manifest.attested.json"
+export F25_BASE_SELF_SHA="$(
+  "$STAGE2_PYTHON" -I -B -c \
+    'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["manifest_sha256"])' \
+    "$F25_BASE"
+)"
+export TEXT_ATTESTATION='I attest that this legacy positive cache was encoded with the locked Wan seq512/whitespace/add-special-tokens/right-padding/exact-zero-padding contract.'
+
+test ! -e "$F25_ATTESTED"
+"$STAGE2_PYTHON" -I -B scripts/audit_stage2_i2v_cache.py \
+  upgrade-source-manifest \
+  --base-source-cache-manifest "$F25_BASE" \
+  --output-manifest "$F25_ATTESTED" \
+  --expected-source-manifest-sha256 "$F25_BASE_SELF_SHA" \
+  --t5-checkpoint "$T5_CKPT" \
+  --tokenizer-dir "$TOKENIZER_DIR" \
+  --operator-id "$OPERATOR_ID" \
+  --operator-attestation "$TEXT_ATTESTATION" \
+  --expected-num-samples 600 \
+  2>&1 | tee "$STAGE2_RUN_DIR/source_attestation.log"
+
+test -s "$F25_ATTESTED"
+test ! -e "$NEGATIVE_DIR"
+CUDA_VISIBLE_DEVICES=0 \
+"$STAGE2_PYTHON" -I -B scripts/audit_stage2_i2v_cache.py \
+  prepare-negative \
+  --source-cache-manifest "$F25_ATTESTED" \
+  --t5-checkpoint "$T5_CKPT" \
+  --tokenizer-dir "$TOKENIZER_DIR" \
+  --output-dir "$NEGATIVE_DIR" \
+  --expected-num-samples 600 \
+  --device cuda:0 \
+  2>&1 | tee "$STAGE2_RUN_DIR/negative_prepare.log"
+
+test -s "$NEGATIVE_DIR/negative_conditioning.safetensors"
+test -s "$NEGATIVE_MANIFEST"
 ```
 
-### 通过标准
+成功输出：
 
-- [ ] 测试与进程退出码为0
-- [ ] shape、dtype、role、hash、计数与本批契约一致
-- [ ] 无OOM、non-finite、NCCL hang或未解释的fallback
-- [ ] 必需manifest、日志、checkpoint或视频完整
+- attestation 的最终 JSON 含 `"status":"ok"`、`manifest_sha256`、`text_encoding_contract_sha256` 和 `"code_version":"git:<当前commit>"`。
+- negative 的最终 JSON 含 `"status":"ok"`、64 位 `artifact_sha256`，且 `prompt_valid_tokens > 0`。
 
-### 真实结果
+`F25_BASE_SELF_SHA` 是 manifest 内部的 self-hash，不是 `sha256sum` 的文件 hash。正常首次部署不要使用 `--force`。negative 必须放在 F25 cache 目录外。
 
-- 状态：待执行 / 失败 / 通过
-- 关键指标：
-- 产物路径：
-- 失败现场：
-- 结论与下一门禁：
-````
+## 7. 正式扫描 600 条 cache
+
+做什么：用同一份 env-resolved YAML 全扫 600 个 F25 artifact，绑定 metadata、action、negative、配置和代码版本。
+
+为什么：这是训练数据唯一正式入口；没有这个 manifest，后续 trainer 必须拒绝启动。
+
+```bash
+"$STAGE2_PYTHON" -I -B scripts/audit_stage2_i2v_cache.py \
+  audit \
+  --config-path "$STAGE2_CONFIG" \
+  --source-cache-manifest "$F25_ATTESTED" \
+  --action-id "$ACTION_ID_1" \
+  --action-id "$ACTION_ID_2" \
+  --action-id "$ACTION_ID_3" \
+  2>&1 | tee "$STAGE2_RUN_DIR/cache_audit.log"
+
+export FINAL_CACHE_MANIFEST="$STAGE2_CACHE_DIR/stage2_i2v_manifest.json"
+test -s "$FINAL_CACHE_MANIFEST"
+
+"$STAGE2_PYTHON" -I -B - "$FINAL_CACHE_MANIFEST" <<'PY'
+import json
+import sys
+
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+assert m["schema"] == "longlive_stage2_i2v_cache"
+assert m["num_samples"] == 600
+assert sorted(m["actions"]["counts"].values()) == [200, 200, 200]
+assert sum(m["orientation_counts"].values()) == 600
+print("FORMAL_CACHE_AUDIT_PASS", m["actions"]["counts"], m["manifest_sha256"])
+PY
+```
+
+成功输出：CLI 最终 JSON 含 `"status":"ok"`、`"num_samples":600`，三个 `action_counts` 各 200；随后打印 `FORMAL_CACHE_AUDIT_PASS`。
+
+不要用 `--metadata-path`、`--cache-dir`、`--negative-conditioning-manifest`、`--action-labels-path` 或 `--output-manifest` 临时换路径；正式路径只能来自第 4 节锁定的环境变量。
+
+## 8. 最终检查、回传，然后停止
+
+做什么：只验证检查点 A 必需产物和禁止项，不运行任何训练命令。
+
+```bash
+test "$(git rev-parse HEAD)" = "$STAGE2_COMMIT"
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$(git ls-files --others --ignored --exclude-standard)"
+test -s "$G_MERGED"
+test -s "$G_MANIFEST"
+test -s "$TEACHER_MANIFEST"
+test -s "$ROLE_INIT_DIR/role_init_manifest.json"
+test -f "$ROLE_INIT_DIR/ROLE_INIT_COMPLETE"
+test ! -e "$ROLE_INIT_DIR/_SUCCESS"
+test -s "$F25_BASE"
+test -s "$F25_SUCCESS"
+test -s "$F25_ATTESTED"
+test -s "$NEGATIVE_MANIFEST"
+test -s "$FINAL_CACHE_MANIFEST"
+echo CHECKPOINT_A_H100_PREP_PASS
+```
+
+成功输出：`CHECKPOINT_A_H100_PREP_PASS`。到这里立即停止，不运行 `train.py`，也不创建 optimizer、训练 checkpoint、训练日志或可视化。
+
+请回传下面这些内容：
+
+```text
+git commit：
+GPU_ENV_PASS 那一行：
+pytest 最后一行：
+Generator SHA256：
+Teacher manifest SHA256：
+role-init 最后一条 JSON：
+F25_CACHE_PASS 那一行：
+attestation 最后一条 JSON：
+negative 最后一条 JSON：
+formal audit 最后一条 JSON：
+FORMAL_CACHE_AUDIT_PASS 那一行：
+最终标记：CHECKPOINT_A_H100_PREP_PASS
+```
+
+## 常见失败：看到就停
+
+| 输出或现象 | 含义 / 正确处理 |
+|---|---|
+| `Refusing non-isolated...` | 命令缺少 `-I -B`；按本文原命令重跑。 |
+| dirty checkout / ignored files | 仓库里出现改动、`.pytest_cache`、`__pycache__` 等；换 fresh clone 或确认来源后移走，**不要直接 `git clean -fdx`**。 |
+| world-size mismatch | 必须单机 8 进程、8 张 H100。 |
+| VAE/T5/tokenizer hash mismatch | 使用的不是原 positive cache 的同源资产；不要强行继续。 |
+| `F25[:24] differs bitwise` | 原 cache、视频、VAE 或预处理 provenance 不一致；立即停止。 |
+| action 不是 200/200/200 | 修正人工确认的 action 标签来源；禁止从文本或行号推断。 |
+| unexpected files in F25 output | 日志、negative 或其他文件放错目录；用全新的独立输出目录重跑。 |
+| config/launch hash changed | 中途换了环境变量或路径；不要复用旧输出目录。 |
+| NCCL hang、OOM、non-finite | 保存日志与 `nvidia-smi` 现场并停止，不得降低门禁或改研究方案。 |

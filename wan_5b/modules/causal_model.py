@@ -225,13 +225,57 @@ class MultiShotT2VCrossAttention(WanCrossAttention):
             # compute query, key, value
             q = self.norm_q(self.q(x_chunk)).view(b_eff, -1, n, d)
 
-            # iter-24: Bypass crossattn_cache. Cached K/V tensors escape the
-            # cudagraph memory pool across torch.compile step boundaries and
-            # block `mode=reduce-overhead`. Per-call recompute cost is tiny
-            # (~1.7us / call in NVFP4 × ~11.5k calls/prompt ≈ 19 ms total),
-            # for cudagraphs unlock of the 28% wall-time gap.
-            k = self.norm_k(self.k(context)).view(b_eff, -1, n, d)
-            v = self.v(context).view(b_eff, -1, n, d)
+            # Legacy/cudagraph paths intentionally bypass crossattn_cache.
+            # Stage-2 runs without torch.compile and opts into one explicit
+            # conditional cache branch.  The flag keeps legacy behavior
+            # byte-for-byte unchanged while making the Stage-2 allocation real
+            # rather than a large unused buffer.
+            use_stage2_cache = (
+                isinstance(crossattn_cache, dict)
+                and crossattn_cache.get("stage2_enabled", False) is True
+            )
+            if use_stage2_cache and bool(crossattn_cache.get("is_init", False)):
+                k = crossattn_cache.get("k")
+                v = crossattn_cache.get("v")
+                expected = (b_eff, context.shape[1], n, d)
+                if (
+                    not isinstance(k, torch.Tensor)
+                    or not isinstance(v, torch.Tensor)
+                    or tuple(k.shape) != expected
+                    or tuple(v.shape) != expected
+                    or k.device != x_chunk.device
+                    or v.device != x_chunk.device
+                    or k.dtype != x_chunk.dtype
+                    or v.dtype != x_chunk.dtype
+                ):
+                    raise RuntimeError(
+                        "Stage-2 cross-attention cache does not match context geometry"
+                    )
+            else:
+                k = self.norm_k(self.k(context)).view(b_eff, -1, n, d)
+                v = self.v(context).view(b_eff, -1, n, d)
+                if use_stage2_cache:
+                    cache_k = crossattn_cache.get("k")
+                    cache_v = crossattn_cache.get("v")
+                    if (
+                        not isinstance(cache_k, torch.Tensor)
+                        or not isinstance(cache_v, torch.Tensor)
+                        or cache_k.shape != k.shape
+                        or cache_v.shape != v.shape
+                        or cache_k.device != k.device
+                        or cache_v.device != v.device
+                        or cache_k.dtype != k.dtype
+                        or cache_v.dtype != v.dtype
+                    ):
+                        raise RuntimeError(
+                            "Stage-2 cross-attention cache allocation mismatch"
+                        )
+                    with torch.no_grad():
+                        cache_k.copy_(k.detach())
+                        cache_v.copy_(v.detach())
+                    crossattn_cache["is_init"] = True
+                    k = cache_k
+                    v = cache_v
 
             # compute attention
             x_attn = flash_attention(q, k, v, k_lens=context_lens)
