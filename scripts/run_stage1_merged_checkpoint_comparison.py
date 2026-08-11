@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Compare pre-merged and runtime-LoRA Stage-1 inference on four GPUs.
 
-The reference is a ``checkpoint_model_XXXXXX`` directory produced by
-``run_stage1_training_checkpoints_validation.py``.  Its prepared carrier
-videos and inference configs are reused so both checkpoint formats receive
-the same sample inputs, sampling parameters, and per-row noise seeds.
+When an old validation result is available, its prepared carrier videos and
+configs are reused.  Otherwise they are built directly from the metadata CSV
+and model assets.  Both checkpoint formats always receive the same inputs,
+sampling parameters, and per-row noise seeds.
 """
 
 from __future__ import annotations
@@ -30,10 +30,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.config import normalize_config  # noqa: E402
+from utils.config import DEFAULT_NEGATIVE_PROMPT, normalize_config  # noqa: E402
 from utils.stage1_causal_validation import (  # noqa: E402
     CAUSAL_TESTSET_SCHEMA_VERSION,
     load_causal_testset_records,
+    prepare_causal_testsets,
     probe_video,
     validate_causal_testset_outputs,
 )
@@ -49,7 +50,7 @@ from utils.stage1_checkpoint import (  # noqa: E402
     validate_checkpoint,
 )
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -82,11 +83,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reference-checkpoint-dir",
-        required=True,
+        default=None,
         help=(
-            "Existing checkpoint_model_XXXXXX result directory created by "
-            "run_stage1_training_checkpoints_validation.py."
+            "Optional existing checkpoint_model_XXXXXX inference result. "
+            "When omitted, shared inputs are prepared directly from metadata."
         ),
+    )
+    parser.add_argument(
+        "--architecture-root",
+        help="Required only when --reference-checkpoint-dir is omitted.",
+    )
+    parser.add_argument(
+        "--t5-checkpoint",
+        help="Required only when --reference-checkpoint-dir is omitted.",
+    )
+    parser.add_argument(
+        "--tokenizer-dir",
+        help="Required only when --reference-checkpoint-dir is omitted.",
+    )
+    parser.add_argument(
+        "--vae-checkpoint",
+        help="Required only when --reference-checkpoint-dir is omitted.",
     )
     parser.add_argument("--metadata", required=True)
     parser.add_argument(
@@ -102,6 +119,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-first-frame-psnr-db", type=float, default=12.0)
     parser.add_argument("--minimum-frame-std", type=float, default=5.0)
     parser.add_argument("--minimum-temporal-abs-diff", type=float, default=0.05)
+    parser.add_argument("--sampling-steps", type=int, default=50)
+    parser.add_argument("--guidance-scale", type=float, default=5.0)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
     return parser
 
 
@@ -182,6 +203,79 @@ def _assert_metadata_matches_reference(
         if wrong:
             raise RuntimeError(f"Reference metadata row {row_id} mismatch: {wrong}")
     return records
+
+
+def prepare_fresh_comparison_inputs(
+    *,
+    metadata_path: str | os.PathLike[str],
+    output_root: str | os.PathLike[str],
+    base_checkpoint: str | os.PathLike[str],
+    architecture_root: str | os.PathLike[str],
+    t5_checkpoint: str | os.PathLike[str],
+    tokenizer_dir: str | os.PathLike[str],
+    vae_checkpoint: str | os.PathLike[str],
+    sampling_steps: int = 50,
+    guidance_scale: float = 5.0,
+    seed: int = 1,
+    negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+    preparation_builder: Callable[..., dict[str, Any]] = prepare_causal_testsets,
+) -> tuple[Path, dict[str, Any]]:
+    """Build one immutable shared preparation when no old result exists."""
+
+    output_root = Path(output_root).expanduser().resolve()
+    manifest = preparation_builder(
+        metadata_path=metadata_path,
+        output_root=output_root,
+        base_checkpoint=base_checkpoint,
+        architecture_root=architecture_root,
+        t5_checkpoint=t5_checkpoint,
+        tokenizer_dir=tokenizer_dir,
+        vae_checkpoint=vae_checkpoint,
+        num_latent_frames=24,
+        num_frame_per_block=8,
+        temporal_compression_ratio=4,
+        minimum_source_frames=97,
+        fps=24,
+        sampling_steps=int(sampling_steps),
+        guidance_scale=float(guidance_scale),
+        seed=int(seed),
+        negative_prompt=str(negative_prompt),
+    )
+    manifest_path = output_root / "prepared_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"Fresh preparation did not publish its manifest: {manifest_path}"
+        )
+    persisted = _load_json(manifest_path)
+    _assert_reference_manifest_integrity(persisted)
+    if persisted != manifest:
+        raise RuntimeError("Fresh prepared manifest differs from the returned manifest")
+    return manifest_path, persisted
+
+
+def _resolve_fresh_preparation_assets(args: argparse.Namespace) -> dict[str, Path]:
+    specs = {
+        "architecture_root": (getattr(args, "architecture_root", None), True),
+        "t5_checkpoint": (getattr(args, "t5_checkpoint", None), False),
+        "tokenizer_dir": (getattr(args, "tokenizer_dir", None), True),
+        "vae_checkpoint": (getattr(args, "vae_checkpoint", None), False),
+    }
+    missing_args = [name for name, (value, _is_dir) in specs.items() if not value]
+    if missing_args:
+        flags = [f"--{name.replace('_', '-')}" for name in missing_args]
+        raise ValueError(
+            "Fresh preparation requires model asset arguments when no reference "
+            f"directory is supplied: {flags}"
+        )
+    resolved: dict[str, Path] = {}
+    for name, (value, is_dir) in specs.items():
+        path = Path(value).expanduser().resolve()
+        exists = path.is_dir() if is_dir else path.is_file()
+        if not exists:
+            expected = "directory" if is_dir else "file"
+            raise FileNotFoundError(f"Expected {name} {expected}: {path}")
+        resolved[name] = path
+    return resolved
 
 
 def validate_merged_checkpoint_provenance(
@@ -766,18 +860,17 @@ video{display:block;max-width:100%;max-height:640px;background:#111}.meta{font-s
         "<p><strong>并排视频左侧：</strong>预 merged 完整权重；"
         "<strong>右侧：</strong>base + adapter_ema.safetensors 动态 LoRA。"
         "两路使用相同的逐 row noise seed。</p>",
-        "<p>原 infer_stage1 视频仅作为历史参考单独展示；其旧版顺序 RNG 不参与两种权重格式的严格等价判断。</p>",
     ]
+    has_historical_reference = any(sample.get("reference_video") for sample in samples)
+    if has_historical_reference:
+        lines.append(
+            "<p>原 infer_stage1 视频仅作为历史参考单独展示；其旧版顺序 RNG "
+            "不参与两种权重格式的严格等价判断。</p>"
+        )
     for sample in samples:
         video_path = Path(sample["comparison_video"]).resolve()
         relative = video_path.relative_to(work_dir).as_posix()
         source = quote(relative, safe="/._-")
-        reference_path = Path(sample["reference_video"]).resolve()
-        try:
-            reference_source_path = reference_path.relative_to(work_dir).as_posix()
-        except ValueError:
-            reference_source_path = os.fspath(reference_path)
-        reference_source = quote(reference_source_path, safe="/._-")
         lines.extend(
             [
                 '<section class="case">',
@@ -785,12 +878,27 @@ video{display:block;max-width:100%;max-height:640px;background:#111}.meta{font-s
                 f"{html.escape(sample['bucket_id'])} · seed {int(sample['sample_seed'])}</h2>",
                 f'<video controls loop preload="metadata" src="{html.escape(source)}"></video>',
                 '<p class="meta">left = pre-merged checkpoint · right = dynamic LoRA</p>',
-                "<details><summary>原 infer_stage1 历史参考</summary>",
-                f'<video controls loop preload="metadata" src="{html.escape(reference_source)}"></video>',
-                "</details>",
-                "</section>",
             ]
         )
+        reference_value = sample.get("reference_video")
+        if reference_value:
+            reference_path = Path(reference_value).resolve()
+            try:
+                reference_source_path = reference_path.relative_to(
+                    work_dir
+                ).as_posix()
+            except ValueError:
+                reference_source_path = os.fspath(reference_path)
+            reference_source = quote(reference_source_path, safe="/._-")
+            lines.extend(
+                [
+                    "<details><summary>原 infer_stage1 历史参考</summary>",
+                    '<video controls loop preload="metadata" '
+                    f'src="{html.escape(reference_source)}"></video>',
+                    "</details>",
+                ]
+            )
+        lines.append("</section>")
     lines.append("</body></html>")
     return "".join(lines)
 
@@ -801,12 +909,18 @@ def run_comparison(
     command_runner: Callable[..., Any] = subprocess.run,
     output_validator: Callable[..., dict[str, Any]] = validate_causal_testset_outputs,
     pair_writer: Callable[..., dict[str, Any]] = write_side_by_side_video,
+    preparation_builder: Callable[..., dict[str, Any]] = prepare_causal_testsets,
 ) -> dict[str, Any]:
     merged_checkpoint = Path(args.merged_checkpoint).expanduser().resolve()
     merged_manifest_path = Path(args.merged_manifest).expanduser().resolve()
     base_checkpoint = Path(args.base_checkpoint).expanduser().resolve()
     training_checkpoint = Path(args.training_checkpoint).expanduser().resolve()
-    reference_dir = Path(args.reference_checkpoint_dir).expanduser().resolve()
+    reference_dir_value = getattr(args, "reference_checkpoint_dir", None)
+    reference_dir = (
+        Path(reference_dir_value).expanduser().resolve()
+        if reference_dir_value
+        else None
+    )
     metadata_path = Path(args.metadata).expanduser().resolve()
     work_dir = Path(args.work_dir).expanduser().resolve()
     gpu_ids = _parse_gpu_ids(args.gpu_ids)
@@ -815,7 +929,11 @@ def run_comparison(
             "This comparison requires exactly four GPUs: one per "
             "(checkpoint format, geometry bucket) worker"
         )
-    reference_manifest_path = reference_dir / "prepared" / "prepared_manifest.json"
+    reference_manifest_path = (
+        reference_dir / "prepared" / "prepared_manifest.json"
+        if reference_dir is not None
+        else work_dir / "shared_prepared" / "prepared_manifest.json"
+    )
     merged_inference_root = work_dir / "merged_inference"
     lora_inference_root = work_dir / "lora_inference"
     report_path = work_dir / "comparison_report.json"
@@ -828,17 +946,18 @@ def run_comparison(
         raise FileNotFoundError(base_checkpoint)
     if not training_checkpoint.is_dir():
         raise FileNotFoundError(training_checkpoint)
-    if not reference_dir.is_dir():
+    if reference_dir is not None and not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
     if not metadata_path.is_file():
         raise FileNotFoundError(metadata_path)
-    reference_step = checkpoint_step(reference_dir)
     training_step = checkpoint_step(training_checkpoint)
-    if reference_step != training_step:
-        raise RuntimeError(
-            "Reference and dynamic LoRA checkpoints select different optimizer steps: "
-            f"reference={reference_step}, training={training_step}"
-        )
+    if reference_dir is not None:
+        reference_step = checkpoint_step(reference_dir)
+        if reference_step != training_step:
+            raise RuntimeError(
+                "Reference and dynamic LoRA checkpoints select different optimizer "
+                f"steps: reference={reference_step}, training={training_step}"
+            )
     base_sha256 = sha256_file(base_checkpoint)
     training_manifest = validate_checkpoint(
         training_checkpoint,
@@ -867,7 +986,12 @@ def run_comparison(
         training_step=training_step,
         adapter_sha256=adapter_sha256,
     )
-    if work_dir == reference_dir or work_dir.is_relative_to(reference_dir):
+    fresh_assets = (
+        None if reference_dir is not None else _resolve_fresh_preparation_assets(args)
+    )
+    if reference_dir is not None and (
+        work_dir == reference_dir or work_dir.is_relative_to(reference_dir)
+    ):
         raise ValueError(
             "Work directory must be outside the immutable reference result"
         )
@@ -895,7 +1019,16 @@ def run_comparison(
             "adapter_sha256": adapter_sha256,
             "checkpoint_manifest_sha256": training_manifest["manifest_sha256"],
         },
-        "reference_checkpoint_dir": os.fspath(reference_dir),
+        "reference_checkpoint_dir": (
+            None if reference_dir is None else os.fspath(reference_dir)
+        ),
+        "input_preparation": {
+            "mode": "reference" if reference_dir is not None else "fresh",
+            "reference_checkpoint_dir": (
+                None if reference_dir is None else os.fspath(reference_dir)
+            ),
+            "prepared_manifest": os.fspath(reference_manifest_path),
+        },
         "gpu_ids": list(gpu_ids),
         "execution": "four_concurrent_single_gpu_format_bucket_workers",
         "side_by_side_order": {
@@ -906,32 +1039,67 @@ def run_comparison(
     atomic_write_json(report_path, report)
 
     try:
-        reference_manifest = _load_json(reference_manifest_path)
-        _assert_reference_manifest_integrity(reference_manifest)
+        validator_kwargs = {
+            "minimum_first_frame_psnr_db": args.minimum_first_frame_psnr_db,
+            "minimum_frame_std": args.minimum_frame_std,
+            "minimum_temporal_abs_diff": args.minimum_temporal_abs_diff,
+        }
+        reference_outputs: dict[str, Any] | None = None
+        if reference_dir is not None:
+            reference_manifest = _load_json(reference_manifest_path)
+            _assert_reference_manifest_integrity(reference_manifest)
+            report["status"] = "validating_reference"
+            atomic_write_json(report_path, report)
+            reference_outputs = output_validator(
+                reference_manifest_path,
+                **validator_kwargs,
+            )
+            reference_output_validation_path = (
+                work_dir / "reference_output_validation.json"
+            )
+            atomic_write_json(
+                reference_output_validation_path,
+                reference_outputs,
+            )
+            report["reference_output_validation"] = os.fspath(
+                reference_output_validation_path
+            )
+        else:
+            assert fresh_assets is not None
+            report["status"] = "preparing_shared_inputs"
+            atomic_write_json(report_path, report)
+            reference_manifest_path, reference_manifest = (
+                prepare_fresh_comparison_inputs(
+                    metadata_path=metadata_path,
+                    output_root=work_dir / "shared_prepared",
+                    base_checkpoint=base_checkpoint,
+                    architecture_root=fresh_assets["architecture_root"],
+                    t5_checkpoint=fresh_assets["t5_checkpoint"],
+                    tokenizer_dir=fresh_assets["tokenizer_dir"],
+                    vae_checkpoint=fresh_assets["vae_checkpoint"],
+                    sampling_steps=getattr(args, "sampling_steps", 50),
+                    guidance_scale=getattr(args, "guidance_scale", 5.0),
+                    seed=getattr(args, "seed", 1),
+                    negative_prompt=getattr(
+                        args,
+                        "negative_prompt",
+                        DEFAULT_NEGATIVE_PROMPT,
+                    ),
+                    preparation_builder=preparation_builder,
+                )
+            )
+            report["input_preparation"]["prepared_manifest"] = os.fspath(
+                reference_manifest_path
+            )
+
         records = _assert_metadata_matches_reference(
             metadata_path,
             reference_manifest,
         )
         report["sampling"] = reference_manifest["sampling"]
         report["frame_policy"] = reference_manifest["frame_policy"]
-        report["status"] = "validating_reference"
-        atomic_write_json(report_path, report)
 
-        validator_kwargs = {
-            "minimum_first_frame_psnr_db": args.minimum_first_frame_psnr_db,
-            "minimum_frame_std": args.minimum_frame_std,
-            "minimum_temporal_abs_diff": args.minimum_temporal_abs_diff,
-        }
-        reference_outputs = output_validator(
-            reference_manifest_path,
-            **validator_kwargs,
-        )
-        report["reference_output_validation"] = os.fspath(
-            work_dir / "reference_output_validation.json"
-        )
-        atomic_write_json(report["reference_output_validation"], reference_outputs)
-
-        report["status"] = "preparing_merged_inference"
+        report["status"] = "preparing_inference_variants"
         atomic_write_json(report_path, report)
         cloned_manifest = clone_reference_preparation(
             reference_manifest_path=reference_manifest_path,
@@ -1002,9 +1170,14 @@ def run_comparison(
         atomic_write_json(lora_output_validation_path, lora_outputs)
         report["lora_output_validation"] = os.fspath(lora_output_validation_path)
 
-        reference_by_row = {
-            int(sample["row_id"]): sample for sample in reference_outputs["samples"]
-        }
+        reference_by_row = (
+            {
+                int(sample["row_id"]): sample
+                for sample in reference_outputs["samples"]
+            }
+            if reference_outputs is not None
+            else {}
+        )
         merged_by_row = {
             int(sample["row_id"]): sample for sample in merged_outputs["samples"]
         }
@@ -1012,15 +1185,16 @@ def run_comparison(
             int(sample["row_id"]): sample for sample in lora_outputs["samples"]
         }
         expected_rows = {record.row_id for record in records}
-        if (
-            set(reference_by_row) != expected_rows
-            or set(merged_by_row) != expected_rows
-            or set(lora_by_row) != expected_rows
-        ):
+        reference_rows_are_valid = reference_outputs is None or (
+            set(reference_by_row) == expected_rows
+        )
+        if not reference_rows_are_valid or set(merged_by_row) != expected_rows or set(
+            lora_by_row
+        ) != expected_rows:
             raise RuntimeError(
                 "Validated output row sets are incomplete: "
                 f"expected={sorted(expected_rows)}, "
-                f"reference={sorted(reference_by_row)}, "
+                f"reference={None if reference_outputs is None else sorted(reference_by_row)}, "
                 f"merged={sorted(merged_by_row)}, lora={sorted(lora_by_row)}"
             )
 
@@ -1049,7 +1223,6 @@ def run_comparison(
         comparisons_dir = work_dir / "side_by_side"
         samples = []
         for record in records:
-            reference = Path(reference_by_row[record.row_id]["output_video"])
             left = Path(merged_by_row[record.row_id]["output_video"])
             right = Path(lora_by_row[record.row_id]["output_video"])
             output = comparisons_dir / (
@@ -1062,20 +1235,21 @@ def run_comparison(
                 output,
                 command_runner=command_runner,
             )
-            samples.append(
-                {
-                    "row_id": record.row_id,
-                    "bucket_id": record.bucket_id,
-                    "prompt": record.prompt,
-                    "sample_seed": merged_seed_by_row[record.row_id],
-                    "reference_video": os.fspath(reference.resolve()),
-                    "left_premerged_video": os.fspath(left.resolve()),
-                    "right_dynamic_lora_video": os.fspath(right.resolve()),
-                    "comparison_video": os.fspath(output.resolve()),
-                    "comparison_sha256": sha256_file(output),
-                    "stream": stream,
-                }
-            )
+            sample = {
+                "row_id": record.row_id,
+                "bucket_id": record.bucket_id,
+                "prompt": record.prompt,
+                "sample_seed": merged_seed_by_row[record.row_id],
+                "left_premerged_video": os.fspath(left.resolve()),
+                "right_dynamic_lora_video": os.fspath(right.resolve()),
+                "comparison_video": os.fspath(output.resolve()),
+                "comparison_sha256": sha256_file(output),
+                "stream": stream,
+            }
+            if reference_outputs is not None:
+                reference = Path(reference_by_row[record.row_id]["output_video"])
+                sample["reference_video"] = os.fspath(reference.resolve())
+            samples.append(sample)
 
         comparison_html_path = work_dir / "comparison.html"
         atomic_write_bytes(

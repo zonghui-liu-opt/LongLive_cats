@@ -3,11 +3,16 @@ set -euo pipefail
 
 project_root="${LONG_LIVE_STAGE1_PROJECT_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0}"
 stage1_python="${LONG_LIVE_STAGE1_PYTHON:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python}"
+auxiliary_root="${LONG_LIVE_STAGE1_AUXILIARY_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}"
 merged_checkpoint="${LONG_LIVE_STAGE1_MERGED_CHECKPOINT:-$project_root/checkpoints/stage2/stage1_step3750_ema_merged.pt}"
 merged_manifest="${LONG_LIVE_STAGE1_MERGED_MANIFEST:-${merged_checkpoint%.pt}.manifest.json}"
 base_checkpoint="${LONG_LIVE_STAGE1_BASE_CHECKPOINT:-$project_root/checkpoints/stage1/converted_causal_base.pt}"
 training_checkpoint="${LONG_LIVE_STAGE1_TRAINING_CHECKPOINT:-$project_root/results/stage1_600cats_phaseA10epochs_phaseB20epochs_all/checkpoint_model_003750}"
-reference_dir="${LONG_LIVE_STAGE1_REFERENCE_DIR:-$project_root/work_dir/stage1_600cats_phaseA10epochs_phaseB20epochs_all/checkpoint_model_003750}"
+reference_dir="${LONG_LIVE_STAGE1_REFERENCE_DIR:-}"
+architecture_root="${LONG_LIVE_STAGE1_ARCHITECTURE_ROOT:-$auxiliary_root}"
+t5_checkpoint="${LONG_LIVE_STAGE1_T5_CHECKPOINT:-$auxiliary_root/models_t5_umt5-xxl-enc-bf16.pth}"
+tokenizer_dir="${LONG_LIVE_STAGE1_TOKENIZER_DIR:-$auxiliary_root/google/umt5-xxl}"
+vae_checkpoint="${LONG_LIVE_STAGE1_VAE_CHECKPOINT:-$auxiliary_root/Wan2.2_VAE.pth}"
 metadata_path="${LONG_LIVE_STAGE1_COMPARE_METADATA:-$project_root/testsets/metadata_6cases_480x832.csv}"
 work_dir="${1:-${LONG_LIVE_STAGE1_MERGED_COMPARE_WORK_DIR:-$project_root/work_dir/stage1_step3750_merged_comparison}}"
 gpu_ids="${LONG_LIVE_STAGE1_INFERENCE_GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
@@ -36,9 +41,28 @@ if [[ ! -f "$training_checkpoint/adapter_ema.safetensors" ]]; then
   echo "error: Stage-1 EMA adapter is missing under: $training_checkpoint" >&2
   exit 2
 fi
-if [[ ! -f "$reference_dir/prepared/prepared_manifest.json" ]]; then
-  echo "error: reference prepared manifest is missing under: $reference_dir" >&2
-  exit 2
+if [[ -n "$reference_dir" ]]; then
+  if [[ ! -f "$reference_dir/prepared/prepared_manifest.json" ]]; then
+    echo "error: reference prepared manifest is missing under: $reference_dir" >&2
+    exit 2
+  fi
+else
+  if [[ ! -d "$architecture_root" ]]; then
+    echo "error: architecture root is missing: $architecture_root" >&2
+    exit 2
+  fi
+  if [[ ! -f "$t5_checkpoint" ]]; then
+    echo "error: T5 checkpoint is missing: $t5_checkpoint" >&2
+    exit 2
+  fi
+  if [[ ! -d "$tokenizer_dir" ]]; then
+    echo "error: tokenizer directory is missing: $tokenizer_dir" >&2
+    exit 2
+  fi
+  if [[ ! -f "$vae_checkpoint" ]]; then
+    echo "error: VAE checkpoint is missing: $vae_checkpoint" >&2
+    exit 2
+  fi
 fi
 if [[ ! -f "$metadata_path" ]]; then
   echo "error: metadata CSV is missing: $metadata_path" >&2
@@ -62,12 +86,24 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export TOKENIZERS_PARALLELISM=false
 
 cd "$project_root"
-exec "$stage1_python" scripts/run_stage1_merged_checkpoint_comparison.py \
-  --merged-checkpoint "$merged_checkpoint" \
-  --merged-manifest "$merged_manifest" \
-  --base-checkpoint "$base_checkpoint" \
-  --training-checkpoint "$training_checkpoint" \
-  --reference-checkpoint-dir "$reference_dir" \
-  --metadata "$metadata_path" \
-  --gpu-ids "$gpu_ids" \
+comparison_args=(
+  scripts/run_stage1_merged_checkpoint_comparison.py
+  --merged-checkpoint "$merged_checkpoint"
+  --merged-manifest "$merged_manifest"
+  --base-checkpoint "$base_checkpoint"
+  --training-checkpoint "$training_checkpoint"
+  --metadata "$metadata_path"
+  --gpu-ids "$gpu_ids"
   --work-dir "$work_dir"
+)
+if [[ -n "$reference_dir" ]]; then
+  comparison_args+=(--reference-checkpoint-dir "$reference_dir")
+else
+  comparison_args+=(
+    --architecture-root "$architecture_root"
+    --t5-checkpoint "$t5_checkpoint"
+    --tokenizer-dir "$tokenizer_dir"
+    --vae-checkpoint "$vae_checkpoint"
+  )
+fi
+exec "$stage1_python" "${comparison_args[@]}"

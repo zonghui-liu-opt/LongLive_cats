@@ -1,19 +1,24 @@
+import csv
 import json
 from pathlib import Path
 
 from omegaconf import OmegaConf
+from PIL import Image
 import pytest
 
 import scripts.run_stage1_merged_checkpoint_comparison as comparison
 from scripts.run_stage1_merged_checkpoint_comparison import (
+    build_parser,
     build_parallel_inference_jobs,
     clone_reference_lora_preparation,
     clone_reference_preparation,
+    prepare_fresh_comparison_inputs,
     run_parallel_inference_jobs,
     validate_merged_checkpoint_provenance,
     write_side_by_side_video,
 )
 from utils.stage1_io import atomic_write_json, canonical_json_sha256
+from utils.stage1_causal_validation import prepare_causal_testsets
 
 
 def _write_reference_preparation(
@@ -126,6 +131,267 @@ def _write_reference_preparation(
     manifest_path = root / "prepared" / "prepared_manifest.json"
     atomic_write_json(manifest_path, manifest)
     return manifest_path
+
+
+def test_reference_directory_is_optional_at_cli_parse_time(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "--merged-checkpoint",
+            str(tmp_path / "merged.pt"),
+            "--merged-manifest",
+            str(tmp_path / "merged.manifest.json"),
+            "--base-checkpoint",
+            str(tmp_path / "base.pt"),
+            "--training-checkpoint",
+            str(tmp_path / "checkpoint_model_003750"),
+            "--metadata",
+            str(tmp_path / "metadata.csv"),
+            "--work-dir",
+            str(tmp_path / "work"),
+        ]
+    )
+
+    assert args.reference_checkpoint_dir is None
+    assert args.sampling_steps == 50
+    assert args.guidance_scale == 5.0
+    assert args.seed == 1
+
+
+def test_fresh_comparison_preparation_uses_locked_stage1_contract(tmp_path):
+    source_manifest_path = _write_reference_preparation(tmp_path / "source")
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    calls = []
+
+    def fake_builder(**kwargs):
+        calls.append(kwargs)
+        output_root = Path(kwargs["output_root"])
+        output_root.mkdir(parents=True)
+        atomic_write_json(output_root / "prepared_manifest.json", source_manifest)
+        return source_manifest
+
+    manifest_path, manifest = prepare_fresh_comparison_inputs(
+        metadata_path=tmp_path / "metadata.csv",
+        output_root=tmp_path / "work" / "shared_prepared",
+        base_checkpoint=tmp_path / "base.pt",
+        architecture_root=tmp_path / "architecture",
+        t5_checkpoint=tmp_path / "t5.pt",
+        tokenizer_dir=tmp_path / "tokenizer",
+        vae_checkpoint=tmp_path / "vae.pt",
+        preparation_builder=fake_builder,
+    )
+
+    assert manifest_path.name == "prepared_manifest.json"
+    assert manifest == source_manifest
+    assert len(calls) == 1
+    assert calls[0]["num_latent_frames"] == 24
+    assert calls[0]["num_frame_per_block"] == 8
+    assert calls[0]["minimum_source_frames"] == 97
+    assert calls[0]["sampling_steps"] == 50
+    assert calls[0]["guidance_scale"] == 5.0
+    assert calls[0]["seed"] == 1
+
+
+def test_comparison_html_omits_missing_historical_reference(tmp_path):
+    sample = {
+        "row_id": 0,
+        "bucket_id": "landscape_480x832",
+        "sample_seed": 1,
+        "comparison_video": str(tmp_path / "side_by_side" / "row0.mp4"),
+    }
+
+    without_reference = comparison._comparison_html(
+        samples=[sample],
+        work_dir=tmp_path,
+    )
+    with_reference = comparison._comparison_html(
+        samples=[
+            {
+                **sample,
+                "reference_video": str(tmp_path / "old" / "rank0.mp4"),
+            }
+        ],
+        work_dir=tmp_path,
+    )
+
+    assert "原 infer_stage1 历史参考" not in without_reference
+    assert "reference_video" not in without_reference
+    assert "原 infer_stage1 历史参考" in with_reference
+
+
+def test_run_comparison_without_reference_builds_shared_inputs(
+    tmp_path,
+    monkeypatch,
+):
+    Image.new("RGB", (832, 480), color=(220, 220, 220)).save(
+        tmp_path / "landscape.png"
+    )
+    Image.new("RGB", (480, 832), color=(200, 200, 200)).save(
+        tmp_path / "portrait.png"
+    )
+    metadata = tmp_path / "metadata.csv"
+    with metadata.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["input_image", "prompt", "height", "width", "bucket"],
+        )
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "input_image": "landscape.png",
+                    "prompt": "landscape cat moves",
+                    "height": 480,
+                    "width": 832,
+                    "bucket": "landscape",
+                },
+                {
+                    "input_image": "portrait.png",
+                    "prompt": "portrait cat moves",
+                    "height": 832,
+                    "width": 480,
+                    "bucket": "portrait",
+                },
+            ]
+        )
+
+    merged = tmp_path / "merged.pt"
+    merged_manifest = tmp_path / "merged.manifest.json"
+    base = tmp_path / "base.pt"
+    for path in (merged, merged_manifest, base):
+        path.write_bytes(path.name.encode())
+    training = tmp_path / "checkpoint_model_003750"
+    training.mkdir()
+    (training / "adapter_ema.safetensors").write_bytes(b"adapter")
+    (training / "resolved_config.yaml").write_text(
+        "adapter:\n  type: lora\n  rank: 2\n",
+        encoding="utf-8",
+    )
+    architecture = tmp_path / "architecture"
+    tokenizer = tmp_path / "tokenizer"
+    architecture.mkdir()
+    tokenizer.mkdir()
+    t5 = tmp_path / "t5.pt"
+    vae = tmp_path / "vae.pt"
+    t5.write_bytes(b"t5")
+    vae.write_bytes(b"vae")
+    work_dir = tmp_path / "comparison"
+
+    args = build_parser().parse_args(
+        [
+            "--merged-checkpoint",
+            str(merged),
+            "--merged-manifest",
+            str(merged_manifest),
+            "--base-checkpoint",
+            str(base),
+            "--training-checkpoint",
+            str(training),
+            "--metadata",
+            str(metadata),
+            "--architecture-root",
+            str(architecture),
+            "--t5-checkpoint",
+            str(t5),
+            "--tokenizer-dir",
+            str(tokenizer),
+            "--vae-checkpoint",
+            str(vae),
+            "--work-dir",
+            str(work_dir),
+        ]
+    )
+
+    monkeypatch.setattr(
+        comparison,
+        "validate_checkpoint",
+        lambda *_args, **_kwargs: {"manifest_sha256": "b" * 64},
+    )
+    monkeypatch.setattr(
+        comparison,
+        "validate_merged_checkpoint_provenance",
+        lambda **_kwargs: {"path": str(merged), "sha256": "c" * 64},
+    )
+
+    def fake_carrier_writer(_image, output, *, frame_count, fps):
+        Path(output).write_bytes(f"frames={frame_count},fps={fps}".encode())
+
+    def fake_carrier_probe(path):
+        portrait = "portrait_832x480" in str(path)
+        return {
+            "width": 480 if portrait else 832,
+            "height": 832 if portrait else 480,
+            "frame_count": 97,
+            "fps": 24.0,
+        }
+
+    def preparation_builder(**kwargs):
+        return prepare_causal_testsets(
+            **kwargs,
+            carrier_writer=fake_carrier_writer,
+            carrier_probe=fake_carrier_probe,
+        )
+
+    def fake_parallel_runner(jobs, *, command_runner):
+        del command_runner
+        reports = []
+        for job in jobs:
+            config = OmegaConf.load(job.config_path)
+            model_type = "lora" if job.variant == "dynamic_lora" else "regular"
+            for index in job.sample_indices:
+                output = Path(config.output_folder) / f"rank0-{index}-0_{model_type}.mp4"
+                output.write_bytes(f"{job.variant}-{job.bucket_id}-{index}".encode())
+            reports.append(
+                {
+                    **comparison.asdict(job),
+                    "elapsed_seconds": 1.0,
+                    "status": "pass",
+                }
+            )
+        return reports
+
+    monkeypatch.setattr(
+        comparison,
+        "run_parallel_inference_jobs",
+        fake_parallel_runner,
+    )
+
+    def fake_output_validator(manifest_path, **_kwargs):
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        samples = []
+        for bucket in manifest["buckets"]:
+            model_type = bucket["output_model_type"]
+            for record in bucket["records"]:
+                output = Path(bucket["output_dir"]) / (
+                    f"rank0-{record['bucket_index']}-0_{model_type}.mp4"
+                )
+                assert output.is_file()
+                samples.append(
+                    {"row_id": record["row_id"], "output_video": str(output)}
+                )
+        return {"status": "pass", "samples": samples}
+
+    def fake_pair_writer(left, right, output, *, command_runner):
+        del left, right, command_runner
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_bytes(b"paired")
+        return {"width": 1664, "height": 480, "frame_count": 93, "fps": 24.0}
+
+    report = comparison.run_comparison(
+        args,
+        output_validator=fake_output_validator,
+        pair_writer=fake_pair_writer,
+        preparation_builder=preparation_builder,
+    )
+
+    assert report["status"] == "pass"
+    assert report["reference_checkpoint_dir"] is None
+    assert report["input_preparation"]["mode"] == "fresh"
+    assert report["input_preparation"]["reference_checkpoint_dir"] is None
+    assert Path(report["input_preparation"]["prepared_manifest"]).is_file()
+    assert report["sample_count"] == 2
+    assert all("reference_video" not in sample for sample in report["samples"])
+    html_text = Path(report["comparison_html"]).read_text(encoding="utf-8")
+    assert "原 infer_stage1 历史参考" not in html_text
 
 
 def test_clone_reference_preparation_changes_only_runtime_destinations(tmp_path):
