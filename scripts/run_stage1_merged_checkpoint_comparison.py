@@ -805,7 +805,8 @@ def write_side_by_side_video(
             (
                 f"[0:v]setpts=N/({fps}*TB),setsar=1[left];"
                 f"[1:v]setpts=N/({fps}*TB),setsar=1[right];"
-                f"[left][right]hstack=inputs=2:shortest=1,fps={fps}[paired]"
+                f"[left][right]hstack=inputs=2:shortest=0,"
+                f"fps=fps={fps}:start_time=0:eof_action=pass[paired]"
             ),
             "-map",
             "[paired]",
