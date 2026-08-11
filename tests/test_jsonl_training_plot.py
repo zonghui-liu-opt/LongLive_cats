@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from scripts.plot_stage1_training import plot_training_metrics
@@ -48,7 +46,9 @@ def test_locked_logical_workload_does_not_multiply_sp():
 
 def test_resume_lineage_overrides_parent_stale_suffix_and_attempts_monotonic(tmp_path):
     path = tmp_path / "metrics.jsonl"
-    with JsonlLogger(path, experiment_id="exp", run_id="parent", fsync_every_steps=1) as parent:
+    with JsonlLogger(
+        path, experiment_id="exp", run_id="parent", fsync_every_steps=1
+    ) as parent:
         assert parent.append_attempt("train_step", _fields(1, 1.0)) == 0
         assert parent.append_attempt("train_step", _fields(2, 2.0)) == 1
         # This suffix is stale after the checkpoint used for resume.
@@ -63,7 +63,12 @@ def test_resume_lineage_overrides_parent_stale_suffix_and_attempts_monotonic(tmp
         fsync_every_steps=1,
     ) as child:
         assert child.append_attempt("train_step", _fields(3, 3.0)) == 3
-        assert child.append_attempt("nonfinite_attempt", {"optimizer_step": 4, "duration": 0.5}) == 4
+        assert (
+            child.append_attempt(
+                "nonfinite_attempt", {"optimizer_step": 4, "duration": 0.5}
+            )
+            == 4
+        )
         assert child.append_attempt("train_step", _fields(4, 4.0)) == 5
 
     records = read_jsonl_tolerant(path)
@@ -79,6 +84,62 @@ def test_truncated_tail_is_ignored_but_middle_corruption_is_not(tmp_path):
     path.write_text('{"record_type":"run_start","run_id":"a"}\nnot-json\n{}\n')
     with pytest.raises(ValueError, match="only a truncated final line"):
         read_jsonl_tolerant(path)
+
+
+def test_resume_repairs_one_truncated_tail_before_appending_new_run(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    with JsonlLogger(
+        path, experiment_id="exp", run_id="parent", fsync_every_steps=1
+    ) as parent:
+        parent.append_attempt("train_step", _fields(1, 1.0))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"partial"')
+
+    with JsonlLogger(
+        path,
+        experiment_id="exp",
+        run_id="child",
+        parent_run_id="parent",
+        resume_from_step=1,
+        checkpoint_next_attempt_index=1,
+        fsync_every_steps=1,
+    ) as child:
+        child.append_attempt("train_step", _fields(2, 0.5))
+
+    records = read_jsonl_tolerant(path)
+    assert [record["record_type"] for record in records] == [
+        "run_start",
+        "train_step",
+        "run_start",
+        "train_step",
+    ]
+    assert records_for_latest_lineage(records)[-1]["loss_total"] == 0.5
+
+
+def test_resume_repairs_tail_truncated_inside_utf8_character(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    with JsonlLogger(
+        path, experiment_id="exp", run_id="parent", fsync_every_steps=1
+    ) as parent:
+        parent.append_attempt("train_step", _fields(1, 1.0))
+    with path.open("ab") as handle:
+        handle.write(b'{"reason":"' + "失败".encode("utf-8")[:-1])
+
+    # Reading and reopening must both tolerate the sole partial UTF-8 tail.
+    assert len(read_jsonl_tolerant(path)) == 2
+    with JsonlLogger(
+        path,
+        experiment_id="exp",
+        run_id="child",
+        parent_run_id="parent",
+        resume_from_step=1,
+        checkpoint_next_attempt_index=1,
+        fsync_every_steps=1,
+    ) as child:
+        child.append_attempt("train_step", _fields(2, 0.25))
+
+    records = read_jsonl_tolerant(path)
+    assert records_for_latest_lineage(records)[-1]["loss_total"] == 0.25
 
 
 def test_plotter_writes_all_png_and_svg_outputs(tmp_path):

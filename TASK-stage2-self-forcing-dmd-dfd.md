@@ -93,7 +93,7 @@
 保留LongLive‑2.0现有Wan/UniPC/attention底座，但不要继续在legacy `trainer/distillation.py`、`model/dmd.py` 和 `pipeline/self_forcing_training.py` 中堆叠大量I2V特殊分支。优先新增隔离的Stage‑2入口：
 
 ```text
-configs/train_i2v_stage2.yaml
+configs/train_i2v_stage2_600cats.yaml
 trainer/stage2_distillation.py
 model/stage2_dmd.py
 pipeline/stage2_rollout.py
@@ -592,7 +592,7 @@ C4,K2: 1 + 6*(2+1) = 19
 ### Step 1：建立修改前基线与规格测试骨架
 
 - [x] **结果**：明确当前DMD/Stage‑1相关测试基线、工作区保护范围和所有新配置字段。
-- **主要区域**：新增 `configs/train_i2v_stage2.yaml`、`utils/stage2_config.py` 与Stage‑2 test骨架；只读对照现有DMD/pipeline/wrapper。
+- **主要区域**：新增 `configs/train_i2v_stage2_600cats.yaml`、`utils/stage2_config.py` 与Stage‑2 test骨架；只读对照现有DMD/pipeline/wrapper。
 - **验证**：运行相关现有测试；新增只描述baseline config/计数/公式的失败测试，不改production。
 - **完成证据**：本地Stage‑2配置正反契约103项与相关Stage‑1/DMD回归64项通过；内网Stage‑2为103 passed，相关回归显式排除仅锁定公开Stage‑1 YAML的`test_release_stage1_config_has_one_locked_source_of_truth`后为63 passed，配置契约全部通过。Black、Ruff、py_compile、CLI与whitespace检查通过。path-independent contract hash为`aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`。
 - **暂停边界**：本步未接`train.py`/registry，未加载CUDA、模型、权重或600-cache；UniPC测试仅characterize仓库scheduler。内网确认raw配置解析、contract hash和本测试集后，才可开始Step 2。
@@ -646,21 +646,25 @@ C4,K2: 1 + 6*(2+1) = 19
 
 ### Step 9：严格5F→1G trainer、phase、EMA与nonfinite
 
-- [ ] **结果**：双optimizer状态机、A24/B4、DFD branch、global64 accumulation、G40 EMA、成功时钟。
+- [x] **结果**：双optimizer状态机、A24/B4、DFD branch、global64 accumulation、G40 EMA、成功时钟。
 - **主要区域**：`trainer/stage2_distillation.py`、Stage‑2 config/schedule/sampler helpers。
 - **验证**：调用顺序、参数变化归属、240/40/1200/200计数、B1精确10点概率序列与resume、B=0、matched control、nonfinite恢复batch/全部RNG且不推进；micro2×acc4、micro1×acc8、sync/no-sync与reference global-batch梯度一致。
+- **完成证据**：唯一状态机为`F1→F2→F3→F4→F5→G→EMA→commit`；C0/C1/C2分别锁定cold+save、resume+DMD+save、resume+DFD+discard；合法raw denominator 0、micro1/micro2吞吐计数、formal拒绝smoke lineage均有正反测试。
 
 ### Step 10：原子checkpoint与精确resume
 
-- [ ] **结果**：完整LoRA/optimizer/EMA/counter/sampler/RNG/hash状态；cycle-boundary原子保存。
+- [x] **结果**：完整LoRA/optimizer/EMA/counter/sampler/RNG/hash状态；cycle-boundary原子保存。
 - **主要区域**：新增Stage‑2 checkpoint helper、trainer integration与tests。
 - **验证**：save/restart下一batch/exit/DFD/t/noise一致；stale/partial/hash/topology/role错误全部失败；异常返回非0。
+- **完成证据**：world8一维FULL_SHARD只聚合G/F LoRA与optimizer state；隐藏临时目录写完全部rank状态和hash后原子rename，最后写`_SUCCESS`；恢复严格验证完整cycle、角色/schema/step/EMA/RNG/topology并按规定顺序安装。
 
 ### Step 11：Stage‑2 JSONL与训练可视化
 
-- [ ] **结果**：F/G/cycle独立记录；Generator/Fake loss、角色/周期吞吐、时间/显存/phase图和HTML。
+- [x] **结果**：F/G/cycle独立记录；Generator/Fake loss、角色/周期吞吐、时间/显存/phase图和HTML。
 - **主要区域**：复用/兼容扩展 `utils/jsonl_logger.py`；新增Stage‑2 metrics helper、`scripts/plot_stage2_training.py`、tests。
 - **验证**：synthetic lineage/nonfinite/resume fixture；全部PNG/SVG/HTML存在且字段/横轴/phase marker正确；Stage‑1 plot tests不变。
+- **检查点B最终本地证据**：最终磁盘态正式`tests/`范围为735 passed、2 subtests passed；14条warning均为既有`torch.jit.script_method`弃用提示。Stage‑2相关Python文件Black/Ruff、py_compile、两个CLI help、contract hash与`git diff --check`通过；两轮只读终审未发现剩余代码P0/P1。
+- **检查点B边界**：未运行或伪造8×H100/NCCL/FSDP2 smoke；未开始Step 12–14、batch推理或正式训练；本节点中文H100指导、commit和push必须等用户检查通过后再做。
 
 ### Step 12：baseline推理、testsets与技术trace
 
@@ -697,16 +701,16 @@ C4,K2: 1 + 6*(2+1) = 19
 
 ### 16.1 本地代码验收
 
-- [ ] 24个新latent从G0到G23全部存在且可反传；score pack严格25帧。
-- [ ] bidirectional score收到9750-token mixed timestep，不会整段t0。
-- [ ] W16/S1真实容量17；chunk2/3为sink1+history8+current8。
-- [ ] noisy KV不提交，clean唯一commit且persistent K/V无autograd；无跨chunkBPTT。
-- [ ] UniPC训练/部署一致，random exit每update分层覆盖。
-- [ ] DMD/DFD/fake-flow公式、CFG、noise/t共享与mask全部有解析测试。
-- [ ] G/F role LoRA计数、梯度、optimizer与checkpoint严格隔离。
-- [ ] 状态机恰为5F→1G；A/B、EMA与checkpoint只由成功G时钟推进。
-- [ ] resume恢复下一数据、exit、DFD branch、score t/noise和参数状态。
-- [ ] Stage‑2 JSONL/plot覆盖loss、吞吐、时间、显存、phase；Stage‑1 logger/plot回归不变。
+- [x] 24个新latent从G0到G23全部存在且可反传；score pack严格25帧。
+- [x] bidirectional score收到9750-token mixed timestep，不会整段t0。
+- [x] W16/S1真实容量17；chunk2/3为sink1+history8+current8。
+- [x] noisy KV不提交，clean唯一commit且persistent K/V无autograd；无跨chunkBPTT。
+- [x] UniPC训练/部署一致，random exit每update分层覆盖。
+- [x] DMD/DFD/fake-flow公式、CFG、noise/t共享与mask全部有解析测试。
+- [x] G/F role LoRA计数、梯度、optimizer与checkpoint严格隔离。
+- [x] 状态机恰为5F→1G；A/B、EMA与checkpoint只由成功G时钟推进。
+- [x] resume恢复下一数据、exit、DFD branch、score t/noise和参数状态。
+- [x] Stage‑2 JSONL/plot覆盖loss、吞吐、时间、显存、phase；Stage‑1 logger/plot回归不变。
 - [ ] baseline inference输出96/192帧并正确reset；旧Stage‑1推理不回归。
 
 ### 16.2 H100验收

@@ -235,7 +235,7 @@ Manifest SHA256: <64位sha256>
 
 ```bash
 export NEGATIVE_MANIFEST="$NEGATIVE_DIR/negative_conditioning_manifest.json"
-export STAGE2_CONFIG="$PWD/configs/train_i2v_stage2.yaml"
+export STAGE2_CONFIG="$PWD/configs/train_i2v_stage2_600cats.yaml"
 
 export LONG_LIVE_STAGE2_ARCHITECTURE_ROOT="$ARCH_ROOT"
 export LONG_LIVE_STAGE2_GENERATOR_BASE="$G_MERGED"

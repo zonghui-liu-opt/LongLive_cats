@@ -1,5 +1,36 @@
 # 进度日志
 
+## 会话：2026-08-11
+
+### Phase 10：Stage‑1 LoRA/merged 四卡批量推理对比
+- **状态：** complete（reference可选扩展完成；等待内网4×H100）
+- 新增需求：此前推理结果目录已删除；未提供`reference_dir`时必须直接从原6-case metadata fresh prepare共享carrier/config，不能要求重新跑旧格式推理。
+- 兼容边界：显式提供reference时继续校验step、metadata、prepared manifest与历史输出；缺省时只生成merged-vs-LoRA主对比，HTML/report不得引用不存在的历史视频。
+- runner CLI与shell现默认不传reference；fresh模式要求architecture/T5/tokenizer/VAE资产并复用`prepare_causal_testsets()`生成`shared_prepared/prepared_manifest.json`。设置`LONG_LIVE_STAGE1_REFERENCE_DIR`时自动恢复原reference模式。
+- 无reference端到端CPU fixture真实完成两种geometry metadata解析、carrier/config preparation、四任务构建、两路输出映射、pair/report/HTML；确认report为fresh/null reference且所有sample无`reference_video`。
+- 最终目标回归39 passed；Ruff、py_compile、`bash -n`、CLI help与diff whitespace全部通过。本轮未执行Git提交或push。
+- 用户要求新增推理时动态加载 LoRA 的 batch inference，并在单机4×H100上尽可能并行加速。
+- 已确认上一轮 runner 只重新推理预 merged checkpoint，左侧直接复用既有 infer_stage1 结果；原 infer_stage1 runner 本身也是先 merge EMA adapter 后推理，因此尚未形成动态 LoRA 对照。
+- 已为 `inference.py` 接入Stage‑1 safetensors严格LoRA加载、显式样本索引sampler和逐row独立noise seed；legacy `.pt` adapter仍保留兼容。
+- 正式调度不使用会漏样本的4-rank DistributedSampler，而是并发4个单卡进程：GPU0/1分别处理pre-merged横/竖屏3条，GPU2/3分别处理dynamic-LoRA横/竖屏3条。每卡只加载一个模型实例，4卡等负载且总模型加载4次。
+- 两路均克隆同一reference prepared输入与sampling配置，并用`base_seed + CSV row_id`生成完全相同的noise seed映射；旧infer_stage1视频因使用旧顺序RNG只作为HTML历史参考。
+- runner会校验merged companion manifest，证明完整权重来自同一个converted base、step3750 checkpoint和`adapter_ema.safetensors`，随后严格校验两路6个输出并生成merged-left/LoRA-right视频、HTML、JSON报告和每GPU日志。
+- 性能设置只对克隆的comparison config启用：每进程1个prefetch worker、pinned memory、异步H2D、TF32/cuDNN benchmark、allocator扩展段和CPU线程限流；不改变其他config的DataLoader默认值。
+- 本地目标回归35 passed；Ruff、py_compile、shell syntax、CLI help、diff whitespace通过；真实ffmpeg 832×480×3帧拼接得到1664×480×3帧。当前机器无H100，因此不声称正式吞吐或视频质量通过。
+- 保护边界：Phase 9检查点B既有脏工作树不覆盖、不暂存；本地无4×H100，不声称正式性能或视频质量通过。
+
+### Phase 9 检查点B：训练闭环代码实现
+- **状态：** waiting_for_user_review
+- 用户明确要求继续精准完成Stage-2训练代码，并在完成log、权重/checkpoint保存和可视化后停止交其检查；本轮不做batch推理、不运行正式H100训练、不编写/上传smoke指南。
+- 已完整重读`planning-with-files-zh`、三份规划文件与739行Stage-2任务文档，锁定Steps 9–11：严格`F1..F5→G→EMA`、cycle-boundary checkpoint、成功G时钟驱动Phase/DFD/EMA、同batch/RNG nonfinite retry、F/G/cycle独立JSONL时钟与PNG/SVG/HTML。
+- 用户本次继续指令构成代码实施授权；会话未提供新的H100检查点A真实输出，因此本地实现不会声称8×H100/NCCL/真实600-cache已经通过。
+- 已完成严格`F1..F5→G→EMA→commit`训练状态机、A24/B4/DFD概率、global64 accumulation、G40 EMA、同batch/RNG nonfinite精确重试与角色梯度/optimizer隔离。
+- 已完成world8一维FULL_SHARD专用checkpoint：G/F raw LoRA、G EMA、两个AdamW、sampler/DataLoader/每rank及控制RNG、配置/数据/资产/topology，隐藏临时目录闭链后rename并最后写`_SUCCESS`；C1恢复和formal/smoke lineage均fail-closed。
+- 已完成权威Stage‑2 JSONL、F/G/cycle/nonfinite/checkpoint记录，9组PNG/SVG与静态HTML；完整run要求latest lineage自己的`run_end.status=complete`及严格终点/5F→1G结构。
+- H100 smoke入口收敛为`--stage2-smoke C0|C1|C2`：C0 cold+save，C1 resume+DMD+save，C2 resume+DFD+discard；formal明确拒绝续接smoke checkpoint。新增`nvidia-ml-py`正式依赖，并在`train.py`最早阶段禁止写bytecode，避免训练入口自行污染clean checkout。
+- 最终本地磁盘态：正式`tests/`为735 passed、2 subtests passed；14条warning均为既有TorchScript弃用提示。Black、Ruff、py_compile、train/plot CLI help、固定contract hash与`git diff --check`通过；独立终审为P0=0、P1=0。
+- 当前边界：未运行8×H100/NCCL/FSDP2 smoke，不声称显存/NVML/吞吐通过；未实现Step 12以后batch推理。本轮按约定停止给用户检查，不写本节点H100指导、不提交、不push。
+
 ## 会话：2026-08-10
 
 ### Phase 9 检查点A：用户检查通过，等待内网8×H100准备门禁
@@ -42,7 +73,7 @@
   - 已定稿8个实现批次；本轮只实现Batch 1/Step 1，推送后暂停。
   - 已从 `stage-1@4c0bb6a` 创建`stage-2`，发布目标严格为用户远程`longlive-cats/stage-2`；未触碰上游`origin`。
   - 修改前相关回归基线为64 passed（14+50）；UniPC K4/shift5 timetable与negative prompt hash均和规格一致。
-  - 新增 `configs/train_i2v_stage2.yaml`：仅保存baseline原始参数与后续资产槽位，不复制派生计数或UniPC timetable。
+  - 新增 `configs/train_i2v_stage2_600cats.yaml`：仅保存baseline原始参数与后续资产槽位，不复制派生计数或UniPC timetable。
   - 新增 `utils/stage2_config.py`：纯静态严格resolver、canonical hash、派生公式和只读CLI；未接registry，未导入torch/model/CUDA。
   - 静态CLI、py_compile与pure-import首次自检通过。
   - 新增 `tests/test_stage2_config.py`，覆盖release派生值、A/B计数、EMA时钟、LoRA契约、真实UniPC timetable、hash/幂等，以及unknown/legacy/missing/非法数值与拓扑反例。
@@ -270,6 +301,9 @@
 | Phase 7 continuation 目标测试 | 9 个 continuation/characterization/runner/HTML 测试模块 | session、sink、noise、trace、orchestration、DOM 全通过 | 111 passed | PASS |
 | Phase 7 全仓正式范围回归 | `PYTHONPATH=$PWD /Users/zonghuiliu/anaconda3/bin/python -m pytest -q tests` | 所有项目 tests 通过 | 270 passed、2 subtests passed、14 warnings | PASS |
 | Phase 7 最终静态验收 | shell syntax、runner help、py_compile、Ruff、tracked/untracked whitespace、旧 shell diff | 全部成功且旧入口不变 | PASS | PASS |
+| Phase 10 LoRA/merged目标测试 | LoRA strict load、4卡分片/provenance、输出映射与validator | 全部通过 | 35 passed | PASS |
+| Phase 10静态与真实拼接smoke | Ruff、py_compile、bash syntax、CLI help、diff check、真实ffmpeg | 全部通过 | 1664×480、3帧、24fps | PASS |
+| Phase 10 optional-reference扩展 | fresh端到端、reference HTML兼容、CLI/shell/static及相关回归 | 全部通过 | 39 passed | PASS |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -286,6 +320,7 @@
 | 2026-08-04 | 最终审计暴露 manifest 写前路径与 inference/session 并发边界 | 1 | 先写失败测试，再实现写前路径门禁与全调用周期 RLock；独立复核无残留 P0/P1 |
 | 2026-08-04 | Anaconda Python 无 `black` 模块 | 1 | 改用现有系统 Black 可执行文件并以 Ruff/py_compile 复核 |
 | 2026-08-07 | 文档静态检查首次循环变量误用zsh特殊 `path`，导致当前shell的PATH被覆盖而找不到git | 1 | 改用任务专用 `file_item` 后在新shell重跑，全部静态检查通过 |
+| 2026-08-11 | 对混有历史未格式化代码的既有文件运行Black check，报告5个文件需要全文件重排 | 1 | 不扩大或覆盖用户既有diff；改用Ruff、py_compile和目标测试验证本任务改动，未执行批量Black写入 |
 
 ## 五问重启检查
 | 问题 | 答案 |
@@ -298,3 +333,14 @@
 
 ---
 *每个阶段完成后或遇到错误时更新此文件。*
+
+## 2026-08-11 Phase 11：新增 Stage-1 资产后的 Stage-2 只读复审
+
+- **状态：** complete
+- 已确认正式配置迁移为 `configs/train_i2v_stage2_600cats.yaml`，原 `configs/train_i2v_stage2.yaml` 删除；`configs/tmp.yaml`、`prepare_stage1.sh` 与本地 checkpoint/result 资产不纳入 Stage-2 发布提交。
+- 本轮仅审查，不修改生产代码、配置、manifest 或模型权重；此前735项通过只作历史证据，必须以当前磁盘态重新验证。
+- 双向角色实现复核通过：real/fake 从同一已审计teacher分别构造独立 `WanModel`，real冻结，fake加载完整base后挂fresh r64；52项role测试通过。
+- 当前两份新YAML完全相同且均不可解析：world4与锁定world8冲突，并缺必填`data.source_cache_manifest`；canonical YAML缺失导致当前全tests为617 passed / 124 failed，124项均由FileNotFoundError引起。
+- trainer/checkpoint/JSONL/九图HTML与共享LoRA联合回归98 passed；隔离配置问题后的独立审计未发现这些模块新增P0/P1，Ruff/Black/py_compile通过。
+- 提供的DiffSynth merge manifest是来源证明，不是`longlive_stage2_teacher_manifest`；当前配置错误指向Stage-1 causal conversion产物。应直接使用原生双向merged safetensors并由现有CLI生成正式teacher sidecar。
+- 测试操作中的两次非产品错误：首次把shell glob加引号导致pytest找不到文件；一次诊断脚本误读resolved字段名，均已用正确命令/字段复跑，不影响上述结果。

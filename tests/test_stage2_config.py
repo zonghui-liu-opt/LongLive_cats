@@ -23,7 +23,7 @@ from utils.stage2_config import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PROJECT_ROOT / "configs" / "train_i2v_stage2.yaml"
+CONFIG_PATH = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats.yaml"
 
 
 def _config() -> dict:
@@ -140,6 +140,9 @@ def test_release_stage2_config_resolves_locked_baseline_contract():
     assert resolved.expected_samples_per_action == 200
     assert resolved.metadata_path.endswith("metadata_600clips_480x832_buckets.csv")
     assert resolved.cache_dir.endswith("stage2_i2v_600_bf16")
+    assert resolved.source_cache_manifest.endswith(
+        "stage2_f25_cache_manifest.attested.json"
+    )
     assert resolved.action_label_source_policy == "manifest_first_sidecar_fallback"
     assert resolved.action_labels_path is None
     assert resolved.negative_conditioning_manifest.endswith(
@@ -430,12 +433,16 @@ def test_manifest_first_action_labels_accept_null_and_explicit_sidecar():
 def test_release_data_paths_support_h100_environment_overrides(monkeypatch):
     monkeypatch.delenv("LONG_LIVE_STAGE2_METADATA_PATH", raising=False)
     monkeypatch.delenv("LONG_LIVE_STAGE2_ACTION_LABELS_PATH", raising=False)
+    monkeypatch.delenv("LONG_LIVE_STAGE2_SOURCE_MANIFEST", raising=False)
     baseline = load_stage2_config(CONFIG_PATH)
 
     assert baseline.metadata_path == (
         "training_sets/metadata_600clips_480x832_buckets.csv"
     )
     assert baseline.action_labels_path is None
+    assert baseline.source_cache_manifest == (
+        "/path/to/stage2_f25_cache_manifest.attested.json"
+    )
     assert (
         baseline.contract_hash()
         == "aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00"
@@ -445,10 +452,17 @@ def test_release_data_paths_support_h100_environment_overrides(monkeypatch):
     monkeypatch.setenv(
         "LONG_LIVE_STAGE2_ACTION_LABELS_PATH", "/mnt/stage2/action_labels.csv"
     )
+    monkeypatch.setenv(
+        "LONG_LIVE_STAGE2_SOURCE_MANIFEST",
+        "/mnt/stage2/stage2_f25_cache_manifest.attested.json",
+    )
     overridden = load_stage2_config(CONFIG_PATH)
 
     assert overridden.metadata_path == "/mnt/stage2/metadata_600.csv"
     assert overridden.action_labels_path == "/mnt/stage2/action_labels.csv"
+    assert overridden.source_cache_manifest == (
+        "/mnt/stage2/stage2_f25_cache_manifest.attested.json"
+    )
     assert overridden.contract_hash() == baseline.contract_hash()
     assert overridden.launch_hash() != baseline.launch_hash()
 

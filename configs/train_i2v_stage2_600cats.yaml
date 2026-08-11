@@ -32,7 +32,7 @@ infra:
 
 model_kwargs:
   model_name: Wan2.2-TI2V-5B
-  architecture_root: ${oc.env:LONG_LIVE_STAGE2_ARCHITECTURE_ROOT,/path/to/Wan2.2-TI2V-5B}
+  architecture_root: /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B
   init_weights: false
 
 model_contract:
@@ -42,10 +42,10 @@ model_contract:
 checkpoints:
   init_from_stage1:
     generator_stage1_step: 3750
-    generator_checkpoint: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_BASE,/path/to/stage1_step3750_ema_merged.pt}
-    generator_manifest: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_MANIFEST,/path/to/stage1_step3750_ema_merge_manifest.json}
-    real_score_checkpoint: ${oc.env:LONG_LIVE_STAGE2_REAL_SCORE_BASE,/path/to/cat_ti2v_teacher.pt}
-    real_score_manifest: ${oc.env:LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST,/path/to/cat_ti2v_teacher_manifest.json}
+    generator_checkpoint: /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3750_ema_merged.pt
+    generator_manifest: /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3750_ema_merged.manifest.json
+    real_score_checkpoint: /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts
+    real_score_manifest: /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/real_score_teacher.manifest.json
   resume_stage2: null
 
 roles:
@@ -139,6 +139,8 @@ adapter:
 data:
   backend: stage2_i2v_cache
   metadata_path: ${oc.env:LONG_LIVE_STAGE2_METADATA_PATH,training_sets/metadata_600clips_480x832_buckets.csv}
+  # Immutable native F25 source manifest after positive-text attestation.
+  source_cache_manifest: ${oc.env:LONG_LIVE_STAGE2_SOURCE_MANIFEST,/path/to/stage2_f25_cache_manifest.attested.json}
   action_label_source_policy: manifest_first_sidecar_fallback
   # Optional. Step 3 first checks a reliable action field in the cache manifest;
   # set this environment variable to an operator-confirmed sidecar only when

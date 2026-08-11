@@ -8,7 +8,7 @@ trainer.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -617,6 +617,7 @@ class Stage2DMD(nn.Module):
         noised_score: Stage2NoisedScoreInput | Stage2NoisedScorePair,
         conditional_dict: Mapping[str, torch.Tensor],
         real_unconditional_dict: Mapping[str, torch.Tensor],
+        timing_callback: Callable[[str, Callable[[], object]], object] | None = None,
     ) -> Stage2GeneratorLossOutput:
         """Evaluate frozen score roles and reduce one DMD/DFD G loss.
 
@@ -660,21 +661,37 @@ class Stage2DMD(nn.Module):
 
         # These teachers are inference-only for a Generator update.  no_grad
         # also prevents an expensive x_hat->score input Jacobian from forming.
+        def measured(label: str, callback: Callable[[], object]) -> object:
+            return (
+                callback()
+                if timing_callback is None
+                else timing_callback(label, callback)
+            )
+
         with torch.no_grad():
-            fake_raw_flow, _ = self.fake_score.forward_score(
-                noisy_image_or_video=noisy_fake_score,
-                conditional_dict=conditional_dict,
-                frame_timestep=frame_timestep,
+            fake_raw_flow, _ = measured(
+                "fake_score",
+                lambda: self.fake_score.forward_score(
+                    noisy_image_or_video=noisy_fake_score,
+                    conditional_dict=conditional_dict,
+                    frame_timestep=frame_timestep,
+                ),
             )
-            real_cond_raw_flow, _ = self.real_score.forward_score(
-                noisy_image_or_video=real_teacher_input,
-                conditional_dict=conditional_dict,
-                frame_timestep=frame_timestep,
+            real_cond_raw_flow, _ = measured(
+                "real_cond",
+                lambda: self.real_score.forward_score(
+                    noisy_image_or_video=real_teacher_input,
+                    conditional_dict=conditional_dict,
+                    frame_timestep=frame_timestep,
+                ),
             )
-            real_uncond_raw_flow, _ = self.real_score.forward_score(
-                noisy_image_or_video=real_teacher_input,
-                conditional_dict=real_unconditional_dict,
-                frame_timestep=frame_timestep,
+            real_uncond_raw_flow, _ = measured(
+                "real_uncond",
+                lambda: self.real_score.forward_score(
+                    noisy_image_or_video=real_teacher_input,
+                    conditional_dict=real_unconditional_dict,
+                    frame_timestep=frame_timestep,
+                ),
             )
 
         return compute_stage2_generator_distribution_matching_loss(
@@ -711,6 +728,7 @@ class Stage2DMD(nn.Module):
         generated_future: torch.Tensor,
         noised_fake_score: Stage2NoisedScoreInput,
         conditional_dict: Mapping[str, torch.Tensor],
+        timing_callback: Callable[[str, Callable[[], object]], object] | None = None,
     ) -> Stage2FakeScoreLossOutput:
         """Evaluate only fake-score and reduce its direct raw-flow DSM loss."""
 
@@ -724,10 +742,18 @@ class Stage2DMD(nn.Module):
             "noisy_fake_score",
             generated_future,
         )
-        fake_raw_flow, _ = self.fake_score.forward_score(
-            noisy_image_or_video=noisy_fake_score,
-            conditional_dict=conditional_dict,
-            frame_timestep=noising.frame_timestep,
+
+        def callback():
+            return self.fake_score.forward_score(
+                noisy_image_or_video=noisy_fake_score,
+                conditional_dict=conditional_dict,
+                frame_timestep=noising.frame_timestep,
+            )
+
+        fake_raw_flow, _ = (
+            callback()
+            if timing_callback is None
+            else timing_callback("fake_score", callback)
         )
         return compute_stage2_fake_score_flow_dsm_loss(
             generated_future=generated_future,

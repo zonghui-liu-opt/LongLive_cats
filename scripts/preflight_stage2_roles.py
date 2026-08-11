@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/train_i2v_stage2.yaml",
+        default="configs/train_i2v_stage2_600cats.yaml",
         help="Raw Stage-2 YAML. It is resolved before any legacy normalize_config call.",
     )
     parser.add_argument(

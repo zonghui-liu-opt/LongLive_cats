@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`，按用户指定的三个检查节点交付：训练前准备、训练/日志/权重/可视化、batch推理与其余验收；保持 Stage‑1 与 legacy DMD 行为不回归。
 
 ## 当前阶段
-Phase 9 检查点A：用户检查已通过，中文H100指南与发布前终审已完成；等待内网8×H100准备门禁结果，尚未进入trainer
+Phase 10 的reference可选/fresh-preparation扩展已完成本地实现与39项目标验证，等待用户内网4×H100执行；Phase 9检查点B仍保持等待用户检查。
 
 ## 各阶段
 
@@ -84,10 +84,29 @@ Phase 9 检查点A：用户检查已通过，中文H100指南与发布前终审�
 - [x] 9.7 实现并解析验证 DMD、DFD、fake raw-flow 与 continuous-sigma loss（原 Step 8）
 - [x] 9.8 重跑训练前准备全量本地测试和相关回归，完成两轮独立终审，并在第一个用户检查点停止
 - [x] 9.9 用户检查通过后，写简洁中文 H100 指南并上传 `stage-2`；等待内网准备门禁结果
-- [ ] 9.10 内网准备通过后，实现严格5F→1G trainer、EMA/nonfinite、原子checkpoint、JSONL/plot（原 Steps 9–11），在第二个用户检查点停止
+- [x] 9.10 实现严格5F→1G trainer、EMA/nonfinite、原子checkpoint、JSONL/plot（原 Steps 9–11），完成735项全仓本地回归并在第二个用户检查点停止
 - [ ] 9.11 用户检查通过后，写本节点指南并上传 `stage-2`；等待内网 H100 smoke 结果
 - [ ] 9.12 smoke通过后，实现baseline batch推理、压缩/sink通用接口和其余本地验收（原 Steps 12–14），按要求完成最终内网任务
-- **Status:** waiting_for_h100_checkpoint_a（检查点A；Phase 9整体仍未完成）
+- **Status:** in_progress（检查点B等待用户检查；Phase 9整体仍未完成）
+
+### Phase 10：Stage‑1 LoRA/merged 四卡批量推理对比
+- [x] 10.1 审计 Stage‑1 `adapter_ema.safetensors` 加载格式、现有 inference 分布式采样和6-case双分辨率约束
+- [x] 10.2 设计并实现不会漏样本的4×H100数据并行调度，同时保持两种格式相同输入/seed/采样参数
+- [x] 10.3 新增动态 LoRA batch inference，并输出 reference/merged/LoRA 映射与并排视频/HTML/report
+- [x] 10.4 补齐正反测试、静态检查和 ffmpeg 调度/拼接验证
+- [x] 10.5 审查最终改动范围并交付内网运行命令；不伪造正式H100推理结果
+- [x] 10.6 将reference目录改为可选，缺省时从metadata和模型资产fresh prepare
+- [x] 10.7 保持提供reference时的旧校验/历史视频兼容，并让无reference报告/HTML无悬空字段
+- [x] 10.8 补齐fresh/reference双路径测试、shell/CLI/静态检查并交付新命令
+- **Status:** complete（39 tests；正式4×H100性能/视频质量待用户内网执行）
+
+### Phase 11：新增 Stage‑1 资产后的 Stage‑2 只读复审
+- [x] 11.1 盘点新增 merged/runtime-LoRA 对比代码、配置文件与双向模型资产
+- [x] 11.2 复核 real-score / fake-score 是否从同一双向 merged 权重独立初始化，并审计 manifest/provenance 门禁
+- [x] 11.3 复核 Stage‑2 trainer、JSONL、checkpoint/resume 与 PNG/SVG/HTML 可视化是否受共享代码改动影响
+- [x] 11.4 运行当前磁盘态的针对性与全量 CPU 回归、CLI/静态检查
+- [x] 11.5 输出按 P0/P1 排序的结论和必须修改项；本轮不改生产代码或权重
+- **Status:** complete（只读结论：核心训练闭环无新增P0/P1；正式YAML与teacher sidecar存在阻断项）
 
 #### 用户指定的停止点（覆盖旧的逐Batch暂停）
 1. **检查点 A——训练前准备**：原 Steps 1–8、本地验证、用户检查、中文指南与分支发布均已完成；当前等待内网8×H100门禁，不写完整trainer、不训练。
@@ -129,6 +148,7 @@ Phase 9 检查点A：用户检查已通过，中文H100指南与发布前终审�
 | teacher checkpoint篡改负例同时改变了文件大小，先触发size门禁而非预期SHA门禁 | 1 | 将fixture改为等长字节篡改，分别独立验证size与SHA失败路径 |
 | 首次格式检查误用当前Anaconda `python -m black`，该解释器未安装Black | 1 | 改用系统已安装的`black`/`ruff`可执行文件；根据报告机械格式化并清理新增代码lint |
 | planning 完成检查脚本不识别中文版 `阶段/状态` 标记，首次报告 0/0 | 1 | 将 plan 标题/状态改为脚本支持的 `Phase`/`Status`，复查为 5/5 complete |
+| 2026-08-11检查点B规划组合补丁误用了`findings.md`首行标题 | 1 | 读取三份文件真实首行后拆分补丁，改用`# 发现与决策`精确上下文 |
 | Phase 6 首次 planning 补丁把 findings 决策行误用为 task_plan 上下文 | 1 | 读取各文件实际段落后按文件分别应用 |
 | Phase 7 首次规划补丁的 findings 上下文与实际文本不一致 | 1 | 读取三个文件的准确段落后拆分补丁并使用精确上下文 |
 | Phase 7 Step 1 完成记录的组合补丁再次因 progress 上下文校验失败 | 1 | 确认组合补丁未部分应用后，按文件拆分为精确小补丁 |

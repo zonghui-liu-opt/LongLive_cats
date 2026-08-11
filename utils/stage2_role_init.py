@@ -14,7 +14,7 @@ from typing import Any, TypeVar
 import torch
 
 from model.stage2_dmd import Stage2DMD, Stage2DiTRole
-from utils.lora_utils import build_lora_shard_schema
+from utils.lora_utils import build_lora_shard_schema, strict_load_lora_state_dict
 from utils.stage1_io import canonical_json_sha256, sha256_file
 from utils.stage2_fsdp2 import audit_stage2_fsdp2_role, fsdp2_wrap_stage2_role
 from utils.stage2_roles import (
@@ -207,6 +207,10 @@ class Stage2InitializedRoles:
     model: Stage2DMD
     role_audits: dict[str, Stage2RoleInitializationAudit]
     adapter_digests: dict[str, str]
+    # Immutable pre-FSDP schemas are required by both DCP optimizer state and
+    # selective adapter checkpointing.  They cannot be reconstructed safely
+    # from sharded parameters after initialization.
+    lora_schemas: dict[str, Mapping[str, Any]]
 
 
 def stage2_role_seed(training_seed: int, role: str) -> int:
@@ -545,6 +549,7 @@ def initialize_stage2_roles(
     stage_runner: StageRunner = _default_stage_runner,
     role_builder: Callable[[Any, str], Stage2DiTRole] = _build_meta_role,
     is_main_process: bool = False,
+    resume_adapter_states: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
 ) -> Stage2InitializedRoles:
     """Build/load/audit/shard G, real, and fake sequentially.
 
@@ -553,9 +558,23 @@ def initialize_stage2_roles(
     distributed caller can enforce WORLD consensus before any rank advances.
     """
 
-    from utils.stage2_role_manifest import require_stage2_cold_start
-
-    require_stage2_cold_start(resolved)
+    mode = getattr(resolved, "initialization_mode", None)
+    if resume_adapter_states is not None:
+        if mode not in {"init_from_stage1", "resume_stage2"} or set(
+            resume_adapter_states
+        ) != {
+            "generator",
+            "fake_score",
+        }:
+            raise ValueError(
+                "Stage-2 resume requires exact generator/fake_score raw adapters"
+            )
+    elif mode == "resume_stage2":
+        raise ValueError("Stage-2 resume mode requires raw checkpoint adapters")
+    elif mode == "init_from_stage1":
+        pass
+    else:
+        raise ValueError(f"unsupported Stage-2 initialization_mode={mode!r}")
     expected_asset_roles = {"generator", "real_score", "fake_score"}
     if set(assets) != expected_asset_roles:
         raise ValueError(f"Stage-2 assets must contain {sorted(expected_asset_roles)}")
@@ -568,6 +587,7 @@ def initialize_stage2_roles(
     wrappers: dict[str, Stage2DiTRole] = {}
     audits: dict[str, Stage2RoleInitializationAudit] = {}
     adapter_digests: dict[str, str] = {}
+    lora_schemas: dict[str, Mapping[str, Any]] = {}
     content_hash_cache: set[tuple[str, str, tuple[tuple[str, int], ...]]] = set()
     for role in ("generator", "real_score", "fake_score"):
         asset = assets[role]
@@ -631,6 +651,14 @@ def initialize_stage2_roles(
                     seed=adapter_seed,
                     is_main_process=is_main_process,
                 )
+                if resume_adapter_states is not None:
+                    strict_load_lora_state_dict(
+                        wrapper.model,
+                        resume_adapter_states[role],
+                        expected_dtype=torch.float32,
+                        require_finite=True,
+                        verify_tensors=True,
+                    )
                 lora_schema = build_lora_shard_schema(
                     wrapper.model,
                     expected_dtype=torch.float32,
@@ -725,6 +753,8 @@ def initialize_stage2_roles(
         wrappers[role] = wrapper
         if adapter_digest is not None:
             adapter_digests[role] = adapter_digest
+        if lora_schema is not None:
+            lora_schemas[role] = lora_schema
         gc.collect()
 
     model = Stage2DMD(
@@ -736,4 +766,5 @@ def initialize_stage2_roles(
         model=model,
         role_audits=audits,
         adapter_digests=adapter_digests,
+        lora_schemas=lora_schemas,
     )

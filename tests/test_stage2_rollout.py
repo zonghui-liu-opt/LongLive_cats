@@ -178,7 +178,7 @@ def test_real_unipc_k4_shift5_is_the_single_runtime_timetable():
 
 
 def test_rollout_contract_is_built_only_from_the_resolved_stage2_config():
-    resolved = load_stage2_config("configs/train_i2v_stage2.yaml")
+    resolved = load_stage2_config("configs/train_i2v_stage2_600cats.yaml")
     schedulers = []
 
     def factory():

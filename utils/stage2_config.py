@@ -43,6 +43,7 @@ _CONTRACT_LOCAL_DERIVED_FIELDS = {
     "init_real_score_manifest",
     "resume_stage2_checkpoint",
     "metadata_path",
+    "source_cache_manifest",
     "cache_dir",
     "action_labels_path",
     "negative_conditioning_manifest",
@@ -158,6 +159,7 @@ _ADAPTER_ROLE_KEYS = {
 _DATA_KEYS = {
     "backend",
     "metadata_path",
+    "source_cache_manifest",
     "action_label_source_policy",
     "action_labels_path",
     "cache_dir",
@@ -369,6 +371,7 @@ class Stage2ResolvedConfig:
     expected_num_actions: int
     expected_samples_per_action: int
     metadata_path: str
+    source_cache_manifest: str
     cache_dir: str
     action_label_source_policy: str
     action_labels_path: str | None
@@ -638,6 +641,10 @@ def _contract_config_view(config: Mapping[str, Any]) -> dict[str, Any]:
     contract["model_kwargs"]["architecture_root"] = "<runtime-asset>"
     contract["checkpoints"] = {"initialization": "<runtime-checkpoint>"}
     contract["data"]["metadata_path"] = "<runtime-asset>"
+    # This field was added after the static contract was published.  It names
+    # an already-hashed runtime asset and is removed (rather than replaced) so
+    # the released research-contract digest stays byte-for-byte stable.
+    contract["data"].pop("source_cache_manifest", None)
     contract["data"]["cache_dir"] = "<runtime-asset>"
     # The manifest-first policy is the research contract. Selecting an optional
     # operator-confirmed sidecar is a launch-local asset choice, just like the
@@ -1051,6 +1058,9 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
     data = _required_section(raw, "data", _DATA_KEYS)
     _locked_string(data, "backend", "data", "stage2_i2v_cache")
     metadata_path = _string(data["metadata_path"], "data.metadata_path")
+    source_cache_manifest = _string(
+        data["source_cache_manifest"], "data.source_cache_manifest"
+    )
     cache_dir = _string(data["cache_dir"], "data.cache_dir")
     action_label_source_policy = _locked_string(
         data,
@@ -1521,6 +1531,7 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         expected_num_actions=expected_num_actions,
         expected_samples_per_action=expected_samples_per_action,
         metadata_path=metadata_path,
+        source_cache_manifest=source_cache_manifest,
         cache_dir=cache_dir,
         action_label_source_policy=action_label_source_policy,
         action_labels_path=action_labels_path,

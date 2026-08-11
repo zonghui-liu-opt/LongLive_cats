@@ -41,3 +41,4 @@ flask-socketio
 torchao==0.13.0  # paired with the documented PyTorch 2.8.0 environment
 peft
 safetensors
+nvidia-ml-py  # Stage-2 H100 smoke: NVML free-memory acceptance gate

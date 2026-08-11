@@ -10,10 +10,18 @@ import socket
 from typing import Any
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import (
+    FullStateDictConfig,
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
 from torch.distributed.fsdp.api import CPUOffload
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
-
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    transformer_auto_wrap_policy,
+)
 
 STAGE1_FSDP1_GATE0_MESSAGE = (
     "Stage-1 Gate 0 failed: the locked FSDP1 size-wrapped model places BF16 "
@@ -96,9 +104,7 @@ def validate_stage1_fsdp2_api(*, torch_version: str | None = None) -> None:
 
     version = torch.__version__ if torch_version is None else torch_version
     if _torch_release_tuple(version) < (2, 8, 0):
-        raise RuntimeError(
-            f"Stage-1 FSDP2 requires PyTorch >=2.8.0, found {version!r}"
-        )
+        raise RuntimeError(f"Stage-1 FSDP2 requires PyTorch >=2.8.0, found {version!r}")
     api = _import_fsdp2_api()
     fully_shard_parameters = inspect.signature(api["fully_shard"]).parameters
     required_fully_shard_parameters = {
@@ -113,9 +119,7 @@ def validate_stage1_fsdp2_api(*, torch_version: str | None = None) -> None:
             f"installed fully_shard API is incompatible with PyTorch 2.8: missing {missing}"
         )
     policy_parameters = inspect.signature(api["MixedPrecisionPolicy"]).parameters
-    missing_policy = sorted(
-        {"param_dtype", "reduce_dtype"} - set(policy_parameters)
-    )
+    missing_policy = sorted({"param_dtype", "reduce_dtype"} - set(policy_parameters))
     if missing_policy:
         raise RuntimeError(
             "installed MixedPrecisionPolicy API is incompatible with PyTorch 2.8: "
@@ -330,8 +334,7 @@ def build_stage1_fsdp2_device_mesh(
         mesh_dim_names=topology.mesh_dim_names,
     )
     actual_layout = tuple(
-        tuple(int(rank) for rank in row)
-        for row in mesh.mesh.detach().cpu().tolist()
+        tuple(int(rank) for rank in row) for row in mesh.mesh.detach().cpu().tolist()
     )
     if actual_layout != topology.rank_layout:
         raise RuntimeError(
@@ -445,8 +448,7 @@ def fsdp2_wrap_stage1(
     if mesh is None:
         raise ValueError("Stage-1 FSDP2 requires the explicit 2D DeviceMesh")
     actual_layout = tuple(
-        tuple(int(rank) for rank in row)
-        for row in mesh.mesh.detach().cpu().tolist()
+        tuple(int(rank) for rank in row) for row in mesh.mesh.detach().cpu().tolist()
     )
     if actual_layout != STAGE1_FSDP2_RANK_LAYOUT:
         raise RuntimeError(
@@ -516,7 +518,7 @@ def fsdp2_wrap_stage1(
 
 
 @contextmanager
-def stage1_fsdp2_accumulation(
+def fsdp2_accumulation(
     module: torch.nn.Module,
     *,
     sync_gradients: bool,
@@ -525,14 +527,14 @@ def stage1_fsdp2_accumulation(
     """Configure one FSDP2 microbatch's gradient synchronization.
 
     Set ``sync_gradients=False`` for non-final accumulation microbatches and
-    ``True`` for the final microbatch. With the Stage-1 FP32 reduce policy,
+    ``True`` for the final microbatch. With an FP32 reduce policy,
     unsynchronized gradients accumulate in FP32. State is restored on exit so
     an exception cannot leak no-sync behavior into the next attempt.
     """
 
     api = _import_fsdp2_api()
     if not isinstance(module, api["FSDPModule"]):
-        raise TypeError("stage1_fsdp2_accumulation requires an FSDP2 root module")
+        raise TypeError("fsdp2_accumulation requires an FSDP2 root module")
     sync_gradients = bool(sync_gradients)
     module.set_requires_gradient_sync(sync_gradients, recurse=True)
     module.set_reshard_after_backward(bool(reshard_after_backward), recurse=True)
@@ -543,6 +545,21 @@ def stage1_fsdp2_accumulation(
         module.set_requires_gradient_sync(True, recurse=True)
         module.set_reshard_after_backward(True, recurse=True)
         module.set_is_last_backward(True)
+
+
+def stage1_fsdp2_accumulation(
+    module: torch.nn.Module,
+    *,
+    sync_gradients: bool,
+    reshard_after_backward: bool = True,
+):
+    """Backward-compatible Stage-1 alias for :func:`fsdp2_accumulation`."""
+
+    return fsdp2_accumulation(
+        module,
+        sync_gradients=sync_gradients,
+        reshard_after_backward=reshard_after_backward,
+    )
 
 
 def fsdp_state_dict(model):
@@ -571,20 +588,18 @@ def fsdp_wrap(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             buffer_dtype=torch.float32,
-            cast_forward_inputs=False
+            cast_forward_inputs=False,
         )
     else:
         mixed_precision_policy = None
 
     if wrap_strategy == "transformer":
         auto_wrap_policy = partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=transformer_module
+            transformer_auto_wrap_policy, transformer_layer_cls=transformer_module
         )
     elif wrap_strategy == "size":
         auto_wrap_policy = partial(
-            size_based_auto_wrap_policy,
-            min_num_params=min_num_params
+            size_based_auto_wrap_policy, min_num_params=min_num_params
         )
     else:
         raise ValueError(f"Invalid wrap strategy: {wrap_strategy}")
@@ -607,7 +622,7 @@ def fsdp_wrap(
         limit_all_gathers=True,
         use_orig_params=True,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=False  # Load ckpt on rank 0 and sync to other ranks
+        sync_module_states=False,  # Load ckpt on rank 0 and sync to other ranks
     )
     return module
 
@@ -632,8 +647,13 @@ def launch_distributed_job(backend: str = "nccl"):
     # (e.g. FSDP.optim_state_dict all-gather + rank0-only disk write for a
     # multi-GB full optimizer state) do not trip the NCCL watchdog on other
     # ranks while they wait at the post-save barrier.
-    dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
-                            init_method=init_method, timeout=timedelta(minutes=60))
+    dist.init_process_group(
+        rank=rank,
+        world_size=world_size,
+        backend=backend,
+        init_method=init_method,
+        timeout=timedelta(minutes=60),
+    )
     torch.cuda.set_device(local_rank)
 
 
@@ -646,11 +666,16 @@ class EMA_FSDP:
     @staticmethod
     def _clean_param_name(name: str) -> str:
         """Remove FSDP wrapper prefixes from parameter names."""
-        return name.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "").replace("_orig_mod.", "")
+        return (
+            name.replace("_fsdp_wrapped_module.", "")
+            .replace("_checkpoint_wrapped_module.", "")
+            .replace("_orig_mod.", "")
+        )
 
     @torch.no_grad()
     def _init_shadow(self, fsdp_module):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
         with FSDP.summon_full_params(fsdp_module, writeback=False):
             for n, p in fsdp_module.module.named_parameters():
                 # Clean the parameter name to remove FSDP prefixes
@@ -662,17 +687,20 @@ class EMA_FSDP:
     def update(self, fsdp_module):
         d = self.decay
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
         with FSDP.summon_full_params(fsdp_module, writeback=False):
             for n, p in fsdp_module.module.named_parameters():
                 cleaned_name = self._clean_param_name(n)
                 if cleaned_name in self.shadow:
-                    self.shadow[cleaned_name].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
+                    self.shadow[cleaned_name].mul_(d).add_(
+                        p.detach().float().cpu(), alpha=1.0 - d
+                    )
 
     # Optional helpers ---------------------------------------------------
     def state_dict(self):
         # Return shadow dict directly - keys are already cleaned during init/update
         # This makes the state_dict directly usable for inference with unwrapped models
-        return self.shadow            # picklable
+        return self.shadow  # picklable
 
     def load_state_dict(self, sd):
         # Handle both cases: with or without FSDP prefixes
@@ -687,6 +715,7 @@ class EMA_FSDP:
     def copy_to(self, fsdp_module):
         # load EMA weights into an (unwrapped) copy of the generator
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
         with FSDP.summon_full_params(fsdp_module, writeback=True):
             for n, p in fsdp_module.module.named_parameters():
                 cleaned_name = self._clean_param_name(n)
@@ -732,14 +761,18 @@ def _parameter_shard_metadata(parameter: torch.Tensor) -> dict[str, Any]:
             "mesh_dim_names": tuple(mesh.mesh_dim_names or ()),
             "mesh_shape": tuple(mesh.mesh.shape),
             "rank_layout": tuple(
-                tuple(int(rank) for rank in row)
-                if isinstance(row, list)
-                else (int(row),)
+                (
+                    tuple(int(rank) for rank in row)
+                    if isinstance(row, list)
+                    else (int(row),)
+                )
                 for row in mesh.mesh.detach().cpu().tolist()
             ),
-            "coordinate": None
-            if coordinate is None
-            else tuple(int(index) for index in coordinate),
+            "coordinate": (
+                None
+                if coordinate is None
+                else tuple(int(index) for index in coordinate)
+            ),
             "placements": tuple(str(placement) for placement in parameter.placements),
         }
     )
@@ -813,7 +846,9 @@ class TrainableShardedEMA:
             return dist.get_rank(), dist.get_world_size()
         return 0, 1
 
-    def _trainable_parameters(self, module: torch.nn.Module) -> dict[str, torch.nn.Parameter]:
+    def _trainable_parameters(
+        self, module: torch.nn.Module
+    ) -> dict[str, torch.nn.Parameter]:
         parameters: dict[str, torch.nn.Parameter] = {}
         raw_names: dict[str, str] = {}
         for raw_name, parameter in module.named_parameters():
@@ -902,7 +937,10 @@ class TrainableShardedEMA:
                 "EMA must initialize exactly at its configured completed step: "
                 f"expected {self.start_step}, got {completed_step}"
             )
-        if self.last_completed_step is not None and completed_step <= self.last_completed_step:
+        if (
+            self.last_completed_step is not None
+            and completed_step <= self.last_completed_step
+        ):
             raise ValueError(
                 f"EMA completed steps must increase: previous={self.last_completed_step}, "
                 f"got={completed_step}"
@@ -927,7 +965,10 @@ class TrainableShardedEMA:
         completed_step = int(completed_step)
         if completed_step < 1:
             raise ValueError(f"completed_step must be >= 1, got {completed_step}")
-        if self.last_completed_step is not None and completed_step <= self.last_completed_step:
+        if (
+            self.last_completed_step is not None
+            and completed_step <= self.last_completed_step
+        ):
             raise ValueError(
                 f"EMA completed steps must increase: previous={self.last_completed_step}, "
                 f"got={completed_step}"
@@ -959,7 +1000,9 @@ class TrainableShardedEMA:
         parameters = self._trainable_parameters(module)
         self._validate_local_topology(parameters)
         if set(parameters) != set(self.shadow):
-            raise ValueError("EMA shadow keys do not match current local trainable shards")
+            raise ValueError(
+                "EMA shadow keys do not match current local trainable shards"
+            )
         # Stage all device-to-CPU copies and finite/shape checks before mutating
         # any shadow. A later non-finite shard must not partially decay earlier
         # keys, since the same completed step may then be retried.
@@ -995,17 +1038,23 @@ class TrainableShardedEMA:
             "rank": rank,
             "world_size": world_size,
             "topology": dict(self.topology),
-            "local_shapes": {name: tuple(shape) for name, shape in self.local_shapes.items()},
+            "local_shapes": {
+                name: tuple(shape) for name, shape in self.local_shapes.items()
+            },
             "global_shapes": {
                 name: tuple(shape) for name, shape in self.global_shapes.items()
             },
             "shard_metadata": {
                 name: dict(metadata) for name, metadata in self.shard_metadata.items()
             },
-            "shadow": {name: value.detach().clone() for name, value in self.shadow.items()},
+            "shadow": {
+                name: value.detach().clone() for name, value in self.shadow.items()
+            },
         }
 
-    def load_state_dict(self, state_dict: Mapping[str, Any], module: torch.nn.Module) -> None:
+    def load_state_dict(
+        self, state_dict: Mapping[str, Any], module: torch.nn.Module
+    ) -> None:
         required = {
             "schema_version",
             "decay",
@@ -1023,7 +1072,9 @@ class TrainableShardedEMA:
         missing = sorted(required - set(state_dict))
         extra = sorted(set(state_dict) - required)
         if missing or extra:
-            raise ValueError(f"EMA state key mismatch: missing={missing}, extra={extra}")
+            raise ValueError(
+                f"EMA state key mismatch: missing={missing}, extra={extra}"
+            )
         if int(state_dict["schema_version"]) != self.schema_version:
             raise ValueError(
                 f"unsupported EMA schema version: {state_dict['schema_version']}"
@@ -1038,7 +1089,10 @@ class TrainableShardedEMA:
                 f"checkpoint={state_dict['start_step']}, current={self.start_step}"
             )
         rank, world_size = self._rank_and_world_size()
-        if int(state_dict["rank"]) != rank or int(state_dict["world_size"]) != world_size:
+        if (
+            int(state_dict["rank"]) != rank
+            or int(state_dict["world_size"]) != world_size
+        ):
             raise ValueError(
                 "EMA distributed topology mismatch: "
                 f"checkpoint=(rank={state_dict['rank']}, world={state_dict['world_size']}), "
@@ -1054,7 +1108,8 @@ class TrainableShardedEMA:
         parameters = self._trainable_parameters(module)
         self._validate_local_topology(parameters)
         checkpoint_shapes = {
-            str(name): tuple(shape) for name, shape in dict(state_dict["local_shapes"]).items()
+            str(name): tuple(shape)
+            for name, shape in dict(state_dict["local_shapes"]).items()
         }
         if checkpoint_shapes != self.local_shapes:
             raise ValueError(
@@ -1130,7 +1185,9 @@ class TrainableShardedEMA:
         parameters = self._trainable_parameters(module)
         self._validate_local_topology(parameters)
         if set(parameters) != set(self.shadow):
-            raise ValueError("EMA shadow keys do not match current local trainable shards")
+            raise ValueError(
+                "EMA shadow keys do not match current local trainable shards"
+            )
         for name, parameter in parameters.items():
             local_parameter = _local_parameter_tensor(parameter, writable=True)
             local_parameter.copy_(

@@ -46,7 +46,6 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
-
 _LORA_PARAMETER_MARKERS = (".lora_A.", ".lora_B.")
 _CANONICAL_LORA_KEY_MARKERS = (".lora_A.weight", ".lora_B.weight")
 
@@ -131,7 +130,9 @@ def _compile_target_patterns(target_patterns: Any) -> tuple[re.Pattern[str], ...
     compiled = []
     for pattern in target_patterns:
         if not isinstance(pattern, str) or not pattern:
-            raise ValueError("every adapter.target_patterns entry must be a non-empty string")
+            raise ValueError(
+                "every adapter.target_patterns entry must be a non-empty string"
+            )
         try:
             compiled.append(re.compile(pattern))
         except re.error as exc:
@@ -165,7 +166,9 @@ def resolve_lora_target_modules(
 
         for name, module in named_modules:
             matching_indices = [
-                index for index, pattern in enumerate(compiled) if pattern.fullmatch(name)
+                index
+                for index, pattern in enumerate(compiled)
+                if pattern.fullmatch(name)
             ]
             if not matching_indices:
                 continue
@@ -229,7 +232,9 @@ def assert_lora_b_weights_zero(lora_model: torch.nn.Module) -> tuple[str, ...]:
         if parameter.numel() and torch.count_nonzero(parameter.detach()).item() != 0:
             nonzero.append(name)
     if nonzero:
-        raise ValueError(f"LoRA-B initialization must be all-zero; nonzero tensors: {nonzero}")
+        raise ValueError(
+            f"LoRA-B initialization must be all-zero; nonzero tensors: {nonzero}"
+        )
     return tuple(name for name, _ in b_parameters)
 
 
@@ -246,7 +251,9 @@ def get_canonical_lora_state_dict(
     """
 
     has_fsdp1 = any(isinstance(module, FSDP) for module in lora_model.modules())
-    has_dtensor = any(isinstance(parameter, DTensor) for parameter in lora_model.parameters())
+    has_dtensor = any(
+        isinstance(parameter, DTensor) for parameter in lora_model.parameters()
+    )
     if state_dict is None and (has_fsdp1 or has_dtensor):
         raise RuntimeError(
             "canonical adapter extraction from a sharded model is forbidden; "
@@ -275,7 +282,9 @@ def audit_lora_model(
         if parameter.requires_grad
     )
     trainable_names = tuple(name for name, _ in trainable)
-    non_lora_trainable = [name for name in trainable_names if not _is_lora_parameter_name(name)]
+    non_lora_trainable = [
+        name for name in trainable_names if not _is_lora_parameter_name(name)
+    ]
     if require_lora_only and non_lora_trainable:
         raise ValueError(f"non-LoRA trainable parameters found: {non_lora_trainable}")
     if expected_trainable_dtype is not None:
@@ -291,9 +300,13 @@ def audit_lora_model(
             )
 
     canonical_state = get_canonical_lora_state_dict(lora_model)
-    non_adapter_keys = [key for key in canonical_state if not _is_canonical_lora_key(key)]
+    non_adapter_keys = [
+        key for key in canonical_state if not _is_canonical_lora_key(key)
+    ]
     if require_lora_only and non_adapter_keys:
-        raise ValueError(f"non-LoRA tensors found in canonical adapter state: {non_adapter_keys}")
+        raise ValueError(
+            f"non-LoRA tensors found in canonical adapter state: {non_adapter_keys}"
+        )
 
     actual_target_prefixes = {
         key.rsplit(".lora_A.weight", 1)[0]
@@ -313,12 +326,18 @@ def audit_lora_model(
 
     expected_values = (
         ("target modules", expected_target_modules, target_module_count),
-        ("trainable parameters", expected_trainable_parameters, trainable_parameter_count),
+        (
+            "trainable parameters",
+            expected_trainable_parameters,
+            trainable_parameter_count,
+        ),
         ("adapter tensors", expected_adapter_tensors, adapter_tensor_count),
     )
     for label, expected, actual in expected_values:
         if expected is not None and actual != int(expected):
-            raise ValueError(f"unexpected LoRA {label}: expected {expected}, got {actual}")
+            raise ValueError(
+                f"unexpected LoRA {label}: expected {expected}, got {actual}"
+            )
 
     if check_b_zero:
         assert_lora_b_weights_zero(lora_model)
@@ -393,11 +412,15 @@ def configure_lora_for_model(
     audit = audit_lora_model(
         lora_model,
         target_module_names=target_linear_modules,
-        expected_target_modules=_config_get(lora_config, "expected_target_modules", None),
+        expected_target_modules=_config_get(
+            lora_config, "expected_target_modules", None
+        ),
         expected_trainable_parameters=_config_get(
             lora_config, "expected_trainable_parameters", None
         ),
-        expected_adapter_tensors=_config_get(lora_config, "expected_adapter_tensors", None),
+        expected_adapter_tensors=_config_get(
+            lora_config, "expected_adapter_tensors", None
+        ),
         expected_trainable_dtype=torch.float32 if exact_targeting else None,
         require_lora_only=exact_targeting,
         check_b_zero=True,
@@ -481,11 +504,15 @@ def strict_load_lora_state_dict(
     if verify_tensors:
         loaded = get_canonical_lora_state_dict(lora_model)
         if set(loaded) != set(validated):
-            raise RuntimeError("loaded PEFT adapter keys changed after strict validation")
+            raise RuntimeError(
+                "loaded PEFT adapter keys changed after strict validation"
+            )
         unequal = []
         for key, source in validated.items():
             actual = loaded[key]
-            expected_value = source.detach().to(device=actual.device, dtype=actual.dtype)
+            expected_value = source.detach().to(
+                device=actual.device, dtype=actual.dtype
+            )
             if not torch.equal(actual.detach(), expected_value):
                 unequal.append(key)
         if unequal:
@@ -532,7 +559,9 @@ def save_lora_safetensors_strict(
     os.close(fd)
     try:
         safe_metadata = (
-            {str(key): str(value) for key, value in metadata.items()} if metadata else None
+            {str(key): str(value) for key, value in metadata.items()}
+            if metadata
+            else None
         )
         save_file(dict(validated), temporary_path, metadata=safe_metadata)
         os.replace(temporary_path, output_path)
@@ -684,9 +713,14 @@ def _chunk_size_and_offset(
 
 
 def _normalize_mesh_ranks(mesh_tensor: torch.Tensor) -> tuple[tuple[int, ...], ...]:
+    if mesh_tensor.ndim == 1:
+        return (
+            tuple(int(rank) for rank in mesh_tensor.detach().to(device="cpu").tolist()),
+        )
     if mesh_tensor.ndim != 2:
         raise ValueError(
-            f"Stage-1 FSDP2 requires a two-dimensional DeviceMesh, got ndim={mesh_tensor.ndim}"
+            "selective FSDP2 LoRA export requires a one- or two-dimensional "
+            f"DeviceMesh, got ndim={mesh_tensor.ndim}"
         )
     return tuple(
         tuple(int(rank) for rank in row)
@@ -717,7 +751,9 @@ def _collect_fsdp2_lora_metadata(
     ]
     if not trainable:
         raise ValueError("model contains no trainable LoRA parameters")
-    non_dtensor = [name for name, parameter in trainable if not isinstance(parameter, DTensor)]
+    non_dtensor = [
+        name for name, parameter in trainable if not isinstance(parameter, DTensor)
+    ]
     if non_dtensor:
         raise RuntimeError(
             "FSDP2 LoRA topology is ambiguous because some trainable parameters are not "
@@ -728,10 +764,13 @@ def _collect_fsdp2_lora_metadata(
 
     required_mesh_shape = tuple(int(value) for value in expected_mesh_shape)
     required_mesh_dim_names = tuple(str(value) for value in expected_mesh_dim_names)
-    if len(required_mesh_dim_names) != 2:
+    if len(required_mesh_shape) not in (1, 2) or len(required_mesh_dim_names) != len(
+        required_mesh_shape
+    ):
         raise ValueError(
-            f"Stage-1 requires exactly two DeviceMesh dim names, got "
-            f"{required_mesh_dim_names}"
+            "selective FSDP2 LoRA export requires matching one- or two-"
+            f"dimensional mesh metadata, got shape={required_mesh_shape}, "
+            f"names={required_mesh_dim_names}"
         )
     required_mesh_ranks = (
         tuple(tuple(int(rank) for rank in row) for row in expected_mesh_ranks)
@@ -762,13 +801,13 @@ def _collect_fsdp2_lora_metadata(
         mesh_shape = tuple(int(size) for size in mesh.shape)
         if mesh_shape != required_mesh_shape:
             raise ValueError(
-                f"wrong Stage-1 DeviceMesh shape for {canonical_key}: "
+                f"wrong selective-LoRA DeviceMesh shape for {canonical_key}: "
                 f"expected {required_mesh_shape}, got {mesh_shape}"
             )
         mesh_ranks = _normalize_mesh_ranks(mesh.mesh)
         if required_mesh_ranks is not None and mesh_ranks != required_mesh_ranks:
             raise ValueError(
-                f"wrong Stage-1 DeviceMesh ranks for {canonical_key}: "
+                f"wrong selective-LoRA DeviceMesh ranks for {canonical_key}: "
                 f"expected {required_mesh_ranks}, got {mesh_ranks}"
             )
         coordinate_value = mesh.get_coordinate()
@@ -777,46 +816,72 @@ def _collect_fsdp2_lora_metadata(
                 f"current rank is not a member of the LoRA DeviceMesh for {canonical_key}"
             )
         coordinate = tuple(int(value) for value in coordinate_value)
-        if len(coordinate) != 2:
+        if len(coordinate) != len(required_mesh_shape):
             raise ValueError(
                 f"wrong DeviceMesh coordinate for {canonical_key}: {coordinate}"
             )
 
         placements = tuple(parameter.placements)
-        if not (
-            len(placements) == 2
-            and isinstance(placements[0], Replicate)
-            and isinstance(placements[1], Shard)
-            and int(placements[1].dim) == 0
-        ):
-            raise ValueError(
-                "Stage-1 LoRA DTensors require placements "
-                f"(Replicate(), Shard(dim=0)); {canonical_key} has {placements}"
-            )
-        placement_names = ("replicate", "shard:0")
+        if len(required_mesh_shape) == 2:
+            if not (
+                len(placements) == 2
+                and isinstance(placements[0], Replicate)
+                and isinstance(placements[1], Shard)
+                and int(placements[1].dim) == 0
+            ):
+                raise ValueError(
+                    "two-dimensional selective LoRA DTensors require placements "
+                    f"(Replicate(), Shard(dim=0)); {canonical_key} has {placements}"
+                )
+            placement_names = ("replicate", "shard:0")
+            replica_coordinate, shard_coordinate = coordinate
+            shard_mesh_size = mesh_shape[1]
+            current_mesh_rank = mesh_ranks[replica_coordinate][shard_coordinate]
+            shard_group_ranks = tuple(mesh_ranks[replica_coordinate])
+            replica_group_ranks = tuple(row[shard_coordinate] for row in mesh_ranks)
+            authoritative_ranks = tuple(mesh_ranks[0])
+        else:
+            if not (
+                len(placements) == 1
+                and isinstance(placements[0], Shard)
+                and int(placements[0].dim) == 0
+            ):
+                raise ValueError(
+                    "one-dimensional selective LoRA DTensors require placement "
+                    f"Shard(dim=0); {canonical_key} has {placements}"
+                )
+            placement_names = ("shard:0",)
+            (shard_coordinate,) = coordinate
+            shard_mesh_size = mesh_shape[0]
+            current_mesh_rank = mesh_ranks[0][shard_coordinate]
+            shard_group_ranks = tuple(mesh_ranks[0])
+            replica_group_ranks = (current_mesh_rank,)
+            authoritative_ranks = tuple(mesh_ranks[0])
         mesh_dim_names_value = getattr(mesh, "mesh_dim_names", None)
         mesh_dim_names = (
             tuple(mesh_dim_names_value)
             if mesh_dim_names_value is not None
-            else (None, None)
+            else tuple(None for _ in required_mesh_shape)
         )
-        if len(mesh_dim_names) != 2:
+        if len(mesh_dim_names) != len(required_mesh_shape):
             raise ValueError(
                 f"wrong DeviceMesh dim-name metadata for {canonical_key}: {mesh_dim_names}"
             )
         if mesh_dim_names != required_mesh_dim_names:
             raise ValueError(
-                f"wrong Stage-1 DeviceMesh dim names for {canonical_key}: "
+                f"wrong selective-LoRA DeviceMesh dim names for {canonical_key}: "
                 f"expected {required_mesh_dim_names}, got {mesh_dim_names}"
             )
-
-        replica_coordinate, shard_coordinate = coordinate
         local_tensor = parameter.to_local()
-        if not isinstance(local_tensor, torch.Tensor) or isinstance(local_tensor, DTensor):
-            raise TypeError(f"DTensor.to_local() did not return a local Tensor for {canonical_key}")
+        if not isinstance(local_tensor, torch.Tensor) or isinstance(
+            local_tensor, DTensor
+        ):
+            raise TypeError(
+                f"DTensor.to_local() did not return a local Tensor for {canonical_key}"
+            )
         local_shape = tuple(int(size) for size in local_tensor.shape)
         local_dim_size, shard_offset = _chunk_size_and_offset(
-            global_shape[0], mesh_shape[1], shard_coordinate
+            global_shape[0], shard_mesh_size, shard_coordinate
         )
         expected_local_shape = (local_dim_size, *global_shape[1:])
         if local_shape != expected_local_shape:
@@ -825,14 +890,11 @@ def _collect_fsdp2_lora_metadata(
                 f"expected {expected_local_shape}, got {local_shape}"
             )
         global_rank = int(torch.distributed.get_rank())
-        if mesh_ranks[replica_coordinate][shard_coordinate] != global_rank:
+        if current_mesh_rank != global_rank:
             raise ValueError(
                 f"DeviceMesh coordinate/rank mismatch for {canonical_key}: "
                 f"coordinate={coordinate}, rank={global_rank}, mesh={mesh_ranks}"
             )
-        shard_group_ranks = tuple(mesh_ranks[replica_coordinate])
-        replica_group_ranks = tuple(row[shard_coordinate] for row in mesh_ranks)
-        authoritative_ranks = tuple(mesh_ranks[0])
         row_numel = int(torch.Size(global_shape[1:]).numel())
         intra_param_start = shard_offset * row_numel
         fingerprint_payload = {
@@ -851,7 +913,8 @@ def _collect_fsdp2_lora_metadata(
             reference_topology = topology
         elif topology != reference_topology:
             raise ValueError(
-                f"LoRA DTensors do not share one unambiguous 2D topology: {canonical_key}"
+                "LoRA DTensors do not share one unambiguous topology: "
+                f"{canonical_key}"
             )
         metadata[canonical_key] = {
             "raw_name": raw_name,
@@ -860,7 +923,7 @@ def _collect_fsdp2_lora_metadata(
             "global_shape": global_shape,
             "intra_param_start": intra_param_start,
             "shard_rank": shard_coordinate,
-            "shard_world_size": mesh_shape[1],
+            "shard_world_size": shard_mesh_size,
             "shard_group_ranks": shard_group_ranks,
             "fsdp_unit_fingerprint": fingerprint,
             "local_shape": local_shape,
@@ -908,7 +971,8 @@ def audit_fsdp2_lora_dtensor_topology(
     return {
         "adapter_tensor_count": len(metadata),
         "global_trainable_parameters": sum(
-            int(torch.Size(spec.global_shape).numel()) for spec in expected_schema.values()
+            int(torch.Size(spec.global_shape).numel())
+            for spec in expected_schema.values()
         ),
         "canonical_keys": tuple(metadata),
         "mesh_shape": first["mesh_shape"],
@@ -918,9 +982,7 @@ def audit_fsdp2_lora_dtensor_topology(
         "mesh_coordinate": first["mesh_coordinate"],
         "shard_group_ranks": first["shard_group_ranks"],
         "replica_group_ranks": first["replica_group_ranks"],
-        "authoritative_shard_group_ranks": first[
-            "authoritative_shard_group_ranks"
-        ],
+        "authoritative_shard_group_ranks": first["authoritative_shard_group_ranks"],
     }
 
 
@@ -966,7 +1028,9 @@ def get_lora_sharded_state_dict(
         parameter.requires_grad and isinstance(parameter, DTensor)
         for _, parameter in named_parameters
     )
-    any_dtensor = any(isinstance(parameter, DTensor) for _, parameter in named_parameters)
+    any_dtensor = any(
+        isinstance(parameter, DTensor) for _, parameter in named_parameters
+    )
     if trainable_dtensor and expected_schema is None:
         raise ValueError(
             "FSDP2 selective LoRA export requires the immutable pre-shard schema "
@@ -1025,7 +1089,9 @@ def get_lora_sharded_state_dict(
 
         if trainable_dtensor:
             if canonical_key not in fsdp2_metadata:
-                raise RuntimeError(f"missing audited FSDP2 metadata for {canonical_key}")
+                raise RuntimeError(
+                    f"missing audited FSDP2 metadata for {canonical_key}"
+                )
             metadata = fsdp2_metadata[canonical_key]
             global_shape = tuple(metadata["global_shape"])
             source_local_tensor = metadata["local_tensor"]
@@ -1097,7 +1163,9 @@ def get_lora_sharded_state_dict(
             f"extra={sorted(set(canonical) - set(expected_schema))}"
         )
 
-    if expected_adapter_tensors is not None and len(canonical) != int(expected_adapter_tensors):
+    if expected_adapter_tensors is not None and len(canonical) != int(
+        expected_adapter_tensors
+    ):
         raise ValueError(
             "unexpected selective adapter tensor count: "
             f"expected {expected_adapter_tensors}, got {len(canonical)}"
@@ -1162,14 +1230,18 @@ def consolidate_lora_shards(
         fingerprints = {record.fsdp_unit_fingerprint for record in records}
         shapes = {record.global_shape for record in records}
         if len(world_sizes) != 1 or len(group_ranks) != 1 or len(fingerprints) != 1:
-            raise ValueError(f"inconsistent FSDP shard topology for adapter tensor {key}")
+            raise ValueError(
+                f"inconsistent FSDP shard topology for adapter tensor {key}"
+            )
         if shapes != {tuple(spec.global_shape)}:
             raise ValueError(
                 f"inconsistent global shapes for {key}: expected {spec.global_shape}, got {shapes}"
             )
         shard_world_size = next(iter(world_sizes))
         shard_ranks = [record.shard_rank for record in records]
-        if len(records) != shard_world_size or set(shard_ranks) != set(range(shard_world_size)):
+        if len(records) != shard_world_size or set(shard_ranks) != set(
+            range(shard_world_size)
+        ):
             raise ValueError(
                 f"adapter tensor {key} requires exactly one authoritative record per shard rank; "
                 f"world_size={shard_world_size}, ranks={shard_ranks}"
@@ -1177,7 +1249,9 @@ def consolidate_lora_shards(
 
         dtensor_flags = {record.is_dtensor for record in records}
         if len(dtensor_flags) != 1:
-            raise ValueError(f"mixed DTensor/unsharded records for adapter tensor {key}")
+            raise ValueError(
+                f"mixed DTensor/unsharded records for adapter tensor {key}"
+            )
         if next(iter(dtensor_flags)):
             mesh_shapes = {record.mesh_shape for record in records}
             mesh_names = {record.mesh_dim_names for record in records}
@@ -1226,7 +1300,9 @@ def consolidate_lora_shards(
                 )
             if record.is_dtensor:
                 expected_rows, expected_offset = _chunk_size_and_offset(
-                    int(spec.global_shape[0]), record.shard_world_size, record.shard_rank
+                    int(spec.global_shape[0]),
+                    record.shard_world_size,
+                    record.shard_rank,
                 )
                 expected_local_shape = (expected_rows, *tuple(spec.global_shape[1:]))
                 if tuple(local_shape) != expected_local_shape:
@@ -1267,9 +1343,13 @@ def consolidate_lora_shards(
             covered[start:end] = True
         if not bool(covered.all().item()):
             missing_count = int((~covered).sum().item())
-            raise ValueError(f"local LoRA shards leave {missing_count} uncovered values for {key}")
+            raise ValueError(
+                f"local LoRA shards leave {missing_count} uncovered values for {key}"
+            )
         if output.numel() and not bool(torch.isfinite(output).all().item()):
-            raise ValueError(f"consolidated LoRA tensor {key!r} contains non-finite values")
+            raise ValueError(
+                f"consolidated LoRA tensor {key!r} contains non-finite values"
+            )
         consolidated[key] = output.reshape(spec.global_shape)
     return consolidated
 
@@ -1290,11 +1370,9 @@ def validate_lora_replica_shards(
             f"left_only={sorted(set(left) - set(right))}, "
             f"right_only={sorted(set(right) - set(left))}"
         )
-    for key in sorted(left):
-        records = (left[key], right[key])
-        if not all(record.is_dtensor for record in records):
-            raise ValueError(f"DP replica validation requires DTensor shards for {key}")
-        invariant = lambda record: (
+
+    def invariant(record: LocalLoraShard) -> tuple:
+        return (
             record.global_shape,
             record.local_shape,
             record.tensor.dtype,
@@ -1311,6 +1389,11 @@ def validate_lora_replica_shards(
             record.intra_param_start,
             record.fsdp_unit_fingerprint,
         )
+
+    for key in sorted(left):
+        records = (left[key], right[key])
+        if not all(record.is_dtensor for record in records):
+            raise ValueError(f"DP replica validation requires DTensor shards for {key}")
         if invariant(records[0]) != invariant(records[1]):
             raise ValueError(f"DP replica topology differs for adapter tensor {key}")
         coordinates = {record.mesh_coordinate for record in records}
@@ -1319,7 +1402,9 @@ def validate_lora_replica_shards(
             raise ValueError(
                 f"wrong DP replica coordinates for {key}: {sorted(coordinates)}"
             )
-        if {record.global_rank for record in records} != set(records[0].replica_group_ranks):
+        if {record.global_rank for record in records} != set(
+            records[0].replica_group_ranks
+        ):
             raise ValueError(f"wrong DP replica global ranks for adapter tensor {key}")
         left_tensor = records[0].tensor.detach().to(device="cpu")
         right_tensor = records[1].tensor.detach().to(device="cpu")
@@ -1398,14 +1483,19 @@ def _validate_local_fsdp2_shards_for_gather(
     for key, spec in expected_schema.items():
         record = local_shards[key]
         if not isinstance(record, LocalLoraShard) or not record.is_dtensor:
-            raise TypeError(f"distributed gather requires FSDP2 LocalLoraShard for {key}")
+            raise TypeError(
+                f"distributed gather requires FSDP2 LocalLoraShard for {key}"
+            )
         if record.global_rank != global_rank:
             raise ValueError(f"local shard rank metadata mismatch for {key}")
         if record.tensor.device.type != "cpu":
             raise ValueError(
                 "gather_fsdp2_lora_state_dict requires cpu_offload=True local shards"
             )
-        if record.tensor.dtype != spec.dtype or record.global_shape != spec.global_shape:
+        if (
+            record.tensor.dtype != spec.dtype
+            or record.global_shape != spec.global_shape
+        ):
             raise ValueError(f"local shard schema mismatch for {key}")
         if record.mesh_shape != (2, 3) or record.placements != (
             "replicate",
@@ -1519,7 +1609,9 @@ def gather_fsdp2_lora_state_dict(
         except Exception as exc:
             authority_error = exc
     if not _world_consensus(authority_error is None):
-        raise RuntimeError("invalid authoritative FSDP2 shard group") from authority_error
+        raise RuntimeError(
+            "invalid authoritative FSDP2 shard group"
+        ) from authority_error
 
     gathered: list[Any] | None = None
     if is_authoritative:
@@ -1544,9 +1636,11 @@ def gather_fsdp2_lora_state_dict(
         except Exception as exc:
             result_error = exc
     status: list[Any] = [
-        (result_error is None, None if result_error is None else str(result_error))
-        if global_rank == dst_global_rank
-        else None
+        (
+            (result_error is None, None if result_error is None else str(result_error))
+            if global_rank == dst_global_rank
+            else None
+        )
     ]
     torch.distributed.broadcast_object_list(status, src=dst_global_rank)
     if not status[0][0]:
@@ -1575,7 +1669,9 @@ def load_lora_checkpoint(
     """Strictly load a canonical in-memory LoRA checkpoint."""
 
     if is_main_process:
-        print(f"Loading LoRA {model_name} weights: {len(lora_state_dict)} keys in checkpoint")
+        print(
+            f"Loading LoRA {model_name} weights: {len(lora_state_dict)} keys in checkpoint"
+        )
     result = strict_load_lora_state_dict(lora_model, lora_state_dict)
     if is_main_process:
         print(f"LoRA {model_name} weights loaded successfully")

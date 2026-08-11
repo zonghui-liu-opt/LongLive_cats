@@ -1,5 +1,38 @@
 # 发现与决策
 
+## 2026-08-11 Stage‑1 LoRA/merged 四卡推理任务
+
+- 当前 `run_stage1_merged_checkpoint_comparison.py` 只对预 merged `.pt` 执行新推理，并复用原 runner 视频；它没有对 `base + adapter_ema.safetensors` 执行动态 LoRA 推理。
+- 原 `run_stage1_training_checkpoints_validation.py` 会先调用 `merge_stage1_ema_checkpoint()`，再生成不含 adapter section 的完整 generator 配置，所以原参考视频同样属于 merged 路径。
+- 正式新目标是让动态 LoRA 与预 merged 两路共享同一 reference prepared carrier/config、相同seed/采样参数，并在报告中明确映射，避免把旧参考误称为动态 LoRA。
+- 性能设计必须先解决6个case被两个3样本分辨率bucket拆分后的4卡调度；直接沿用当前 `DistributedSampler(..., drop_last=True)` 的4-rank torchrun会丢样本，不能作为正式方案。
+- 对总计12次生成（2种格式×2个geometry bucket×3条样本），最均衡且加载开销最低的正式拓扑是4个并发单卡进程，每个进程固定一种格式和一个bucket并顺序生成3条；相比两轮各4进程，总模型加载从8次降为4次，且每卡总工作量一致。
+- 动态LoRA必须从training checkpoint的`resolved_config.yaml`读取精确adapter schema，并通过`load_lora_safetensors_strict()`加载`adapter_ema.safetensors`；原inference中的`torch.load(lora_ckpt)`不能读取safetensors，也缺少完整key/shape/dtype/finite/value回读门禁。
+- merge与dynamic-LoRA的全局RNG消耗不同，不能只调用相同`set_seed()`就宣称noise相同；正式实现使用`base_seed + row_id`创建独立CUDA Generator，因此两路每行noise与worker分片/模型初始化顺序解耦。
+- merged companion manifest提供必要provenance：正式对比前同时绑定base SHA、training manifest SHA、step3750、EMA adapter SHA、merged output SHA/size/BF16/strict-reload；否则两个视频即使可生成也不能证明来自同一组权重。
+- 原infer_stage1历史结果同样是先merge后推理且使用旧顺序RNG，因此不能冒充dynamic-LoRA或参与严格数值等价判断；它保留在HTML details中作为上下文，主并排固定为左pre-merged、右dynamic-LoRA。
+- 用户确认历史推理目录已删除，因此reference只能是可选的加速/历史上下文输入，不能成为merged-vs-dynamic-LoRA对比的硬依赖。
+- fresh路径应直接复用`prepare_causal_testsets()`：把共享prepared数据放在本次空work dir下，使用converted base、architecture、T5、tokenizer、VAE和锁定的24-latent/UniPC50/CFG5/seed1参数；两路仍从该manifest克隆以保持完全一致。
+- 显式reference路径继续保留原step/metadata/技术输出门禁；fresh路径没有历史视频，因此HTML只显示主并排，report用明确`preparation_mode=fresh`而不是伪造reference validation。
+
+## 2026-08-11 检查点B实现边界
+
+- 用户明确授权继续Steps 9–11；本轮交付严格限定为trainer、optimizer/EMA/nonfinite、checkpoint/resume、JSONL与静态可视化，完成本地正反测试和终审后停止。
+- 唯一合法训练cycle为`F1→F2→F3→F4→F5→G→EMA`；checkpoint只允许`next_substep=F1`且无pending grad/batch/branch/KV的完整cycle边界。
+- Phase、generator epoch、B1十点DFD概率、milestone、EMA初始化/decay和checkpoint频率只能由成功`completed_generator_updates`派生；nonfinite attempt不得推进任何已提交时钟、sampler或RNG。
+- JSONL是唯一权威metric source；必须沿用现有lineage/strict JSON/fsync语义，但使用Stage-2 typed schema和F/G/cycle独立横轴；plot fixture必须由真实producer生成。
+- 本次继续实现不等于宣称内网H100准备门禁已通过；所有H100 profile、显存和正式训练结果继续保留为外部验证。
+
+### 检查点B最终技术结论
+
+- Trainer与checkpoint已形成真实接口闭环，不复用Stage‑1的world6/二维mesh假设：Stage‑2只选择性聚合world8一维FULL_SHARD的G/F LoRA与两个optimizer state，禁止聚合三份5B base。
+- C0/C1/C2 lineage是硬门禁：C1只接C0，C2只接C1且不保存；正式训练拒绝任何带`smoke_probe`的checkpoint，避免预检权重进入正式run。正式训练必须另用全新输出目录。
+- Generator rollout audit给出单样本query tokens；trainer现按实际microbatch乘一次，再按world size换成global logical tokens，micro2和micro1均有参数化测试，避免吞吐固定低报两倍。
+- DMD/DFD diagnostic记录的是clamp前raw denominator；有限的0合法，logger按nonnegative校验，不能在optimizer/EMA/clock提交后因0误判失败。
+- JSONL完整状态不仅看G/F终点，还必须看到latest lineage自己的`run_end.status=complete`及逐cycle严格5F→1G；plot输出9组PNG/SVG和静态HTML，核心loss/吞吐缺字段直接失败。
+- H100 smoke的NVML余量门禁依赖`pynvml`，已把`nvidia-ml-py`加入正式依赖；`train.py`在导入项目模块前关闭bytecode，仍建议部署使用`-B`并要求checkout中ignored文件为0。
+- 最终本地验证为`735 passed, 2 subtests passed`；14条warning都是既有TorchScript弃用提示。真实8×H100健康路径、异常watchdog、显存余量和DataLoader data-wait只能由用户C0→C1→C2实测，不能由CPU测试代替。
+
 ## 2026-08-08 Stage-2 分批执行约束
 
 > **历史记录，非当前门禁。** 本节的逐Batch暂停与“H100‑002通过前不得进入Step 3”已被2026‑08‑10用户确认的三个检查点覆盖；当前状态只看本文后部“三个检查点”和 `task_plan.md`。
@@ -250,6 +283,22 @@
 - 本地证据只能证明CPU/tiny逻辑和真实小模型接口；8×5B FSDP2/NCCL、H100 Triton/FlashAttention、真实600-cache及teacher猫域/video-global provenance仍必须由用户内网门禁确认。
 
 ## 2026-08-07 Stage-2 LongLive-2.0 任务文档
+
+## 2026-08-11 Phase 11 复审初始事实
+
+- 用户明确要求 real-score 与 fake-score 的初始化底座为 DiffSynth-Studio SFT LoRA merge 进 base 后的双向 attention 模型；Generator 仍应保持 Stage-1 causal merged 初始化，三者不可混用。
+- 当前新增权威候选是 `checkpoints/bi_direction/merge_manifest.json` 和 `prepare_stage1.sh`，但“推理脚本能加载”不等价于通过 Stage-2 的 teacher provenance、BF16、架构、独立对象/存储与 checkpoint lineage 门禁。
+- 正式配置已迁移为 `configs/train_i2v_stage2_600cats.yaml`；删除旧文件名后必须同步更新测试、preflight、cache 工具与运行手册中的所有入口，并重新复核严格 schema、路径绑定和 resume 兼容性。
+- 本轮只读审查将分别验证：同一双向权重来源、real 冻结与 fake fresh r64 LoRA、两份模型对象/Parameter/storage 隔离、checkpoint 对 teacher 资产 hash 的绑定，以及 Stage-1 新共享 loader 改动是否影响 Stage-2。
+
+### Phase 11 最终结论
+
+- **无需改角色加载器：** `stage2_role_init` 对score角色固定构造非causal `WanModel`，real/fake分别strict load同一SHA；real无LoRA且冻结，fake再挂fresh r64，`Stage2DMD`审计三个wrapper/model/Parameter/storage全部互斥。
+- **唯一正式配置：** canonical 配置为 `configs/train_i2v_stage2_600cats.yaml`；旧 `train_i2v_stage2.yaml` 删除，`tmp.yaml` 不发布。正式配置已恢复 world8/DP8、补齐 `source_cache_manifest`，并绑定 600cats Stage-2 资产路径。
+- **必须换teacher输入：** `converted_causal_base.pt`及其manifest只服务Stage-1 causal推理，不是Stage-2双向teacher资产。正式cold start应直接指DiffSynth merged目录中的原生BF16 safetensors，并用`create_stage2_teacher_manifest.py`生成自哈希、架构绑定、cat-domain/bidirectional/video-global attestation齐全的sidecar。
+- 用户提供的`checkpoints/bi_direction/merge_manifest.json`首个正式验证错误为缺`manifest_sha256`；即使补hash，top-level schema仍不兼容。它适合作为新teacher sidecar的source provenance，不可直接填`real_score_manifest`。
+- 新Stage-1 comparison提交未被Stage-2 trainer/init/checkpoint导入；共享`lora_utils`的一维FSDP扩展保留Stage-1二维分支，相关联合回归通过。comparison当前证明两路视频分别有效，但没有merged-vs-runtime-LoRA跨路数值等价指标，不能把`pass`解释为严格等价。
+- 当前本地没有约10GB merged权重，无法复核真实文件hash/BF16/tensor schema；这些由内网生成teacher manifest与8×H100 init-only继续验证。本轮没有伪造H100结论。
 
 ### 已锁定目标
 - 使用 Stage-1 checkpoint 3750 EMA merged causal generator 初始化 Stage-2，训练 4-step UniPC、24 个全新 latent、3×8 chunk 的 Self-Forcing DMD/DFD baseline。

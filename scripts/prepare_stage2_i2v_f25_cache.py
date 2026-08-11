@@ -204,7 +204,7 @@ def _parser() -> argparse.ArgumentParser:
         epilog=(
             "8×H100 example: torchrun --standalone --nproc-per-node=8 --no-python "
             "/absolute/path/to/python -I -B scripts/prepare_stage2_i2v_f25_cache.py "
-            "--config-path configs/train_i2v_stage2.yaml --source-cache-manifest "
+            "--config-path configs/train_i2v_stage2_600cats.yaml --source-cache-manifest "
             "/absolute/path/to/stage1/cache_manifest.json --vae-checkpoint "
             "/absolute/path/to/Wan2.2_VAE.pth"
         ),

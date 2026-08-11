@@ -167,6 +167,13 @@ class Stage2ExitRNGStreams:
             for role, generator in self._generators.items()
         }
 
+    def generator(self, role: str) -> torch.Generator:
+        """Return the owned CPU stream for exact checkpoint capture only."""
+
+        if role not in self._generators:
+            raise ValueError(f"unknown Stage-2 exit RNG role: {role!r}")
+        return self._generators[role]
+
     def load_state_dict(self, state: Mapping[str, torch.Tensor]) -> None:
         if set(state) != set(_EXIT_ROLES):
             raise ValueError("Stage-2 exit RNG state must contain generator/fake_score")
