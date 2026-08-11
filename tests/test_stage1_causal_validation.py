@@ -9,6 +9,7 @@ import torch
 
 from scripts.convert_diffsynth_wan22_to_longlive import convert_diffsynth_checkpoint
 from scripts.prepare_stage1_causal_testsets import build_parser as build_prepare_parser
+from utils.stage1_io import atomic_write_json, canonical_json_sha256
 from utils.stage1_causal_validation import (
     load_causal_testset_records,
     prepare_causal_testsets,
@@ -365,7 +366,11 @@ def test_converted_base_audit_checks_hash_schema_bf16_and_source(tmp_path):
     assert manifest["coverage"]["key_percent"] == 100.0
 
 
-def test_output_gate_maps_every_bucket_index_and_rejects_stale_files(tmp_path):
+@pytest.mark.parametrize("output_model_type", ["regular", "lora"])
+def test_output_gate_maps_every_bucket_index_and_rejects_stale_files(
+    tmp_path,
+    output_model_type,
+):
     Image.new("RGB", (832, 480), color=(240, 240, 240)).save(tmp_path / "cat.png")
     metadata = tmp_path / "metadata.csv"
     _write_metadata(
@@ -387,7 +392,11 @@ def test_output_gate_maps_every_bucket_index_and_rejects_stale_files(tmp_path):
         carrier_probe=_fake_carrier_probe,
     )
     output_dir = Path(manifest["buckets"][0]["output_dir"])
-    output_video = output_dir / "rank0-0-0_regular.mp4"
+    manifest["buckets"][0]["output_model_type"] = output_model_type
+    manifest.pop("manifest_sha256")
+    manifest["manifest_sha256"] = canonical_json_sha256(manifest)
+    atomic_write_json(prepared_root / "prepared_manifest.json", manifest)
+    output_video = output_dir / f"rank0-0-0_{output_model_type}.mp4"
     output_video.write_bytes(b"rendered-video")
 
     report = validate_causal_testset_outputs(

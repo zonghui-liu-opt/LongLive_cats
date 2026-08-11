@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Infer a pre-merged Stage-1 checkpoint and pair it with a reference run.
+"""Compare pre-merged and runtime-LoRA Stage-1 inference on four GPUs.
 
 The reference is a ``checkpoint_model_XXXXXX`` directory produced by
 ``run_stage1_training_checkpoints_validation.py``.  Its prepared carrier
-videos and inference configs are reused so that the generator checkpoint and
-output directory are the only intentional config changes.
+videos and inference configs are reused so both checkpoint formats receive
+the same sample inputs, sampling parameters, and per-row noise seeds.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+from dataclasses import asdict, dataclass
 import html
 import json
 import os
@@ -18,6 +20,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -41,13 +44,42 @@ from utils.stage1_io import (  # noqa: E402
     canonical_json_sha256,
     sha256_file,
 )
+from utils.stage1_checkpoint import (  # noqa: E402
+    checkpoint_step,
+    validate_checkpoint,
+)
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True)
+class InferenceJob:
+    variant: str
+    bucket_id: str
+    gpu_id: str
+    sample_indices: tuple[int, ...]
+    config_path: str
+    log_path: str
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--merged-checkpoint", required=True)
+    parser.add_argument(
+        "--merged-manifest",
+        required=True,
+        help="Companion merge manifest proving the pre-merged checkpoint provenance.",
+    )
+    parser.add_argument(
+        "--base-checkpoint",
+        required=True,
+        help="Immutable causal base used by the dynamic LoRA inference path.",
+    )
+    parser.add_argument(
+        "--training-checkpoint",
+        required=True,
+        help="Stage-1 checkpoint_model_XXXXXX containing adapter_ema.safetensors.",
+    )
     parser.add_argument(
         "--reference-checkpoint-dir",
         required=True,
@@ -58,6 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--metadata", required=True)
     parser.add_argument(
+        "--gpu-ids",
+        default="0,1,2,3",
+        help="Comma-separated physical GPU ids; four H100s are recommended.",
+    )
+    parser.add_argument(
         "--work-dir",
         required=True,
         help="A new or empty directory. Existing results are never overwritten.",
@@ -66,6 +103,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-frame-std", type=float, default=5.0)
     parser.add_argument("--minimum-temporal-abs-diff", type=float, default=0.05)
     return parser
+
+
+def _parse_gpu_ids(value: str) -> tuple[str, ...]:
+    gpu_ids = tuple(piece.strip() for piece in str(value).split(","))
+    if not gpu_ids or any(not gpu_id for gpu_id in gpu_ids):
+        raise ValueError("--gpu-ids must be a comma-separated non-empty list")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError(f"--gpu-ids contains duplicates: {gpu_ids}")
+    return gpu_ids
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -138,6 +184,80 @@ def _assert_metadata_matches_reference(
     return records
 
 
+def validate_merged_checkpoint_provenance(
+    *,
+    merged_checkpoint: str | os.PathLike[str],
+    merged_manifest_path: str | os.PathLike[str],
+    base_sha256: str,
+    training_manifest_sha256: str,
+    training_step: int,
+    adapter_sha256: str,
+) -> dict[str, Any]:
+    """Prove that the full checkpoint was merged from this base and EMA LoRA."""
+
+    merged_checkpoint = Path(merged_checkpoint).expanduser().resolve()
+    merged_manifest_path = Path(merged_manifest_path).expanduser().resolve()
+    if not merged_checkpoint.is_file():
+        raise FileNotFoundError(merged_checkpoint)
+    if not merged_manifest_path.is_file():
+        raise FileNotFoundError(merged_manifest_path)
+    manifest = _load_json(merged_manifest_path)
+    recorded_manifest_sha256 = manifest.get("manifest_sha256")
+    unhashed = {
+        key: value for key, value in manifest.items() if key != "manifest_sha256"
+    }
+    actual_manifest_sha256 = canonical_json_sha256(unhashed)
+    if recorded_manifest_sha256 != actual_manifest_sha256:
+        raise RuntimeError("Merged checkpoint manifest SHA256 is invalid")
+    if manifest.get("schema") != "longlive_stage1_merge_manifest" or int(
+        manifest.get("schema_version", -1)
+    ) != 2:
+        raise RuntimeError("Unsupported Stage-1 merged checkpoint manifest")
+
+    output = manifest.get("output", {})
+    training = manifest.get("training_checkpoint", {})
+    expected = {
+        "base.sha256": base_sha256,
+        "training.completed_step": int(training_step),
+        "training.manifest_sha256": training_manifest_sha256,
+        "training.adapter": "adapter_ema.safetensors",
+        "training.ema_adapter.sha256": adapter_sha256,
+        "output.sha256": sha256_file(merged_checkpoint),
+        "output.size": merged_checkpoint.stat().st_size,
+        "output.dtype": "bfloat16",
+        "output.strict_reload": True,
+    }
+    actual = {
+        "base.sha256": manifest.get("base", {}).get("sha256"),
+        "training.completed_step": training.get("completed_step"),
+        "training.manifest_sha256": training.get("manifest_sha256"),
+        "training.adapter": training.get("adapter"),
+        "training.ema_adapter.sha256": training.get("ema_adapter", {}).get(
+            "sha256"
+        ),
+        "output.sha256": output.get("sha256"),
+        "output.size": output.get("size"),
+        "output.dtype": output.get("dtype"),
+        "output.strict_reload": output.get("strict_reload"),
+    }
+    wrong = {
+        key: {"expected": value, "actual": actual[key]}
+        for key, value in expected.items()
+        if actual[key] != value
+    }
+    if wrong:
+        raise RuntimeError(f"Merged checkpoint provenance mismatch: {wrong}")
+    return {
+        "path": os.fspath(merged_checkpoint),
+        "sha256": expected["output.sha256"],
+        "size": expected["output.size"],
+        "manifest_path": os.fspath(merged_manifest_path),
+        "manifest_sha256": recorded_manifest_sha256,
+        "source_training_step": int(training_step),
+        "source_adapter": "adapter_ema.safetensors",
+    }
+
+
 def _assert_reference_config_contract(
     config_path: Path,
     *,
@@ -191,21 +311,36 @@ def _assert_reference_config_contract(
         raise RuntimeError(f"Reference inference config/manifest mismatch: {wrong}")
 
 
-def clone_reference_preparation(
+def _clone_reference_variant(
     *,
     reference_manifest_path: str | os.PathLike[str],
-    merged_checkpoint: str | os.PathLike[str],
+    generator_checkpoint: str | os.PathLike[str],
     output_root: str | os.PathLike[str],
+    variant: str,
+    output_model_type: str,
+    adapter_config: Any | None = None,
+    lora_checkpoint: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
-    """Clone reference configs while changing only checkpoint/output paths."""
+    """Clone one reference-prepared dataset for a checkpoint loading variant."""
 
     reference_manifest_path = Path(reference_manifest_path).expanduser().resolve()
-    merged_checkpoint = Path(merged_checkpoint).expanduser().resolve()
+    generator_checkpoint = Path(generator_checkpoint).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
     if not reference_manifest_path.is_file():
         raise FileNotFoundError(reference_manifest_path)
-    if not merged_checkpoint.is_file():
-        raise FileNotFoundError(merged_checkpoint)
+    if not generator_checkpoint.is_file():
+        raise FileNotFoundError(generator_checkpoint)
+    lora_path = (
+        None
+        if lora_checkpoint is None
+        else Path(lora_checkpoint).expanduser().resolve()
+    )
+    if (adapter_config is None) != (lora_path is None):
+        raise ValueError("adapter_config and lora_checkpoint must be provided together")
+    if lora_path is not None and not lora_path.is_file():
+        raise FileNotFoundError(lora_path)
+    if variant not in {"premerged", "dynamic_lora"}:
+        raise ValueError(f"Unsupported inference variant: {variant!r}")
     if output_root.exists() and any(output_root.iterdir()):
         raise FileExistsError(
             f"Merged inference directory must be empty: {output_root}"
@@ -217,7 +352,14 @@ def clone_reference_preparation(
     cloned = deepcopy(reference)
     cloned.pop("manifest_sha256", None)
     cloned["reference_prepared_manifest"] = os.fspath(reference_manifest_path)
-    cloned["model_paths"]["base_checkpoint"] = os.fspath(merged_checkpoint)
+    cloned["model_paths"]["base_checkpoint"] = os.fspath(generator_checkpoint)
+    cloned["inference_variant"] = {
+        "name": variant,
+        "generator_checkpoint": os.fspath(generator_checkpoint),
+        "lora_checkpoint": None if lora_path is None else os.fspath(lora_path),
+        "output_model_type": output_model_type,
+    }
+    base_seed = int(reference["sampling"]["seed"])
 
     for bucket in cloned["buckets"]:
         bucket_id = str(bucket["bucket_id"])
@@ -245,13 +387,29 @@ def clone_reference_preparation(
             )
         if config.get("checkpoints", None) is None:
             config.checkpoints = OmegaConf.create({})
-        config.checkpoints.generator_ckpt = os.fspath(merged_checkpoint)
+        config.checkpoints.generator_ckpt = os.fspath(generator_checkpoint)
         config.checkpoints.pop("lora_ckpt", None)
-        config.generator_ckpt = os.fspath(merged_checkpoint)
+        config.generator_ckpt = os.fspath(generator_checkpoint)
         config.pop("lora_ckpt", None)
         config.use_ema = False
         config.num_samples = 1
         config.save_with_index = True
+        config.merge_lora = False
+
+        if lora_path is None:
+            config.pop("adapter", None)
+        else:
+            config.adapter = OmegaConf.create(
+                OmegaConf.to_container(adapter_config, resolve=True)
+                if OmegaConf.is_config(adapter_config)
+                else deepcopy(adapter_config)
+            )
+            config.checkpoints.lora_ckpt = os.fspath(lora_path)
+            config.lora_ckpt = os.fspath(lora_path)
+
+        sample_seeds = [
+            base_seed + int(record["row_id"]) for record in bucket["records"]
+        ]
 
         output_dir = output_root / "videos" / bucket_id
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +417,20 @@ def clone_reference_preparation(
         if config.get("inference", None) is not None:
             config.inference.output_folder = os.fspath(output_dir)
             config.inference.use_ema = False
+            config.inference.merge_lora = False
+            config.inference.sample_seeds = sample_seeds
+            config.inference.dataloader_num_workers = 1
+            config.inference.prefetch_factor = 2
+            config.inference.pin_memory = True
+        else:
+            config.inference = OmegaConf.create(
+                {
+                    "sample_seeds": sample_seeds,
+                    "dataloader_num_workers": 1,
+                    "prefetch_factor": 2,
+                    "pin_memory": True,
+                }
+            )
 
         config_path = output_root / "configs" / f"{bucket_id}.yaml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,10 +439,230 @@ def clone_reference_preparation(
         bucket["reference_config_path"] = os.fspath(source_config_path)
         bucket["config_path"] = os.fspath(config_path)
         bucket["output_dir"] = os.fspath(output_dir)
+        bucket["output_model_type"] = output_model_type
+        bucket["sample_seeds"] = sample_seeds
 
     cloned["manifest_sha256"] = canonical_json_sha256(cloned)
     atomic_write_json(output_root / "prepared_manifest.json", cloned)
     return cloned
+
+
+def clone_reference_preparation(
+    *,
+    reference_manifest_path: str | os.PathLike[str],
+    merged_checkpoint: str | os.PathLike[str],
+    output_root: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Clone reference inputs for a pre-merged full-generator checkpoint."""
+
+    return _clone_reference_variant(
+        reference_manifest_path=reference_manifest_path,
+        generator_checkpoint=merged_checkpoint,
+        output_root=output_root,
+        variant="premerged",
+        output_model_type="regular",
+    )
+
+
+def clone_reference_lora_preparation(
+    *,
+    reference_manifest_path: str | os.PathLike[str],
+    base_checkpoint: str | os.PathLike[str],
+    lora_checkpoint: str | os.PathLike[str],
+    adapter_config: Any,
+    output_root: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Clone reference inputs for runtime ``base + LoRA`` inference."""
+
+    return _clone_reference_variant(
+        reference_manifest_path=reference_manifest_path,
+        generator_checkpoint=base_checkpoint,
+        lora_checkpoint=lora_checkpoint,
+        adapter_config=adapter_config,
+        output_root=output_root,
+        variant="dynamic_lora",
+        output_model_type="lora",
+    )
+
+
+def _allocate_bucket_workers(
+    sample_counts: list[int],
+    worker_budget: int,
+) -> list[int]:
+    if not sample_counts or any(count <= 0 for count in sample_counts):
+        raise ValueError(f"Bucket sample counts must be positive: {sample_counts}")
+    if worker_budget < len(sample_counts):
+        raise ValueError(
+            f"At least {len(sample_counts)} GPUs are required for the geometry buckets"
+        )
+    worker_budget = min(int(worker_budget), sum(sample_counts))
+    workers = [1] * len(sample_counts)
+    while sum(workers) < worker_budget:
+        candidates = [
+            index
+            for index, count in enumerate(sample_counts)
+            if workers[index] < count
+        ]
+        if not candidates:
+            break
+        selected = max(
+            candidates,
+            key=lambda index: (sample_counts[index] / workers[index], -index),
+        )
+        workers[selected] += 1
+    return workers
+
+
+def build_parallel_inference_jobs(
+    prepared_manifest_path: str | os.PathLike[str],
+    *,
+    gpu_ids: tuple[str, ...],
+) -> list[InferenceJob]:
+    """Shard each fixed-geometry bucket over independent single-GPU workers."""
+
+    prepared_manifest_path = Path(prepared_manifest_path).expanduser().resolve()
+    manifest = _load_json(prepared_manifest_path)
+    _assert_reference_manifest_integrity(manifest)
+    buckets = manifest["buckets"]
+    counts = [len(bucket["records"]) for bucket in buckets]
+    worker_counts = _allocate_bucket_workers(counts, len(gpu_ids))
+    output_root = prepared_manifest_path.parent
+    variant = str(manifest["inference_variant"]["name"])
+    jobs: list[InferenceJob] = []
+    gpu_cursor = 0
+
+    for bucket, sample_count, worker_count in zip(
+        buckets, counts, worker_counts, strict=True
+    ):
+        bucket_id = str(bucket["bucket_id"])
+        source_config = OmegaConf.load(bucket["config_path"])
+        for worker_index in range(worker_count):
+            sample_indices = tuple(range(worker_index, sample_count, worker_count))
+            gpu_id = gpu_ids[gpu_cursor]
+            gpu_cursor += 1
+            config = OmegaConf.create(
+                OmegaConf.to_container(source_config, resolve=False)
+            )
+            if config.get("inference", None) is None:
+                config.inference = OmegaConf.create({})
+            config.inference.sample_indices = list(sample_indices)
+            worker_name = f"{bucket_id}_gpu{gpu_id}_worker{worker_index}"
+            config_path = output_root / "configs" / "workers" / f"{worker_name}.yaml"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(
+                config_path,
+                OmegaConf.to_yaml(config, resolve=False, sort_keys=False).encode(
+                    "utf-8"
+                ),
+            )
+            jobs.append(
+                InferenceJob(
+                    variant=variant,
+                    bucket_id=bucket_id,
+                    gpu_id=gpu_id,
+                    sample_indices=sample_indices,
+                    config_path=os.fspath(config_path),
+                    log_path=os.fspath(
+                        output_root / "logs" / f"{worker_name}.log"
+                    ),
+                )
+            )
+    if gpu_cursor != len(jobs) or len({job.gpu_id for job in jobs}) != len(jobs):
+        raise RuntimeError("Parallel inference jobs did not receive unique GPUs")
+    expected = {
+        (str(bucket["bucket_id"]), index)
+        for bucket in buckets
+        for index in range(len(bucket["records"]))
+    }
+    actual = {
+        (job.bucket_id, index) for job in jobs for index in job.sample_indices
+    }
+    if actual != expected or sum(len(job.sample_indices) for job in jobs) != len(
+        expected
+    ):
+        raise RuntimeError(
+            f"Parallel inference sharding is incomplete or duplicated: "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+        )
+    return jobs
+
+
+def run_parallel_inference_jobs(
+    jobs: list[InferenceJob],
+    *,
+    command_runner: Callable[..., Any] = subprocess.run,
+) -> list[dict[str, Any]]:
+    """Run one independent model process per GPU and preserve per-worker logs."""
+
+    if not jobs:
+        raise ValueError("At least one inference job is required")
+
+    def run_job(job: InferenceJob) -> dict[str, Any]:
+        env = os.environ.copy()
+        for name in (
+            "LOCAL_RANK",
+            "RANK",
+            "WORLD_SIZE",
+            "LOCAL_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+        ):
+            env.pop(name, None)
+        env.update(
+            {
+                "CUDA_VISIBLE_DEVICES": job.gpu_id,
+                "PYTHONUNBUFFERED": "1",
+                "TOKENIZERS_PARALLELISM": "false",
+            }
+        )
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        command = [
+            sys.executable,
+            os.fspath(PROJECT_ROOT / "inference.py"),
+            "--config_path",
+            job.config_path,
+        ]
+        log_path = Path(job.log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        print(
+            f"[stage1-format-comparison] variant={job.variant} gpu={job.gpu_id} "
+            f"bucket={job.bucket_id} indices={list(job.sample_indices)}"
+        )
+        with log_path.open("wb") as log_handle:
+            command_runner(
+                command,
+                cwd=PROJECT_ROOT,
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                check=True,
+            )
+        return {
+            **asdict(job),
+            "elapsed_seconds": time.monotonic() - started,
+            "status": "pass",
+        }
+
+    reports: list[dict[str, Any]] = []
+    failures = []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = {executor.submit(run_job, job): job for job in jobs}
+        for future in as_completed(futures):
+            job = futures[future]
+            try:
+                reports.append(future.result())
+            except Exception as exc:
+                failures.append(
+                    {
+                        **asdict(job),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    if failures:
+        raise RuntimeError(f"Parallel inference workers failed: {failures}")
+    return sorted(reports, key=lambda item: (item["gpu_id"], item["bucket_id"]))
 
 
 def write_side_by_side_video(
@@ -369,20 +761,33 @@ video{display:block;max-width:100%;max-height:640px;background:#111}.meta{font-s
     lines = [
         "<!doctype html>",
         '<html lang="zh-CN"><head><meta charset="utf-8">',
-        f"<title>Stage-1 merged checkpoint comparison</title><style>{style}</style></head><body>",
-        "<h1>Stage-1 merged checkpoint comparison</h1>",
-        "<p><strong>左侧：</strong>原 infer_stage1 结果；<strong>右侧：</strong>当前 merged checkpoint 结果。</p>",
+        f"<title>Stage-1 merged vs dynamic LoRA</title><style>{style}</style></head><body>",
+        "<h1>Stage-1 merged vs dynamic LoRA</h1>",
+        "<p><strong>并排视频左侧：</strong>预 merged 完整权重；"
+        "<strong>右侧：</strong>base + adapter_ema.safetensors 动态 LoRA。"
+        "两路使用相同的逐 row noise seed。</p>",
+        "<p>原 infer_stage1 视频仅作为历史参考单独展示；其旧版顺序 RNG 不参与两种权重格式的严格等价判断。</p>",
     ]
     for sample in samples:
         video_path = Path(sample["comparison_video"]).resolve()
         relative = video_path.relative_to(work_dir).as_posix()
         source = quote(relative, safe="/._-")
+        reference_path = Path(sample["reference_video"]).resolve()
+        try:
+            reference_source_path = reference_path.relative_to(work_dir).as_posix()
+        except ValueError:
+            reference_source_path = os.fspath(reference_path)
+        reference_source = quote(reference_source_path, safe="/._-")
         lines.extend(
             [
                 '<section class="case">',
-                f"<h2>row {int(sample['row_id'])} · {html.escape(sample['bucket_id'])}</h2>",
+                f"<h2>row {int(sample['row_id'])} · "
+                f"{html.escape(sample['bucket_id'])} · seed {int(sample['sample_seed'])}</h2>",
                 f'<video controls loop preload="metadata" src="{html.escape(source)}"></video>',
-                '<p class="meta">left = infer_stage1 reference · right = merged checkpoint</p>',
+                '<p class="meta">left = pre-merged checkpoint · right = dynamic LoRA</p>',
+                "<details><summary>原 infer_stage1 历史参考</summary>",
+                f'<video controls loop preload="metadata" src="{html.escape(reference_source)}"></video>',
+                "</details>",
                 "</section>",
             ]
         )
@@ -398,19 +803,70 @@ def run_comparison(
     pair_writer: Callable[..., dict[str, Any]] = write_side_by_side_video,
 ) -> dict[str, Any]:
     merged_checkpoint = Path(args.merged_checkpoint).expanduser().resolve()
+    merged_manifest_path = Path(args.merged_manifest).expanduser().resolve()
+    base_checkpoint = Path(args.base_checkpoint).expanduser().resolve()
+    training_checkpoint = Path(args.training_checkpoint).expanduser().resolve()
     reference_dir = Path(args.reference_checkpoint_dir).expanduser().resolve()
     metadata_path = Path(args.metadata).expanduser().resolve()
     work_dir = Path(args.work_dir).expanduser().resolve()
+    gpu_ids = _parse_gpu_ids(args.gpu_ids)
+    if len(gpu_ids) != 4:
+        raise ValueError(
+            "This comparison requires exactly four GPUs: one per "
+            "(checkpoint format, geometry bucket) worker"
+        )
     reference_manifest_path = reference_dir / "prepared" / "prepared_manifest.json"
     merged_inference_root = work_dir / "merged_inference"
+    lora_inference_root = work_dir / "lora_inference"
     report_path = work_dir / "comparison_report.json"
 
     if not merged_checkpoint.is_file():
         raise FileNotFoundError(merged_checkpoint)
+    if not merged_manifest_path.is_file():
+        raise FileNotFoundError(merged_manifest_path)
+    if not base_checkpoint.is_file():
+        raise FileNotFoundError(base_checkpoint)
+    if not training_checkpoint.is_dir():
+        raise FileNotFoundError(training_checkpoint)
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
     if not metadata_path.is_file():
         raise FileNotFoundError(metadata_path)
+    reference_step = checkpoint_step(reference_dir)
+    training_step = checkpoint_step(training_checkpoint)
+    if reference_step != training_step:
+        raise RuntimeError(
+            "Reference and dynamic LoRA checkpoints select different optimizer steps: "
+            f"reference={reference_step}, training={training_step}"
+        )
+    base_sha256 = sha256_file(base_checkpoint)
+    training_manifest = validate_checkpoint(
+        training_checkpoint,
+        require_resumable=False,
+        expected_base_sha256=base_sha256,
+        expected_topology=(6, 3, 2),
+    )
+    resolved_training_config_path = training_checkpoint / "resolved_config.yaml"
+    resolved_training_config = normalize_config(
+        OmegaConf.load(resolved_training_config_path)
+    )
+    adapter_config = getattr(resolved_training_config, "adapter", None)
+    if adapter_config is None:
+        raise RuntimeError(
+            f"Stage-1 training config has no adapter section: {resolved_training_config_path}"
+        )
+    lora_checkpoint = training_checkpoint / "adapter_ema.safetensors"
+    if not lora_checkpoint.is_file():
+        raise FileNotFoundError(lora_checkpoint)
+    adapter_sha256 = sha256_file(lora_checkpoint)
+    merged_provenance = validate_merged_checkpoint_provenance(
+        merged_checkpoint=merged_checkpoint,
+        merged_manifest_path=merged_manifest_path,
+        base_sha256=base_sha256,
+        training_manifest_sha256=training_manifest["manifest_sha256"],
+        training_step=training_step,
+        adapter_sha256=adapter_sha256,
+    )
     if work_dir == reference_dir or work_dir.is_relative_to(reference_dir):
         raise ValueError(
             "Work directory must be outside the immutable reference result"
@@ -422,16 +878,29 @@ def run_comparison(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     report: dict[str, Any] = {
-        "schema": "longlive_stage1_premerged_reference_comparison",
+        "schema": "longlive_stage1_premerged_dynamic_lora_comparison",
         "schema_version": REPORT_SCHEMA_VERSION,
         "status": "initializing",
         "work_dir": os.fspath(work_dir),
         "metadata": os.fspath(metadata_path),
-        "merged_checkpoint": os.fspath(merged_checkpoint),
+        "merged_checkpoint": merged_provenance,
+        "base_checkpoint": {
+            "path": os.fspath(base_checkpoint),
+            "sha256": base_sha256,
+        },
+        "dynamic_lora": {
+            "training_checkpoint": os.fspath(training_checkpoint),
+            "optimizer_step": training_step,
+            "adapter_checkpoint": os.fspath(lora_checkpoint),
+            "adapter_sha256": adapter_sha256,
+            "checkpoint_manifest_sha256": training_manifest["manifest_sha256"],
+        },
         "reference_checkpoint_dir": os.fspath(reference_dir),
+        "gpu_ids": list(gpu_ids),
+        "execution": "four_concurrent_single_gpu_format_bucket_workers",
         "side_by_side_order": {
-            "left": "infer_stage1_reference",
-            "right": "premerged_checkpoint",
+            "left": "premerged_checkpoint",
+            "right": "dynamic_lora",
         },
     }
     atomic_write_json(report_path, report)
@@ -469,24 +938,53 @@ def run_comparison(
             merged_checkpoint=merged_checkpoint,
             output_root=merged_inference_root,
         )
+        lora_manifest = clone_reference_lora_preparation(
+            reference_manifest_path=reference_manifest_path,
+            base_checkpoint=base_checkpoint,
+            lora_checkpoint=lora_checkpoint,
+            adapter_config=adapter_config,
+            output_root=lora_inference_root,
+        )
 
-        report["status"] = "inferencing_merged_checkpoint"
-        atomic_write_json(report_path, report)
-        for bucket in cloned_manifest["buckets"]:
-            report["active_bucket"] = bucket["bucket_id"]
-            atomic_write_json(report_path, report)
-            command = [
-                sys.executable,
-                os.fspath(PROJECT_ROOT / "inference.py"),
-                "--config_path",
-                bucket["config_path"],
-            ]
-            print(
-                f"[stage1-merged-comparison] bucket={bucket['bucket_id']}: "
-                f"{' '.join(command)}"
+        if len(cloned_manifest["buckets"]) != 2 or len(lora_manifest["buckets"]) != 2:
+            raise RuntimeError(
+                "The optimized four-GPU comparison expects exactly two geometry buckets"
             )
-            command_runner(command, cwd=PROJECT_ROOT, check=True)
-        report.pop("active_bucket", None)
+        merged_jobs = build_parallel_inference_jobs(
+            merged_inference_root / "prepared_manifest.json",
+            gpu_ids=gpu_ids[:2],
+        )
+        lora_jobs = build_parallel_inference_jobs(
+            lora_inference_root / "prepared_manifest.json",
+            gpu_ids=gpu_ids[2:],
+        )
+        all_jobs = merged_jobs + lora_jobs
+        if len(all_jobs) != 4:
+            raise RuntimeError(
+                f"Expected four format/bucket workers, built {len(all_jobs)}"
+            )
+        report["status"] = "inferencing_premerged_and_dynamic_lora"
+        report["active_variants"] = ["premerged", "dynamic_lora"]
+        report["gpu_assignment"] = {
+            job.gpu_id: {
+                "variant": job.variant,
+                "bucket_id": job.bucket_id,
+                "sample_indices": list(job.sample_indices),
+            }
+            for job in all_jobs
+        }
+        atomic_write_json(report_path, report)
+        worker_reports = run_parallel_inference_jobs(
+            all_jobs,
+            command_runner=command_runner,
+        )
+        report["merged_jobs"] = [
+            item for item in worker_reports if item["variant"] == "premerged"
+        ]
+        report["lora_jobs"] = [
+            item for item in worker_reports if item["variant"] == "dynamic_lora"
+        ]
+        report.pop("active_variants", None)
 
         report["status"] = "validating_merged_outputs"
         atomic_write_json(report_path, report)
@@ -496,21 +994,54 @@ def run_comparison(
         atomic_write_json(merged_output_validation_path, merged_outputs)
         report["merged_output_validation"] = os.fspath(merged_output_validation_path)
 
+        report["status"] = "validating_lora_outputs"
+        atomic_write_json(report_path, report)
+        lora_manifest_path = lora_inference_root / "prepared_manifest.json"
+        lora_outputs = output_validator(lora_manifest_path, **validator_kwargs)
+        lora_output_validation_path = work_dir / "lora_output_validation.json"
+        atomic_write_json(lora_output_validation_path, lora_outputs)
+        report["lora_output_validation"] = os.fspath(lora_output_validation_path)
+
         reference_by_row = {
             int(sample["row_id"]): sample for sample in reference_outputs["samples"]
         }
         merged_by_row = {
             int(sample["row_id"]): sample for sample in merged_outputs["samples"]
         }
+        lora_by_row = {
+            int(sample["row_id"]): sample for sample in lora_outputs["samples"]
+        }
         expected_rows = {record.row_id for record in records}
         if (
             set(reference_by_row) != expected_rows
             or set(merged_by_row) != expected_rows
+            or set(lora_by_row) != expected_rows
         ):
             raise RuntimeError(
                 "Validated output row sets are incomplete: "
                 f"expected={sorted(expected_rows)}, "
-                f"reference={sorted(reference_by_row)}, merged={sorted(merged_by_row)}"
+                f"reference={sorted(reference_by_row)}, "
+                f"merged={sorted(merged_by_row)}, lora={sorted(lora_by_row)}"
+            )
+
+        merged_seed_by_row = {
+            int(record["row_id"]): int(seed)
+            for bucket in cloned_manifest["buckets"]
+            for record, seed in zip(
+                bucket["records"], bucket["sample_seeds"], strict=True
+            )
+        }
+        lora_seed_by_row = {
+            int(record["row_id"]): int(seed)
+            for bucket in lora_manifest["buckets"]
+            for record, seed in zip(
+                bucket["records"], bucket["sample_seeds"], strict=True
+            )
+        }
+        if merged_seed_by_row != lora_seed_by_row or set(merged_seed_by_row) != expected_rows:
+            raise RuntimeError(
+                "Merged and dynamic LoRA sample seed mappings differ: "
+                f"merged={merged_seed_by_row}, lora={lora_seed_by_row}"
             )
 
         report["status"] = "pairing_videos"
@@ -518,11 +1049,12 @@ def run_comparison(
         comparisons_dir = work_dir / "side_by_side"
         samples = []
         for record in records:
-            left = Path(reference_by_row[record.row_id]["output_video"])
-            right = Path(merged_by_row[record.row_id]["output_video"])
+            reference = Path(reference_by_row[record.row_id]["output_video"])
+            left = Path(merged_by_row[record.row_id]["output_video"])
+            right = Path(lora_by_row[record.row_id]["output_video"])
             output = comparisons_dir / (
                 f"row{record.row_id:04d}_{record.bucket_id}_"
-                "infer-stage1-left_merged-right.mp4"
+                "premerged-left_dynamic-lora-right.mp4"
             )
             stream = pair_writer(
                 left,
@@ -535,8 +1067,10 @@ def run_comparison(
                     "row_id": record.row_id,
                     "bucket_id": record.bucket_id,
                     "prompt": record.prompt,
-                    "left_reference_video": os.fspath(left.resolve()),
-                    "right_merged_video": os.fspath(right.resolve()),
+                    "sample_seed": merged_seed_by_row[record.row_id],
+                    "reference_video": os.fspath(reference.resolve()),
+                    "left_premerged_video": os.fspath(left.resolve()),
+                    "right_dynamic_lora_video": os.fspath(right.resolve()),
                     "comparison_video": os.fspath(output.resolve()),
                     "comparison_sha256": sha256_file(output),
                     "stream": stream,
@@ -559,7 +1093,7 @@ def run_comparison(
         atomic_write_json(report_path, report)
         return report
     except Exception as exc:
-        report.pop("active_bucket", None)
+        report.pop("active_variants", None)
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
         atomic_write_json(report_path, report)

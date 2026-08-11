@@ -14,10 +14,11 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 from einops import rearrange
+from torch.utils.data import Sampler
 
 from utils.nvfp4_checkpoint import (
     clean_fsdp_state_dict_keys,
@@ -56,6 +57,124 @@ def _load_lora_state_dict(lora_ckpt_path: str) -> Mapping[str, torch.Tensor]:
     return checkpoint
 
 
+class ExplicitIndexSampler(Sampler[int]):
+    """Iterate an explicit, validated subset without padding or duplication."""
+
+    def __init__(self, indices: Sequence[int]) -> None:
+        self._indices = tuple(int(index) for index in indices)
+
+    def __iter__(self):
+        return iter(self._indices)
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
+def resolve_inference_sample_indices(
+    value: Any,
+    *,
+    dataset_size: int,
+) -> tuple[int, ...]:
+    """Validate an optional per-process sample shard against a dataset size."""
+
+    dataset_size = int(dataset_size)
+    if dataset_size <= 0:
+        raise ValueError("inference dataset must contain at least one sample")
+    if value is None:
+        return tuple(range(dataset_size))
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("inference.sample_indices must be a sequence of integers")
+    if not value:
+        raise ValueError("inference.sample_indices must not be empty")
+    indices = []
+    for raw_index in value:
+        if isinstance(raw_index, bool):
+            raise TypeError("inference sample indices must be integers, not booleans")
+        index = int(raw_index)
+        if index != raw_index:
+            raise TypeError(f"inference sample index is not an integer: {raw_index!r}")
+        if index < 0 or index >= dataset_size:
+            raise ValueError(
+                f"inference sample index {index} is outside [0, {dataset_size})"
+            )
+        indices.append(index)
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"inference.sample_indices contains duplicates: {indices}")
+    return tuple(indices)
+
+
+def resolve_inference_sample_seeds(
+    value: Any,
+    *,
+    dataset_size: int,
+) -> tuple[int, ...] | None:
+    """Validate stable per-dataset-index seeds used by parallel inference."""
+
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("inference.sample_seeds must be a sequence of integers")
+    if len(value) != int(dataset_size):
+        raise ValueError(
+            "inference.sample_seeds must have one entry per dataset sample: "
+            f"expected={dataset_size}, actual={len(value)}"
+        )
+    seeds = []
+    for raw_seed in value:
+        if isinstance(raw_seed, bool):
+            raise TypeError("inference sample seeds must be integers, not booleans")
+        seed = int(raw_seed)
+        if seed != raw_seed or seed < 0:
+            raise ValueError(
+                f"inference sample seed must be a non-negative integer: {raw_seed!r}"
+            )
+        seeds.append(seed)
+    return tuple(seeds)
+
+
+def load_inference_lora_checkpoint(
+    lora_model: torch.nn.Module,
+    lora_ckpt_path: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Load Stage-1 safetensors strictly while preserving legacy ``.pt`` support."""
+
+    path = Path(lora_ckpt_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() == ".safetensors":
+        from utils.lora_utils import load_lora_safetensors_strict
+
+        state = load_lora_safetensors_strict(
+            lora_model,
+            path,
+            expected_dtype=torch.float32,
+            require_finite=True,
+            verify_tensors=True,
+        )
+        return {
+            "format": "safetensors",
+            "path": os.fspath(path),
+            "tensor_count": len(state),
+        }
+
+    import peft
+
+    state = _load_lora_state_dict(os.fspath(path))
+    incompatible = peft.set_peft_model_state_dict(lora_model, state)
+    mismatched = list(getattr(incompatible, "mismatched_keys", []) or [])
+    unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+    if mismatched or unexpected:
+        raise ValueError(
+            "PEFT rejected inference adapter tensors: "
+            f"mismatched={mismatched}, unexpected={unexpected}"
+        )
+    return {
+        "format": "torch",
+        "path": os.fspath(path),
+        "tensor_count": len(state),
+    }
+
+
 def apply_and_merge_lora(
     pipeline,
     config,
@@ -78,7 +197,6 @@ def apply_and_merge_lora(
     if adapter_cfg is None or not lora_ckpt:
         return False
 
-    import peft
     from utils.lora_utils import configure_lora_for_model
 
     if device is not None:
@@ -97,8 +215,7 @@ def apply_and_merge_lora(
 
     if verbose:
         print(f"[LoRA] Loading LoRA weights from: {lora_ckpt}")
-    lora_state = _load_lora_state_dict(lora_ckpt)
-    peft.set_peft_model_state_dict(pipeline.generator.model, lora_state)  # type: ignore[arg-type]
+    load_inference_lora_checkpoint(pipeline.generator.model, lora_ckpt)
 
     if verbose:
         print("[LoRA] Merging LoRA delta into base weights (merge_and_unload)...")

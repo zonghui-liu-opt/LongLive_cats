@@ -817,8 +817,15 @@ def validate_causal_testset_outputs(
     samples = []
     for bucket in manifest["buckets"]:
         output_dir = Path(bucket["output_dir"])
+        output_model_type = str(bucket.get("output_model_type", "regular"))
+        if output_model_type not in {"regular", "lora", "ema"}:
+            raise RuntimeError(
+                f"unsupported output_model_type for {bucket['bucket_id']}: "
+                f"{output_model_type!r}"
+            )
         expected_names = {
-            f"rank0-{record['bucket_index']}-0_regular.mp4" for record in bucket["records"]
+            f"rank0-{record['bucket_index']}-0_{output_model_type}.mp4"
+            for record in bucket["records"]
         }
         actual_names = {path.name for path in output_dir.glob("*.mp4")}
         if actual_names != expected_names:
@@ -828,7 +835,9 @@ def validate_causal_testset_outputs(
                 f"unexpected={sorted(actual_names - expected_names)}"
             )
         for record in bucket["records"]:
-            video_path = output_dir / f"rank0-{record['bucket_index']}-0_regular.mp4"
+            video_path = output_dir / (
+                f"rank0-{record['bucket_index']}-0_{output_model_type}.mp4"
+            )
             gate = validate_causal_video_output(
                 video_path,
                 record["input_image"],

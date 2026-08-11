@@ -41,7 +41,7 @@ from tqdm import tqdm
 from torchvision.io import write_video
 from einops import rearrange
 import torch.distributed as dist
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from pipeline import CausalDiffusionInferencePipeline
@@ -65,6 +65,13 @@ from utils.nvfp4_checkpoint import (
 )
 
 from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
+from utils.inference_utils import (
+    ExplicitIndexSampler,
+    load_inference_lora_checkpoint,
+    resolve_inference_sample_indices,
+    resolve_inference_sample_seeds,
+)
+from utils.lora_utils import configure_lora_for_model
 
 
 def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_process: bool):
@@ -288,15 +295,15 @@ print(f'Free VRAM {get_cuda_free_memory_gb(device)} GB')
 low_memory = get_cuda_free_memory_gb(device) < 40
 
 torch.set_grad_enabled(False)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 
 # Initialize pipeline
 pipeline = CausalDiffusionInferencePipeline(config, device=device)
 
 # --------------------------- LoRA support (optional) ---------------------------
-from utils.lora_utils import configure_lora_for_model
-import peft
-
 merge_lora = bool(getattr(config, "merge_lora", False))
 has_lora_adapter = bool(getattr(config, "adapter", None) and configure_lora_for_model is not None)
 if has_lora_adapter and (
@@ -417,17 +424,21 @@ if has_lora_adapter:
     if lora_ckpt_path:
         if local_rank == 0:
             print(f"Loading LoRA weights from lora_ckpt: {lora_ckpt_path}")
-        lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
-        if isinstance(lora_checkpoint, dict) and "generator_lora" in lora_checkpoint:
-            peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint["generator_lora"])  # type: ignore
-        else:
-            peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint)  # type: ignore
+        lora_load_report = load_inference_lora_checkpoint(
+            pipeline.generator.model,
+            lora_ckpt_path,
+        )
         if local_rank == 0:
-            print("LoRA weights loaded for generator")
+            print(f"LoRA weights loaded for generator: {lora_load_report}")
     elif generator_lora_state is not None:
         if local_rank == 0:
             print(f"Loading LoRA weights from generator_ckpt: {generator_ckpt_path}")
-        peft.set_peft_model_state_dict(pipeline.generator.model, generator_lora_state)  # type: ignore
+        import peft
+
+        peft.set_peft_model_state_dict(
+            pipeline.generator.model,
+            generator_lora_state,
+        )
         if local_rank == 0:
             print("LoRA weights loaded for generator")
     else:
@@ -581,12 +592,50 @@ if local_rank == 0:
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
+sample_indices = resolve_inference_sample_indices(
+    getattr(config, "sample_indices", None),
+    dataset_size=num_prompts,
+)
+sample_seeds = resolve_inference_sample_seeds(
+    getattr(config, "sample_seeds", None),
+    dataset_size=num_prompts,
+)
+if local_rank == 0:
+    print(
+        f"[data] selected_indices={list(sample_indices)}, "
+        f"sample_seeds={None if sample_seeds is None else list(sample_seeds)}"
+    )
+
 if dist.is_initialized():
+    if sample_indices != tuple(range(num_prompts)):
+        raise ValueError(
+            "inference.sample_indices is only supported by independent single-GPU "
+            "workers, not torchrun distributed inference"
+        )
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
 else:
-    sampler = SequentialSampler(dataset)
-dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0,
-                        drop_last=False, collate_fn=collate_fn)
+    sampler = ExplicitIndexSampler(sample_indices)
+dataloader_num_workers = int(getattr(config, "dataloader_num_workers", 0))
+if dataloader_num_workers < 0:
+    raise ValueError("inference.dataloader_num_workers must be non-negative")
+pin_memory = bool(getattr(config, "pin_memory", False))
+dataloader_kwargs = {
+    "dataset": dataset,
+    "batch_size": 1,
+    "sampler": sampler,
+    "num_workers": dataloader_num_workers,
+    "drop_last": False,
+    "collate_fn": collate_fn,
+    "pin_memory": pin_memory,
+}
+if dataloader_num_workers > 0:
+    dataloader_kwargs.update(
+        {
+            "persistent_workers": True,
+            "prefetch_factor": int(getattr(config, "prefetch_factor", 2)),
+        }
+    )
+dataloader = DataLoader(**dataloader_kwargs)
 
 # Create output directory (only on main process to avoid race conditions)
 if local_rank == 0:
@@ -627,12 +676,23 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     prompts = [block_prompts] * config.num_samples
 
     shape = config.image_or_video_shape
+    noise_generator = None
+    if sample_seeds is not None:
+        noise_generator = torch.Generator(device=device)
+        noise_generator.manual_seed(sample_seeds[idx])
     sampled_noise = torch.randn(
-        [config.num_samples, config.num_output_frames, shape[2], shape[3], shape[4]], device=device, dtype=torch.bfloat16
+        [config.num_samples, config.num_output_frames, shape[2], shape[3], shape[4]],
+        device=device,
+        dtype=torch.bfloat16,
+        generator=noise_generator,
     )
     initial_latent = None
     if getattr(config, "i2v", False):
-        image = batch["image"].to(device=device, dtype=torch.bfloat16)
+        image = batch["image"].to(
+            device=device,
+            dtype=torch.bfloat16,
+            non_blocking=pin_memory,
+        )
         if image.ndim == 4:
             image = image.unsqueeze(2)
         elif image.ndim != 5:
