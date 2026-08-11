@@ -1,5 +1,7 @@
 import csv
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -683,8 +685,89 @@ def test_side_by_side_video_keeps_premerged_on_left(tmp_path, monkeypatch):
     assert filter_graph.count("setpts=N") == 3
     assert "hstack=inputs=2:shortest=0" in filter_graph
     assert "trim=start_frame=0:end_frame=93" in filter_graph
-    assert "-r" not in command
+    assert command[command.index("-r") + 1] == "24"
     assert command[command.index("-frames:v") + 1] == "93"
-    assert command[command.index("-fps_mode") + 1] == "passthrough"
+    assert command[command.index("-fps_mode") + 1] == "cfr"
     assert stream["width"] == 1664
     assert output.read_bytes() == b"paired"
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required for the real stream-contract test",
+)
+@pytest.mark.parametrize("right_track_timescale", [1_000, 90_000])
+def test_side_by_side_real_ffmpeg_preserves_exact_stream_contract(
+    tmp_path,
+    right_track_timescale,
+):
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    left = tmp_path / "premerged.mp4"
+    right = tmp_path / "dynamic-lora.mp4"
+    output = tmp_path / "paired.mp4"
+
+    def write_source(path, *, color, track_timescale):
+        subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c={color}:s=64x48:r=24",
+                "-frames:v",
+                "93",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-video_track_timescale",
+                str(track_timescale),
+                str(path),
+            ],
+            check=True,
+        )
+
+    write_source(left, color="red", track_timescale=12_288)
+    write_source(right, color="blue", track_timescale=right_track_timescale)
+
+    stream = write_side_by_side_video(left, right, output)
+    assert stream == {
+        "width": 128,
+        "height": 48,
+        "frame_count": 93,
+        "fps": 24.0,
+    }
+
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            (
+                "stream=start_time,duration,nb_read_frames,nb_frames,"
+                "avg_frame_rate,r_frame_rate"
+            ),
+            "-of",
+            "json",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    encoded = json.loads(completed.stdout)["streams"][0]
+    assert encoded["start_time"] == "0.000000"
+    assert encoded["duration"] == "3.875000"
+    assert encoded["nb_frames"] == "93"
+    assert encoded["nb_read_frames"] == "93"
+    assert encoded["avg_frame_rate"] == "24/1"
+    assert encoded["r_frame_rate"] == "24/1"
