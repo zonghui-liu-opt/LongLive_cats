@@ -679,10 +679,12 @@ def test_side_by_side_video_keeps_premerged_on_left(tmp_path, monkeypatch):
     assert command[first_input + 1] == str(left.resolve())
     assert command[second_input + 1] == str(right.resolve())
     filter_graph = command[command.index("-filter_complex") + 1]
-    assert filter_graph.count("setpts=N/(24*TB)") == 2
+    assert filter_graph.count("settb=expr=1/24") == 3
+    assert filter_graph.count("setpts=N") == 3
     assert "hstack=inputs=2:shortest=0" in filter_graph
-    assert "fps=fps=24:start_time=0:eof_action=pass" in filter_graph
-    assert command[command.index("-r") + 1] == "24"
-    assert command[command.index("-fps_mode") + 1] == "cfr"
+    assert "trim=start_frame=0:end_frame=93" in filter_graph
+    assert "-r" not in command
+    assert command[command.index("-frames:v") + 1] == "93"
+    assert command[command.index("-fps_mode") + 1] == "passthrough"
     assert stream["width"] == 1664
     assert output.read_bytes() == b"paired"
