@@ -787,6 +787,7 @@ def write_side_by_side_video(
         raise RuntimeError(
             f"Cannot pair videos with different stream properties: {mismatch}"
         )
+    fps = f"{float(left['fps']):.12g}"
 
     with atomic_output_path(output_video, suffix=".mp4") as temporary:
         command = [
@@ -802,14 +803,18 @@ def write_side_by_side_video(
             os.fspath(right_video),
             "-filter_complex",
             (
-                "[0:v]setpts=PTS-STARTPTS,setsar=1[left];"
-                "[1:v]setpts=PTS-STARTPTS,setsar=1[right];"
-                "[left][right]hstack=inputs=2:shortest=1[paired]"
+                f"[0:v]setpts=N/({fps}*TB),setsar=1[left];"
+                f"[1:v]setpts=N/({fps}*TB),setsar=1[right];"
+                f"[left][right]hstack=inputs=2:shortest=1,fps={fps}[paired]"
             ),
             "-map",
             "[paired]",
             "-frames:v",
             str(int(left["frame_count"])),
+            "-r",
+            fps,
+            "-fps_mode",
+            "cfr",
             "-an",
             "-c:v",
             "libx264",

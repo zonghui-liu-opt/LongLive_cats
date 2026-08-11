@@ -678,6 +678,10 @@ def test_side_by_side_video_keeps_premerged_on_left(tmp_path, monkeypatch):
     second_input = command.index("-i", first_input + 1)
     assert command[first_input + 1] == str(left.resolve())
     assert command[second_input + 1] == str(right.resolve())
-    assert "hstack" in command[command.index("-filter_complex") + 1]
+    filter_graph = command[command.index("-filter_complex") + 1]
+    assert filter_graph.count("setpts=N/(24*TB)") == 2
+    assert "hstack=inputs=2:shortest=1,fps=24" in filter_graph
+    assert command[command.index("-r") + 1] == "24"
+    assert command[command.index("-fps_mode") + 1] == "cfr"
     assert stream["width"] == 1664
     assert output.read_bytes() == b"paired"
