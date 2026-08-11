@@ -28,12 +28,19 @@ export ROLE_INIT_DIR="$STAGE2_RUN_DIR/role_init"
 export STAGE1_BASE=/绝对路径/stage1_immutable_base.pt
 export STAGE1_CKPT=/绝对路径/checkpoint_model_003750
 
-# real-score teacher 与 Wan 架构目录。
+# real-score/fake-score 共用的初始化 teacher 与 Wan 架构目录。
+# 注意：这里不是上面的 Stage-1 causal Generator，而是 Stage-1 训练前那份
+# “猫域 SFT LoRA 已 merge、仍保持双向 attention”的 Wan teacher。
 export ARCH_ROOT=/绝对路径/Wan2.2-TI2V-5B
-export TEACHER_CKPT=/绝对路径/cat_domain_bidirectional_teacher
-export TEACHER_SOURCE_KIND=direct_internal_training_checkpoint
-export TEACHER_SOURCE_ID=替换为可信训练任务或转换任务ID
-export TEACHER_SOURCE_SHA256=替换为可信来源记录中的64位小写SHA256
+export TEACHER_CKPT=/绝对路径/merged_bi-direct_Wan2.2-5B-cats/ckpts
+
+# 上述双向 teacher 的原始 merge 记录。先运行：
+# sha256sum "$TEACHER_PROVENANCE_RECORD"
+# 再把输出第一列复制到 TEACHER_SOURCE_SHA256；不要填 LoRA 自身的 SHA。
+export TEACHER_PROVENANCE_RECORD=/绝对路径/merge_manifest.json
+export TEACHER_SOURCE_KIND=diffsynth_sft_lora_merge
+export TEACHER_SOURCE_ID='Wan2.2-TI2V-5B_cats_LoRA_rank64_600clips_5e-5_ga4steps:epoch-79'
+export TEACHER_SOURCE_SHA256=替换为merge_manifest.json的64位小写SHA256
 
 # 原始 Stage-1 cache、原视频 metadata 和同源模型。
 export STAGE1_CACHE_MANIFEST=/绝对路径/原始Stage1缓存/cache_manifest.json
@@ -131,6 +138,13 @@ test -z "$(git ls-files --others --ignored --exclude-standard)"
 
 ## 3. 准备 Generator 和 real-score teacher
 
+先区分两类权重，后面不要交叉使用：
+
+- **Generator（G）**：Stage-1 causal base + step3750 EMA LoRA；就是第 3.1 节合并和你已经对比推理的模型。
+- **real-score / fake-score 的共同底座**：Stage-1 训练前的猫域双向 Wan teacher。real-score 加载后完全冻结；fake-score 从同一权重独立初始化，再挂新的 r64 LoRA。
+
+因此，Stage-1 causal merged 模型即使推理效果正常，也不能填到 `TEACHER_CKPT`。
+
 ### 3.1 合并 Stage-1 step3750 EMA Generator
 
 做什么：只选择正式 checkpoint 中的 `adapter_ema.safetensors`，严格合并回不可变 causal base。
@@ -164,15 +178,28 @@ SHA256: <64位sha256>
 
 `_SUCCESS`、step、EMA metadata、target 数量或 strict reload 任一不匹配，脚本会失败；不要手补旧 checkpoint。
 
-### 3.2 建立 real-score teacher 的可信 provenance
+### 3.2 给双向 real-score teacher 生成“身份证” manifest
 
-做什么：下面命令适用于“未转换的原生 Wan safetensors teacher”。
+这一步**不会生成或修改模型权重**，只读取已经合并好的双向 teacher，检查权重文件、BF16 tensor 和 Wan 架构，然后写出一份 JSON sidecar。下面命令适用于“已经是原生 Wan safetensors 格式”的 teacher。
 
-为什么：代码能检查权重结构和 hash，但“猫域、双向 TI2V、video-global flow”只能由掌握训练来源的人确认。
+三个需要人工填写的 `source-*` 字段只是记录 teacher 从哪里来：
+
+| 字段 | 人话解释 | 本项目建议值 |
+|---|---|---|
+| `source-kind` | teacher 的产生方式 | `diffsynth_sft_lora_merge` |
+| `source-identifier` | 稳定、可读的训练/合并任务名 | `Wan2.2-TI2V-5B_cats_LoRA_rank64_600clips_5e-5_ga4steps:epoch-79` |
+| `source-sha256` | 上述来源记录的防篡改指纹 | 对配套的 `merge_manifest.json` 运行 `sha256sum` 后的第一列 |
+
+不要把 Stage-1 step3750 LoRA/merged Generator 的 SHA 填到这里，也不要填 `merge_manifest.json` 里的 `lora_sha256`：它只代表 LoRA 文件，不能绑定完整的 base + LoRA merge 记录。当前 teacher 的实际 safetensors 文件 hash 会由下面的脚本自动逐个计算，不需要手工填写。
+
+代码可以自动检查权重结构和 hash，但“它确实是猫域、双向 TI2V、video-global flow teacher”仍需由掌握训练来源的人确认；这就是两个 `--attest-*` 开关的含义。
 
 ```bash
 export TEACHER_MANIFEST="$STAGE2_ASSET_DIR/real_score_teacher.manifest.json"
 test ! -e "$TEACHER_MANIFEST"
+test -s "$TEACHER_PROVENANCE_RECORD"
+test "$(sha256sum "$TEACHER_PROVENANCE_RECORD" | awk '{print $1}')" = \
+  "$TEACHER_SOURCE_SHA256"
 
 "$STAGE2_PYTHON" -I -B scripts/create_stage2_teacher_manifest.py \
   --checkpoint "$TEACHER_CKPT" \
@@ -198,7 +225,7 @@ Wrote ...
 Manifest SHA256: <64位sha256>
 ```
 
-如果 teacher 是 LongLive wrapper 或经过转换，不要照抄上面的格式/`none`；必须按真实格式、selector 和完整转换 argv 重建 manifest。来源语义无法确认就停。
+这里的 `--conversion-command none` 表示：`TEACHER_CKPT` 已经是最终使用的原生 Wan teacher，在生成本 sidecar 前没有再做额外格式转换；此前的 base + SFT LoRA merge 历史由 `TEACHER_PROVENANCE_RECORD` 绑定。如果 teacher 后来又转成 LongLive wrapper 或经过其他格式转换，就不能继续写 `none`，必须改成真实格式、selector 和完整转换 argv。来源语义无法确认就停。
 
 ## 4. 锁定同一份运行配置，做 8 卡三角色 init-only
 
