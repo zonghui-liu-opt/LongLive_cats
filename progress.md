@@ -1,5 +1,20 @@
 # 进度日志
 
+## 会话：2026-08-11（Phase 12）
+
+### real-score manifest 后的 Stage-2 H100 指南重生成
+- **状态：** in_progress
+- 已恢复并完整读取三份规划文件，确认旧手册边界落后于当前Stage-2训练闭环。
+- 已把本轮范围锁定为：从teacher manifest生成/验收到init-only、C0/C1/C2 smoke、正式训练/resume和JSONL/九图HTML验收的完整单线指导；下一步以当前CLI和脚本反向生成文档。
+- 已核对train/plot/teacher/merge/preflight CLI；formal cache与F25 CLI即使请求`--help`也会先验证物理clean checkout，当前文档编辑态按设计失败。后续不绕过该安全门禁，改读parser源码并用测试验证命令契约。
+- 已完成生产契约审计：确认3750是resolver硬锁定来源，prepare脚本中的3075/G变量实际未消费；确认YAML模型路径环境变量旧手册未生效、F25最终source env漏设、旧顺序会导致launch绑定漂移，以及正式执行必须采用clean clone/仓库外资产与输出。
+- 已完整重写Stage-2中文手册，从teacher manifest三类SHA校验开始，覆盖step3750 Generator、一次性最终env/launch绑定、F25/negative/formal audit、init-only、C0→C1→C2、formal cold/resume、G280/F1400终点和九图HTML。
+- 已让正式YAML的architecture/G/teacher路径真正读取手册环境变量，保留原路径默认值与既有contract hash；prepare脚本移除未消费的3075/G变量，新增teacher manifest自哈希和merge记录文件SHA复核及明确handoff。
+- 新增`tests/test_stage2_runbook.py`锁定新手册全流程、禁止旧检查点A终止语义、验证外部资产env进入resolver并检查prepare脚本teacher-only边界。
+- 首轮目标验证为113 passed / 1 failed：唯一失败是测试禁止出现历史`329 passed`，而手册恰在“不要锁死历史计数”的说明句中引用了该字符串；已删除具体历史数字。Black同时要求格式化新增测试，下一步机械格式化后重跑。
+- 修订后目标门禁114 passed；完整`tests/test_stage2_*.py + test_jsonl_training_plot.py`最终443 passed、14 warnings（均为既有TorchScript弃用）。contract hash保持锁定值，bash/Black/关键Ruff/diff检查通过。
+- **状态：** complete（本地代码与指南；真实8×H100 C0/C1/C2和formal待用户内网执行）
+
 ## 会话：2026-08-11
 
 ### Phase 10：Stage‑1 LoRA/merged 四卡批量推理对比

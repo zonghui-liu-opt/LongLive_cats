@@ -2,20 +2,20 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # Teacher manifest creation is CPU-only. Keep the later Stage-2 baseline
 # preflight environment aligned with its locked 8-rank topology.
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-export STAGE2_PYTHON=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python
-export STAGE2_TORCHRUN="$(dirname "$STAGE2_PYTHON")/torchrun"
-export STAGE1_BASE=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage1/converted_causal_base.pt
-export STAGE1_CKPT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/results/stage1_600cats_phaseA10epochs_phaseB20epochs/checkpoint_model_003075
-export G_MERGED=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3075_ema_merged.pt
-export G_MANIFEST=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3075_ema_merged.manifest.json
-export TEACHER_MANIFEST=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/real_score_teacher.manifest.json
-export TEACHER_CKPT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts
-export TEACHER_PROVENANCE_RECORD=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/merge_manifest.json
-export ARCH_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B
+export STAGE2_PYTHON="${STAGE2_PYTHON:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python}"
+export TEACHER_MANIFEST="${TEACHER_MANIFEST:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/real_score_teacher.manifest.json}"
+export TEACHER_CKPT="${TEACHER_CKPT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts}"
+export TEACHER_PROVENANCE_RECORD="${TEACHER_PROVENANCE_RECORD:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/merge_manifest.json}"
+export ARCH_ROOT="${ARCH_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}"
+
+test -x "$STAGE2_PYTHON"
 
 # These are semantic operator attestations, not properties recoverable from a
 # safetensors file. Set both to 1 only after checking the DiffSynth SFT config:
@@ -146,3 +146,88 @@ test ! -e "$TEACHER_MANIFEST"
   --attest-video-global-flow
 
 test -s "$TEACHER_MANIFEST"
+
+manifest_summary="$("$STAGE2_PYTHON" -I -B - \
+  "$TEACHER_MANIFEST" "$TEACHER_PROVENANCE_RECORD" \
+  "$TEACHER_SOURCE_SHA256" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+manifest_path = Path(sys.argv[1]).expanduser().resolve()
+provenance_path = Path(sys.argv[2]).expanduser().resolve()
+expected_source_sha256 = sys.argv[3]
+value = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+required = {
+    "schema": "longlive_stage2_teacher_manifest",
+    "role": "real_score",
+    "model_name": "Wan2.2-TI2V-5B",
+}
+for key, expected in required.items():
+    if value.get(key) != expected:
+        raise RuntimeError(
+            f"Teacher manifest {key} mismatch: {value.get(key)!r} != {expected!r}"
+        )
+
+recorded_self_hash = value.get("manifest_sha256")
+if not isinstance(recorded_self_hash, str) or re.fullmatch(
+    r"[0-9a-f]{64}", recorded_self_hash
+) is None:
+    raise ValueError("Teacher manifest self hash is invalid")
+body = dict(value)
+body.pop("manifest_sha256")
+canonical = json.dumps(
+    body,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+    allow_nan=False,
+).encode("utf-8")
+actual_self_hash = hashlib.sha256(canonical).hexdigest()
+if actual_self_hash != recorded_self_hash:
+    raise RuntimeError("Teacher manifest self hash verification failed")
+
+actual_source_sha256 = sha256_file(provenance_path)
+if actual_source_sha256 != expected_source_sha256:
+    raise RuntimeError("DiffSynth merge record changed during manifest creation")
+if value.get("provenance", {}).get("source_sha256") != actual_source_sha256:
+    raise RuntimeError(
+        "Teacher manifest provenance.source_sha256 is not the merge_manifest.json "
+        "file SHA256"
+    )
+if value.get("provenance", {}).get("conversion_command") != ["none"]:
+    raise RuntimeError("Native Wan teacher must record conversion_command=['none']")
+
+print(
+    json.dumps(
+        {
+            "manifest": str(manifest_path),
+            "manifest_file_sha256": sha256_file(manifest_path),
+            "manifest_sha256": recorded_self_hash,
+            "provenance_file_sha256": actual_source_sha256,
+            "teacher_source_files_sha256": value["checkpoint"][
+                "source_files_sha256"
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ),
+    end="",
+)
+PY
+)"
+
+echo "REAL_SCORE_TEACHER_MANIFEST_PASS $manifest_summary"
+echo "Next: follow docs/STAGE2_H100_QUICK_DEPLOY_ZH.md from section 1."

@@ -1,5 +1,25 @@
 # 发现与决策
 
+## 2026-08-11 Phase 12：real-score manifest 后的 Stage-2 H100 指南重生成
+
+- 用户要求一次性重生成 teacher manifest 之后的全部操作指导，不能只修正 manifest 生成段。
+- 当前已知漂移：旧手册仍以检查点A/训练前准备为终点，但仓库已经具备600cats正式配置、严格trainer、C0/C1/C2 smoke、checkpoint/resume、JSONL和九图/HTML实现。
+- 本轮会以生产脚本和CLI为唯一真相，逐项核对参数、输出目录、成功信号和fail-closed边界；历史规划文字不作为可执行命令来源。
+- 全仓盘点只发现一份正式Stage-2操作者手册：`docs/STAGE2_H100_QUICK_DEPLOY_ZH.md`；`TASK-stage2-self-forcing-dmd-dfd.md`是实现规格，不应被当作运行手册。`prepare_stage2.sh`是资产准备入口，也必须让其末尾输出明确指向手册中的下一步。
+- 当前旧手册在formal cache audit/init-only后结束，没有覆盖已落地的`train.py --stage2-smoke C0|C1|C2`、formal冷启动/resume、checkpoint lineage和`plot_stage2_training.py`九图HTML，因此manifest后半段必须整体替换而非局部补丁。
+- 生产入口存在必须先闭环的资产漂移：`prepare_stage2.sh`指向真实`checkpoint_model_003075`并命名step3075 Generator产物，但正式YAML/旧手册仍写`generator_stage1_step: 3750`和step3750文件名。
+- 旧手册导出了`LONG_LIVE_STAGE2_ARCHITECTURE_ROOT/GENERATOR_BASE/GENERATOR_MANIFEST/REAL_SCORE_BASE/REAL_SCORE_MANIFEST`，但当前YAML这些字段是硬编码绝对路径，不读取这些环境变量；因此旧的“锁定同一配置”命令不能证明训练使用了刚生成的资产。
+- `prepare_stage2.sh`当前只真正生成teacher manifest；其中`STAGE1_BASE/STAGE1_CKPT/G_MERGED/G_MANIFEST`只是未消费变量。后续指南必须明确Generator merge是已经完成的前置产物还是在本脚本中生成，不能继续制造“脚本已准备全部模型”的错觉。
+- 本地未跟踪的旧`real_score_teacher.manifest.json`可验证历史错误：`provenance.source_sha256`为DiffSynth的`merged_state_sha256=d8ba...`，而新版脚本应写完整`merge_manifest.json`的文件SHA；它不能作为新手册示例中的合格产物，必须在内网删除旧sidecar后由新版脚本重新生成并校验。
+- 本地存在一份完整、可审计的Stage-1 step3750 checkpoint manifest（`completed_step=3750`）；与此同时新版`prepare_stage2.sh`改指另一路step3075结果。两者是不同Generator候选，指南必须只允许与YAML声明一致的一路，不能靠文件名猜选。
+- Trainer真实产物：JSONL默认为`<logdir>/metrics/stage2_train_metrics.jsonl`；checkpoint目录为`checkpoint_stage2_gNNNNNN`且`_SUCCESS`最后写入；默认成功/每次smoke结束会生成`<logdir>/plots/`中的9组PNG/SVG及`index.html`，除非显式`--no-visualize`。
+- 当前resolver明确把Generator来源锁为Stage-1 step3750（代码、角色`base_source`和测试三重锁定）；因此step3075不是“换一条文档路径”即可合法使用的候选。本轮不擅自改变研究契约，而是从teacher-only脚本中删除未消费的step3075/G变量，并让Generator步骤以正式YAML的3750为准。
+- YAML可以安全改为`oc.env`承载architecture/G/teacher的操作路径，同时保留当前绝对路径作为默认值；这些路径本来就被contract hash排除，默认解析和锁定contract hash不变，却能让clean clone真正使用手册刚生成的外部资产。
+- `.gitignore`忽略`*.pt/*.pth/*.log/*.html`，而trainer同时拒绝tracked dirty、untracked和ignored文件；因此正式流程必须使用“代码clean clone + 仓库外资产/cache/logdir”的双目录布局。把checkpoint或训练输出写进执行clone会在下一次启动/resume时按设计失败。
+- F25 producer只要求最终配置字符串可解析，不要求未来的attested source/negative文件已经存在；可在F25前就把`LONG_LIVE_STAGE2_SOURCE_MANIFEST`和`LONG_LIVE_STAGE2_NEGATIVE_MANIFEST`设为最终路径，从第一步起保持同一launch hash。formal audit/trainer会重新绑定该hash。
+- 最终实现保持contract hash `aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`不变；新增外部模型路径env只改变合法的launch-specific路径绑定。
+- 最终本地证据为443 passed、14条既有TorchScript弃用warning；`bash -n`、Black、关键Ruff、config resolver、文档陈旧字符串搜索和`git diff --check`均通过。本地没有H100，不声称C0/C1/C2或formal真实训练已经成功。
+
 ## 2026-08-11 Stage‑1 LoRA/merged 四卡推理任务
 
 - 当前 `run_stage1_merged_checkpoint_comparison.py` 只对预 merged `.pt` 执行新推理，并复用原 runner 视频；它没有对 `base + adapter_ema.safetensors` 执行动态 LoRA 推理。

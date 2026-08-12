@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`，按用户指定的三个检查节点交付：训练前准备、训练/日志/权重/可视化、batch推理与其余验收；保持 Stage‑1 与 legacy DMD 行为不回归。
 
 ## 当前阶段
-Phase 10 的reference可选/fresh-preparation扩展已完成本地实现与39项目标验证，等待用户内网4×H100执行；Phase 9检查点B仍保持等待用户检查。
+Phase 12 已完成：real-score teacher manifest 之后的完整 Stage-2 H100 操作指南已与当前脚本、600cats配置、C0/C1/C2 smoke、正式训练、checkpoint/resume、JSONL和九图产物对齐，并通过443项相关回归；真实8×H100执行仍由用户在内网完成。
 
 ## 各阶段
 
@@ -108,6 +108,14 @@ Phase 10 的reference可选/fresh-preparation扩展已完成本地实现与39项
 - [x] 11.5 输出按 P0/P1 排序的结论和必须修改项；本轮不改生产代码或权重
 - **Status:** complete（只读结论：核心训练闭环无新增P0/P1；正式YAML与teacher sidecar存在阻断项）
 
+### Phase 12：重生成 real-score manifest 后的 Stage‑2 H100 指南
+- [x] 12.1 审计当前 `prepare_stage2.sh`、600cats YAML、manifest/audit/preflight/train/plot CLI 与旧手册，建立真实命令和产物契约
+- [x] 12.2 盘点所有面向操作者的 Stage‑2 指导入口，删除 manifest 后仍停留在旧检查点边界的过期步骤
+- [x] 12.3 重写中文 H100 指南：manifest验收→正式资产审计→角色init-only→C0/C1/C2 smoke→全新正式训练→resume→九图/HTML验收
+- [x] 12.4 增加或更新文档契约验证，确保文件名、参数、路径、成功标记和禁止事项与生产代码一致
+- [x] 12.5 运行CLI help、shell syntax、文档命令静态审计、目标测试与最终diff检查
+- **Status:** complete（443 passed；真实8×H100 smoke/formal仍待内网执行）
+
 #### 用户指定的停止点（覆盖旧的逐Batch暂停）
 1. **检查点 A——训练前准备**：原 Steps 1–8、本地验证、用户检查、中文指南与分支发布均已完成；当前等待内网8×H100门禁，不写完整trainer、不训练。
 2. **检查点 B——训练闭环**：完成trainer、log、checkpoint/权重保存与可视化并本地验证；不做正式训练，停下给用户安排H100 smoke。
@@ -163,6 +171,11 @@ Phase 10 的reference可选/fresh-preparation扩展已完成本地实现与39项
 | review修订后误用系统`pytest`可执行文件，Python3.11环境缺少OmegaConf而收集失败 | 1 | 核对shebang后改用项目依赖所在的Anaconda Python执行`python -m pytest`；96个Stage-2测试通过 |
 | review修订后的Black check报告两个Python文件需重新格式化 | 1 | 仅运行Black机械格式化，再跑Ruff、py_compile、测试与diff检查 |
 | 将`git diff --no-index --check`直接串入成功链时，正常“文件不同”退出码1被误当失败 | 1 | 对每个未跟踪文件单独接受0/1，仅把大于1视为检查异常；空白审计通过 |
+| 文档编辑中的dirty checkout直接请求formal cache/F25 CLI `--help`，被物理clean-checkout前置门禁拒绝 | 1 | 不绕过门禁；读取当前parser源码并依赖CLI测试，正式命令只允许在clean clone/提交态运行 |
+| 首次记录上述错误的组合补丁误用了task_plan中不存在的历史错误行上下文 | 1 | 先定位真实表格尾部，再用精确上下文补写；未发生部分修改 |
+| prepare脚本首次补丁给`$STAGE2_PYTHON`命令名误加了单引号，形成字面量命令 | 1 | 静态复核后立即改为双引号变量展开，随后用`bash -n`和stub集成测试验证 |
+| 新runbook测试首次运行因手册在“不要锁死历史计数”的反例句中仍出现`329 passed`而失败 | 1 | 删除具体历史数字、保留原则性说明；产品命令与流程未失败 |
+| 新增runbook测试首次Black check要求格式化 | 1 | 仅对新增测试运行Black机械格式化，再复跑静态和目标测试 |
 
 ## 备注
 - 重大决策前重新读取本计划。
