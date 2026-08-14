@@ -128,6 +128,8 @@ def test_prepare_stage2_call_chain_has_no_git_clean_or_code_version_gate():
         PROJECT_ROOT / "scripts" / "prepare_stage2_i2v_f25_cache.py",
         PROJECT_ROOT / "scripts" / "audit_stage2_i2v_cache.py",
         PROJECT_ROOT / "scripts" / "preflight_stage2_roles.py",
+        PROJECT_ROOT / "precompute_stage2_i2v_cache_h100_8gpu.sh",
+        PROJECT_ROOT / "trainer" / "stage2_distillation.py",
         PROJECT_ROOT / "utils" / "stage2_f25_cache.py",
         PROJECT_ROOT / "utils" / "stage2_i2v_data.py",
     )
@@ -140,5 +142,12 @@ def test_prepare_stage2_call_chain_has_no_git_clean_or_code_version_gate():
         "_git_code_version",
         "expected_upgrade_code_version",
         "expected-git-commit",
+        "_repo_identity",
+        "clean Git identity",
+        "worktree_clean",
+        "ignored_files_absent",
+        "producer file changed after preparation",
+        "validator file changed after upgrade",
+        "_PRODUCER_RELATIVE_PATH",
     ):
         assert forbidden not in text

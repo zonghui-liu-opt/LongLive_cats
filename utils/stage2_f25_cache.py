@@ -58,7 +58,6 @@ F25_COMPLETION_SCHEMA = "longlive_stage2_i2v_f25_record_completion"
 F25_COMPLETION_SCHEMA_VERSION = 1
 F25_OUTPUT_OWNERSHIP_SCHEMA = "longlive_stage2_i2v_f25_output_ownership"
 F25_OUTPUT_OWNERSHIP_SCHEMA_VERSION = 1
-_PRODUCER_RELATIVE_PATH = "utils/stage2_f25_cache.py"
 _OUTPUT_POLICY = {
     "independent_output_directory": True,
     "in_place_overwrite": False,
@@ -302,8 +301,6 @@ def _preparation_contract(
     config_launch_sha256: str,
     vae_aggregate_sha256: str,
 ) -> dict[str, Any]:
-    project_root = Path(__file__).resolve().parents[1]
-    producer_path = project_root / _PRODUCER_RELATIVE_PATH
     preparation: dict[str, Any] = {
         "schema": STAGE2_F25_PREPARATION_SCHEMA,
         "schema_version": STAGE2_F25_PREPARATION_SCHEMA_VERSION,
@@ -316,10 +313,6 @@ def _preparation_contract(
             ],
             "schema": source_manifest["schema"],
             "schema_version": source_manifest["schema_version"],
-        },
-        "producer": {
-            "file": _PRODUCER_RELATIVE_PATH,
-            "file_sha256": sha256_file(producer_path),
         },
         "config": {
             "path": str(config_path),

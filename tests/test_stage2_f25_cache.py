@@ -32,6 +32,7 @@ from utils.stage2_i2v_data import (
     STAGE2_F25_SOURCE_CACHE_SCHEMA,
     STAGE2_TEXT_ENCODING_UPGRADE_KEY,
     STAGE2_TEXT_ENCODING_OPERATOR_ATTESTATION,
+    _validate_f25_source_preparation,
     load_source_cache_manifest,
     upgrade_legacy_source_cache_manifest_text_encoding,
 )
@@ -280,7 +281,44 @@ def test_proven_f25_is_byte_reused_without_vae_or_decode(tmp_path):
         "reused_f25": 1,
         "reverified_f25": 0,
     }
+    assert "producer" not in manifest["preparation"]
     assert calls == []
+
+
+def test_legacy_producer_hash_is_inert_after_source_code_changes(tmp_path):
+    fixture = _fixture(tmp_path, [25], proven_f25=True)
+    manifest_path = _prepare(fixture, tmp_path, [])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    preparation = manifest["preparation"]
+    preparation["producer"] = {
+        "file": "utils/stage2_f25_cache.py",
+        "file_sha256": "0" * 64,
+    }
+    legacy_contract = {
+        key: preparation[key]
+        for key in (
+            "schema",
+            "schema_version",
+            "input_manifest",
+            "producer",
+            "config",
+            "metadata",
+            "frame_policy",
+            "frame_policy_sha256",
+            "vae",
+            "output_policy",
+        )
+    }
+    contract_sha256 = canonical_json_sha256(legacy_contract)
+    preparation["contract_sha256"] = contract_sha256
+    fingerprint = manifest["source_fingerprint"]
+    fingerprint["preparation_contract_sha256"] = contract_sha256
+    fingerprint.pop("aggregate_sha256")
+    fingerprint["aggregate_sha256"] = canonical_json_sha256(fingerprint)
+    for record in manifest["records"]:
+        record["preparation_contract_sha256"] = contract_sha256
+
+    _validate_f25_source_preparation(manifest, expected_num_samples=1)
 
 
 def test_mixed_f25_reuse_and_f24_reencode_once_with_prefix_parity(tmp_path, capsys):

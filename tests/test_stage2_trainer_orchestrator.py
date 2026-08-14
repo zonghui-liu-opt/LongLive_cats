@@ -140,11 +140,6 @@ def test_resume_provenance_separates_formal_and_smoke_lineages(
     parent_probe,
     error_match,
 ):
-    git_identity = {
-        "commit": "a" * 40,
-        "worktree_clean": True,
-        "ignored_files_absent": True,
-    }
     data_provenance = {
         "stage2_manifest_sha256": "b" * 64,
         "source_manifest_sha256": "c" * 64,
@@ -168,7 +163,6 @@ def test_resume_provenance_separates_formal_and_smoke_lineages(
     )
     payload = SimpleNamespace(
         provenance={
-            "git": git_identity,
             "data": data_provenance,
             "smoke_probe": parent_probe,
         }
@@ -180,7 +174,7 @@ def test_resume_provenance_separates_formal_and_smoke_lineages(
         else nullcontext()
     )
     with context:
-        trainer._audit_resume_runtime_bindings(payload, git_identity)
+        trainer._audit_resume_runtime_bindings(payload)
 
 
 def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and_rng(
@@ -532,14 +526,10 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
             )
         ),
         _runtime_rank0_checked=lambda _label, callback: callback(),
-        _checkpoint_provenance=lambda identity: (
-            provenance
-            if identity == {"commit": "a" * 40}
-            else pytest.fail("checkpoint provenance received the wrong Git identity")
-        ),
+        _checkpoint_provenance=lambda: provenance,
     )
 
-    event = trainer._save_checkpoint({"commit": "a" * 40})
+    event = trainer._save_checkpoint()
 
     assert len(builder_calls) == 1
     builder = builder_calls[0]
@@ -628,13 +618,13 @@ def test_logger_run_id_is_created_once_on_rank0_and_broadcast_to_every_rank(
         "resolved": resolved,
         "state": state,
         "options": SimpleNamespace(output_dir=tmp_path),
-        "_run_metadata": lambda _identity: {"kind": "tiny"},
+        "_run_metadata": lambda: {"kind": "tiny"},
     }
     rank0 = _bare_trainer(is_main_process=True, **common)
     rank1 = _bare_trainer(is_main_process=False, **common)
 
-    rank0._build_logger(None, {"commit": "b" * 40})
-    rank1._build_logger(None, {"commit": "b" * 40})
+    rank0._build_logger(None)
+    rank1._build_logger(None)
 
     assert rank0.logger.run_id == rank1.logger.run_id == "shared-run-id"
     assert rank0.logger.options["enabled"] is True
@@ -723,8 +713,8 @@ def test_smoke_loop_runs_one_complete_cycle_then_saves_or_discards_at_boundary(
             state.commit_successful_fake_update(substep, schedule=schedule)
         return {"elapsed": 1.0}
 
-    def save_checkpoint(identity):
-        checkpoint_calls.append(identity)
+    def save_checkpoint():
+        checkpoint_calls.append(True)
         return {
             "path": tmp_path / f"checkpoint-{state.completed_g}",
             "manifest_sha256": "a" * 64,
@@ -749,7 +739,7 @@ def test_smoke_loop_runs_one_complete_cycle_then_saves_or_discards_at_boundary(
         _save_checkpoint=save_checkpoint,
     )
 
-    trainer._train_loop({"commit": "b" * 40})
+    trainer._train_loop()
 
     assert executed == ["F1", "F2", "F3", "F4", "F5", "G"]
     assert state.cycle == starting_cycles + 1

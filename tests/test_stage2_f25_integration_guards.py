@@ -266,6 +266,7 @@ def _build_native_chain(root: Path) -> dict[str, Path]:
         "reencoded_f24": 0,
         "reverified_f25": 0,
     }
+    assert "producer" not in base["preparation"]
     assert (f25_cache / STAGE2_F25_SUCCESS_NAME).is_file()
 
     attested_path = f25_cache / "cache_manifest.attested.json"
@@ -279,6 +280,10 @@ def _build_native_chain(root: Path) -> dict[str, Path]:
         operator_attestation=STAGE2_TEXT_ENCODING_OPERATOR_ATTESTATION,
         expected_num_samples=6,
     )
+    attested = json.loads(attested_path.read_text(encoding="utf-8"))
+    verification = attested["stage2_text_encoding_upgrade"]["verification"]
+    assert "validator_file" not in verification
+    assert "validator_file_sha256" not in verification
 
     negative_dir = root / "negative"
     negative_dir.mkdir()

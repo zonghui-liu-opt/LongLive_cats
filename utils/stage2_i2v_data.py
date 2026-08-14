@@ -165,8 +165,6 @@ _TEXT_ENCODING_UPGRADE_ORIGINAL_KEYS = {
     "source_fingerprint_sha256",
 }
 _TEXT_ENCODING_UPGRADE_VERIFICATION_KEYS = {
-    "validator_file",
-    "validator_file_sha256",
     "text_encoding_contract_sha256",
     "t5_checkpoint_aggregate_sha256",
     "tokenizer_aggregate_sha256",
@@ -251,7 +249,6 @@ _F25_PREPARATION_KEYS = {
     "schema",
     "schema_version",
     "input_manifest",
-    "producer",
     "config",
     "metadata",
     "frame_policy",
@@ -269,7 +266,6 @@ _F25_INPUT_MANIFEST_KEYS = {
     "schema",
     "schema_version",
 }
-_F25_PRODUCER_KEYS = {"file", "file_sha256"}
 _F25_CONFIG_KEYS = {
     "path",
     "file_sha256",
@@ -838,11 +834,19 @@ def _validate_f25_source_preparation(
         label="Stage-2 F25 source manifest",
         expected=allowed_manifest_keys,
     )
-    preparation = _require_exact_keys(
+    preparation = _require_required_keys(
         manifest.get("preparation"),
         label="Stage-2 F25 preparation",
-        expected=_F25_PREPARATION_KEYS,
+        required=_F25_PREPARATION_KEYS,
     )
+    unexpected_preparation_keys = set(preparation) - (
+        _F25_PREPARATION_KEYS | {"producer"}
+    )
+    if unexpected_preparation_keys:
+        raise RuntimeError(
+            "Stage-2 F25 preparation has unexpected keys: "
+            f"{sorted(unexpected_preparation_keys)}."
+        )
     if (
         preparation["schema"] != STAGE2_F25_PREPARATION_SCHEMA
         or type(preparation["schema_version"]) is not int
@@ -904,20 +908,6 @@ def _validate_f25_source_preparation(
             raise RuntimeError(
                 f"Stage-2 F25 input manifest provenance mismatch for {key}."
             )
-
-    producer = _require_required_keys(
-        preparation["producer"],
-        label="Stage-2 F25 preparation.producer",
-        required=_F25_PRODUCER_KEYS,
-    )
-    if producer["file"] != "utils/stage2_f25_cache.py":
-        raise RuntimeError("Unexpected Stage-2 F25 producer file.")
-    producer_sha256 = _require_sha256(
-        producer["file_sha256"], "F25 producer file SHA256"
-    )
-    producer_path = Path(__file__).resolve().parents[1] / producer["file"]
-    if sha256_file(producer_path) != producer_sha256:
-        raise RuntimeError("Stage-2 F25 producer file changed after preparation.")
 
     config = _require_exact_keys(
         preparation["config"],
@@ -1000,7 +990,6 @@ def _validate_f25_source_preparation(
             "schema",
             "schema_version",
             "input_manifest",
-            "producer",
             "config",
             "metadata",
             "frame_policy",
@@ -1012,7 +1001,12 @@ def _validate_f25_source_preparation(
     contract_sha256 = _require_sha256(
         preparation["contract_sha256"], "F25 preparation contract SHA256"
     )
-    if canonical_json_sha256(contract_payload) != contract_sha256:
+    accepted_contract_hashes = {canonical_json_sha256(contract_payload)}
+    if "producer" in preparation:
+        legacy_contract_payload = copy.deepcopy(contract_payload)
+        legacy_contract_payload["producer"] = copy.deepcopy(preparation["producer"])
+        accepted_contract_hashes.add(canonical_json_sha256(legacy_contract_payload))
+    if contract_sha256 not in accepted_contract_hashes:
         raise RuntimeError("Stage-2 F25 preparation contract hash mismatch.")
 
     summary = _require_exact_keys(
@@ -1353,17 +1347,15 @@ def _validate_text_encoding_upgrade(
         label="text-encoding upgrade verification",
         required=_TEXT_ENCODING_UPGRADE_VERIFICATION_KEYS,
     )
-    if verification["validator_file"] != "utils/wan_5b_wrapper.py":
-        raise RuntimeError("Unexpected text-encoding validator file.")
-    validator_path = (
-        Path(__file__).resolve().parents[1] / verification["validator_file"]
+    unexpected_verification_keys = set(verification) - (
+        _TEXT_ENCODING_UPGRADE_VERIFICATION_KEYS
+        | {"validator_file", "validator_file_sha256"}
     )
-    validator_hash = _require_sha256(
-        verification["validator_file_sha256"],
-        "text-encoding validator file SHA256",
-    )
-    if sha256_file(validator_path) != validator_hash:
-        raise RuntimeError("Text-encoding validator file changed after upgrade.")
+    if unexpected_verification_keys:
+        raise RuntimeError(
+            "text-encoding upgrade verification has unexpected keys: "
+            f"{sorted(unexpected_verification_keys)}."
+        )
 
     contract = _source_text_encoding_contract(source_manifest)
     contract_hash = _require_sha256(
@@ -1686,19 +1678,6 @@ def upgrade_legacy_source_cache_manifest_text_encoding(
         runtime_audit,
         label="Wan tokenizer runtime audit",
     )
-    validator_path = Path(wan_5b_wrapper.__file__).resolve()
-    project_root = Path(__file__).resolve().parents[1]
-    try:
-        validator_relative = validator_path.relative_to(project_root).as_posix()
-    except ValueError as exc:
-        raise RuntimeError(
-            "Wan text validator must live inside the project directory."
-        ) from exc
-    if validator_relative != "utils/wan_5b_wrapper.py":
-        raise RuntimeError(
-            f"Unexpected Wan text validator path: {validator_relative!r}."
-        )
-
     contract = {
         "t5_checkpoint_aggregate_sha256": actual_t5_hash,
         "tokenizer_aggregate_sha256": actual_tokenizer_hash,
@@ -1723,8 +1702,6 @@ def upgrade_legacy_source_cache_manifest_text_encoding(
             "source_fingerprint_sha256": fingerprint_hash,
         },
         "verification": {
-            "validator_file": validator_relative,
-            "validator_file_sha256": sha256_file(validator_path),
             "text_encoding_contract_sha256": canonical_json_sha256(contract),
             "t5_checkpoint_aggregate_sha256": actual_t5_hash,
             "tokenizer_aggregate_sha256": actual_tokenizer_hash,

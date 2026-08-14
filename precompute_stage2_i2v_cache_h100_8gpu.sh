@@ -6,32 +6,8 @@ trap 'echo "STAGE2_F25_CACHE_FAILED (line ${LINENO})" >&2' ERR
 SOURCE_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAGE2_F25_WORK_ROOT="${STAGE2_F25_WORK_ROOT:-${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_pretrain_check}}"
 
-# Formal F25 producers require a clean committed checkout. Keep datasets and
-# generated caches outside the clone so expensive artifacts remain resumable.
-if [[ "${STAGE2_F25_INNER:-0}" != "1" ]]; then
-  SOURCE_COMMIT="$(git -C "$SOURCE_REPO" rev-parse HEAD)"
-  SOURCE_BRANCH="$(git -C "$SOURCE_REPO" branch --show-current)"
-  [[ -n "$SOURCE_BRANCH" ]] || { echo "请先切到已提交的 Stage-2 分支。" >&2; exit 1; }
-  CLEAN_REPO="$STAGE2_F25_WORK_ROOT/code-${SOURCE_COMMIT:0:12}"
-  mkdir -p "$STAGE2_F25_WORK_ROOT"
-  if [[ ! -e "$CLEAN_REPO" ]]; then
-    git clone --quiet --no-local --branch "$SOURCE_BRANCH" "$SOURCE_REPO" "$CLEAN_REPO"
-  fi
-  [[ "$(git -C "$CLEAN_REPO" rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || {
-    echo "干净代码副本版本不一致，请更换 STAGE2_F25_WORK_ROOT。" >&2
-    exit 1
-  }
-  export STAGE2_F25_WORK_ROOT
-  export STAGE2_F25_INNER=1
-  export STAGE2_F25_SOURCE_COMMIT="$SOURCE_COMMIT"
-  exec bash "$CLEAN_REPO/precompute_stage2_i2v_cache_h100_8gpu.sh"
-fi
-
 REPO_ROOT="$SOURCE_REPO"
 cd "$REPO_ROOT"
-[[ "$(git rev-parse HEAD)" == "${STAGE2_F25_SOURCE_COMMIT:?}" ]]
-[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
-[[ -z "$(git ls-files --others --ignored --exclude-standard)" ]]
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
@@ -192,7 +168,7 @@ if [[ ! -e "$F25_ATTESTED" ]]; then
     2>&1 | tee "$LOG_DIR/source_attestation.log"
 fi
 
-"$STAGE2_PYTHON" -B - "$F25_ATTESTED" "git:$(git rev-parse HEAD)" <<'PY'
+"$STAGE2_PYTHON" -B - "$F25_ATTESTED" <<'PY'
 import sys
 from pathlib import Path
 from utils.stage2_i2v_data import load_source_cache_manifest
@@ -201,7 +177,6 @@ load_source_cache_manifest(
     Path(sys.argv[1]),
     expected_num_samples=600,
     require_text_encoding_upgrade=True,
-    expected_upgrade_code_version=sys.argv[2],
 )
 PY
 echo "CHECK_F25_PASS manifest=$F25_ATTESTED"

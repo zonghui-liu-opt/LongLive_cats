@@ -19,7 +19,6 @@ import math
 import os
 from pathlib import Path
 import random
-import subprocess
 import time
 from typing import Any
 import uuid
@@ -55,44 +54,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _repo_identity(project_root: Path) -> dict[str, Any]:
-    def run(*args: str) -> str:
-        result = subprocess.run(
-            ("git", *args),
-            cwd=project_root,
-            text=True,
-            capture_output=True,
-            check=False,
-            env={
-                key: value
-                for key, value in os.environ.items()
-                if key not in {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
-            },
-        )
-        if result.returncode:
-            raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
-        return result.stdout
-
-    top = Path(run("rev-parse", "--show-toplevel").strip()).resolve()
-    if top != project_root.resolve():
-        raise RuntimeError(
-            f"Git top-level mismatch: expected={project_root}, actual={top}"
-        )
-    commit = run("rev-parse", "HEAD").strip()
-    if len(commit) != 40:
-        raise RuntimeError("Stage-2 requires one full Git commit identity.")
-    dirty = run("status", "--porcelain=v1", "--untracked-files=all").splitlines()
-    ignored = run(
-        "ls-files", "--others", "--ignored", "--exclude-standard"
-    ).splitlines()
-    if dirty or ignored:
-        raise RuntimeError(
-            "Stage-2 formal training requires a clean checkout with no ignored "
-            f"runtime files; dirty={dirty[:8]}, ignored={ignored[:8]}."
-        )
-    return {"commit": commit, "worktree_clean": True, "ignored_files_absent": True}
-
-
 class Trainer:
     """Production Stage-2 trainer; construction stays CPU/light until ``train``."""
 
@@ -111,9 +72,7 @@ class Trainer:
                 "Stage-2 Trainer requires the strict Stage2ResolvedConfig."
             )
         if not output_dir:
-            raise ValueError(
-                "Stage-2 requires an explicit --logdir outside the clean checkout."
-            )
+            raise ValueError("Stage-2 requires an explicit --logdir.")
         if smoke_mode not in {None, "C0", "C1", "C2"}:
             raise ValueError("Stage-2 smoke_mode must be one of C0/C1/C2 or None.")
         self.resolved = resolved_config
@@ -127,13 +86,6 @@ class Trainer:
             auto_resume=bool(auto_resume),
             smoke_mode=smoke_mode,
         )
-        self.project_root = Path(__file__).resolve().parents[1]
-        try:
-            self.options.output_dir.relative_to(self.project_root)
-        except ValueError:
-            pass
-        else:
-            raise ValueError("Stage-2 --logdir must be outside the clean Git checkout.")
         if self.resolved.torch_compile:
             raise ValueError(
                 "Stage-2 torch.compile remains a post-eager profiling candidate; "
@@ -346,16 +298,10 @@ class Trainer:
             microbatch_size_per_device=self.resolved.microbatch_size_per_device,
         )
 
-    def _audit_resume_runtime_bindings(
-        self, resume_payload: Any, git_identity: Mapping[str, Any]
-    ) -> None:
+    def _audit_resume_runtime_bindings(self, resume_payload: Any) -> None:
         if resume_payload is None:
             return
         provenance = resume_payload.provenance
-        if provenance.get("git") != dict(git_identity):
-            raise RuntimeError(
-                "Stage-2 resume checkpoint Git identity differs from this clean checkout."
-            )
         expected_data = {
             "stage2_manifest_sha256": self.dataset.manifest["manifest_sha256"],
             "source_manifest_sha256": self.dataset.source_manifest["manifest_sha256"],
@@ -1663,9 +1609,8 @@ class Trainer:
             require_cuda_topology=True,
         )
 
-    def _run_metadata(self, git_identity: Mapping[str, Any]) -> dict[str, Any]:
+    def _run_metadata(self) -> dict[str, Any]:
         return {
-            "git_commit": git_identity["commit"],
             "config_contract_sha256": self.resolved.contract_hash(),
             "config_launch_sha256": self.resolved.launch_hash(),
             "resolved_config": self.resolved.to_dict(),
@@ -1713,26 +1658,13 @@ class Trainer:
             "smoke_mode": self.options.smoke_mode,
         }
 
-    def _build_logger(
-        self, resume_payload: Any, git_identity: Mapping[str, Any]
-    ) -> None:
+    def _build_logger(self, resume_payload: Any) -> None:
         from utils.stage2_metrics import Stage2MetricsLogger
 
         metric_path = Path(self.resolved.jsonl_path)
         if not metric_path.is_absolute():
             metric_path = self.options.output_dir / metric_path
         metric_path = metric_path.expanduser().resolve()
-        project_root = getattr(
-            self, "project_root", Path(__file__).resolve().parents[1]
-        )
-        try:
-            metric_path.relative_to(project_root)
-        except ValueError:
-            pass
-        else:
-            raise ValueError(
-                "Stage-2 JSONL path must stay outside the clean Git checkout."
-            )
         lineage = (
             None
             if resume_payload is None
@@ -1754,13 +1686,12 @@ class Trainer:
             checkpoint_next_attempt_index=next_attempt,
             fsync_every_steps=self.resolved.fsync_every_steps,
             enabled=self.is_main_process,
-            run_metadata=self._run_metadata(git_identity),
+            run_metadata=self._run_metadata(),
         )
         self.metric_path = metric_path
 
-    def _checkpoint_provenance(self, git_identity: Mapping[str, Any]) -> dict[str, Any]:
+    def _checkpoint_provenance(self) -> dict[str, Any]:
         return {
-            "git": dict(git_identity),
             "assets": self.assets,
             "data": {
                 "stage2_manifest_sha256": self.dataset.manifest["manifest_sha256"],
@@ -1789,7 +1720,7 @@ class Trainer:
             "smoke_probe": self._last_cycle_smoke_probe,
         }
 
-    def _save_checkpoint(self, git_identity: Mapping[str, Any]) -> dict[str, Any]:
+    def _save_checkpoint(self) -> dict[str, Any]:
         from utils.stage2_checkpoint import (
             build_stage2_trainer_state,
             save_stage2_checkpoint,
@@ -1847,7 +1778,7 @@ class Trainer:
             fake_score_schema=self.lora_schemas["fake_score"],
             dedicated_generators=self._checkpoint_dedicated_generators(),
             rank0_control_generators=self._rank0_control_generators(),
-            provenance=self._checkpoint_provenance(git_identity),
+            provenance=self._checkpoint_provenance(),
             topology=self._checkpoint_topology(),
             shard_group=self.mesh.get_group("shard"),
             keep_last=self.resolved.keep_last_resumable,
@@ -1898,7 +1829,7 @@ class Trainer:
             require_complete=require_complete,
         )
 
-    def _train_loop(self, git_identity: Mapping[str, Any]) -> None:
+    def _train_loop(self) -> None:
         cycle_elapsed: list[float] = []
         cycle_retry_elapsed: list[float] = []
         cycle_step_fields: list[Mapping[str, Any]] = []
@@ -1954,7 +1885,7 @@ class Trainer:
             )
             if should_save:
                 started = time.perf_counter()
-                event = self._save_checkpoint(git_identity)
+                event = self._save_checkpoint()
                 elapsed = time.perf_counter() - started
                 self._append_metric(
                     "checkpoint_event",
@@ -1979,9 +1910,6 @@ class Trainer:
         try:
             from utils.stage2_fsdp2 import build_stage2_fsdp2_device_mesh
 
-            git_identity = self._rank0_checked(
-                "clean Git identity", lambda: _repo_identity(self.project_root)
-            )
             self._rank0_checked(
                 "create Stage-2 output directory",
                 lambda: self.options.output_dir.mkdir(parents=True, exist_ok=True),
@@ -2003,9 +1931,7 @@ class Trainer:
             self._world_checked("Stage-2 data runtime", self._build_data_runtime)
             self._world_checked(
                 "Stage-2 resume runtime provenance",
-                lambda: self._audit_resume_runtime_bindings(
-                    resume_payload, git_identity
-                ),
+                lambda: self._audit_resume_runtime_bindings(resume_payload),
             )
             self._initialize_roles(mesh, resume_payload)
             self._world_checked(
@@ -2025,9 +1951,9 @@ class Trainer:
             )
             self._world_checked(
                 "build Stage-2 JSONL logger",
-                lambda: self._build_logger(resume_payload, git_identity),
+                lambda: self._build_logger(resume_payload),
             )
-            self._train_loop(git_identity)
+            self._train_loop()
             complete = (
                 not self.options.dry_run
                 and self.state.completed_g == self.resolved.total_generator_updates
