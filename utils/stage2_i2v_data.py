@@ -22,17 +22,12 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.utils.data import Dataset
 
 from utils.config import DEFAULT_NEGATIVE_PROMPT
-from utils.stage1_i2v_data import (
-    STAGE1_CACHE_SCHEMA_VERSION,
-    Stage1I2VRecord,
-    load_stage1_i2v_manifest,
-)
 from utils.stage1_io import (
     aggregate_file_hash,
     atomic_output_path,
@@ -42,6 +37,10 @@ from utils.stage1_io import (
     sha256_file,
     tree_file_hashes,
 )
+from utils.stage1_i2v_schema import STAGE1_CACHE_SCHEMA_VERSION
+
+if TYPE_CHECKING:
+    from utils.stage1_i2v_data import Stage1I2VRecord
 
 STAGE2_CACHE_MANIFEST_NAME = "stage2_i2v_manifest.json"
 STAGE2_CACHE_SCHEMA = "longlive_stage2_i2v_cache"
@@ -2148,6 +2147,8 @@ def audit_stage2_i2v_cache(
 ) -> dict[str, Any]:
     """Scan every Stage-2 cache artifact and atomically write the training gate."""
 
+    from utils.stage1_i2v_data import load_stage1_i2v_manifest
+
     if isinstance(expected_num_samples, bool) or int(expected_num_samples) <= 0:
         raise ValueError("expected_num_samples must be a positive integer.")
     if (
@@ -2527,6 +2528,8 @@ def validate_stage2_i2v_runtime_bindings(
     expected_num_samples: int,
 ) -> dict[str, Any]:
     """Revalidate every mutable external input before a training process starts."""
+
+    from utils.stage1_i2v_data import load_stage1_i2v_manifest
 
     provenance = _require_required_keys(
         manifest.get("provenance"),

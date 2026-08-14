@@ -23,6 +23,7 @@ from utils.stage1_io import (
     sha256_file,
     tree_file_hashes,
 )
+from utils.stage1_i2v_schema import STAGE1_CACHE_SCHEMA_VERSION
 
 
 STAGE1_REQUIRED_COLUMNS = (
@@ -33,7 +34,6 @@ STAGE1_REQUIRED_COLUMNS = (
     "width",
     "bucket",
 )
-STAGE1_CACHE_SCHEMA_VERSION = 1
 STAGE1_CACHE_MANIFEST_NAME = "cache_manifest.json"
 EXPECTED_CACHE_DTYPES = {
     "video_latent": torch.bfloat16,
