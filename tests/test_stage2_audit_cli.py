@@ -1,4 +1,3 @@
-from pathlib import Path
 import inspect
 import os
 import subprocess
@@ -9,48 +8,6 @@ import pytest
 import torch
 
 from scripts import audit_stage2_i2v_cache as audit_cli
-
-
-def _run_git(repo: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return completed.stdout.strip()
-
-
-def test_cache_audit_code_version_rejects_every_untracked_file(tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _run_git(repo, "init")
-    _run_git(repo, "config", "user.name", "Stage2 Test")
-    _run_git(repo, "config", "user.email", "stage2-test@example.invalid")
-    (repo / "tracked.py").write_text("VALUE = 1\n", encoding="utf-8")
-    _run_git(repo, "add", "tracked.py")
-    _run_git(repo, "commit", "-m", "fixture")
-    revision = _run_git(repo, "rev-parse", "HEAD")
-
-    monkeypatch.setattr(audit_cli, "PROJECT_ROOT", repo)
-    assert audit_cli._git_code_version() == f"git:{revision}"
-
-    (repo / "untracked_stage2.py").write_text("VALUE = 2\n", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="clean committed checkout"):
-        audit_cli._git_code_version()
-
-
-def test_cache_audit_git_gate_rejects_redirected_environment(tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    decoy = tmp_path / "decoy.git"
-    repo.mkdir()
-    decoy.mkdir()
-    monkeypatch.setattr(audit_cli, "PROJECT_ROOT", repo)
-    monkeypatch.setenv("GIT_DIR", str(decoy))
-
-    with pytest.raises(RuntimeError, match="redirected Git provenance.*GIT_DIR"):
-        audit_cli._git_code_version()
 
 
 def test_direct_cli_refuses_nonisolated_startup_before_argparse_shadow(tmp_path):
@@ -77,14 +34,14 @@ def test_direct_cli_refuses_nonisolated_startup_before_argparse_shadow(tmp_path)
     assert not marker.exists()
 
 
-def test_isolated_direct_cli_runs_git_gate_before_any_project_import(tmp_path):
+def test_isolated_direct_cli_does_not_depend_on_git_state(tmp_path):
     shadow_root = tmp_path / "shadow"
     shadow_root.mkdir()
     marker = tmp_path / "project-imported.txt"
     (shadow_root / "omegaconf.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('imported', encoding='utf-8')\n"
-        "raise RuntimeError('project import ran before provenance gate')\n",
+        "raise RuntimeError('isolated startup imported shadow module')\n",
         encoding="utf-8",
     )
     environment = dict(os.environ)
@@ -97,27 +54,8 @@ def test_isolated_direct_cli_runs_git_gate_before_any_project_import(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert completed.returncode != 0
-    assert "Refusing redirected Git provenance environment" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
     assert not marker.exists()
-
-
-def test_cache_audit_git_gate_rejects_ignored_python_bytecode(tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _run_git(repo, "init")
-    _run_git(repo, "config", "user.name", "Stage2 Test")
-    _run_git(repo, "config", "user.email", "stage2-test@example.invalid")
-    (repo / ".gitignore").write_text("*.pyc\n*.so\n", encoding="utf-8")
-    (repo / "tracked.py").write_text("VALUE = 1\n", encoding="utf-8")
-    _run_git(repo, "add", ".gitignore", "tracked.py")
-    _run_git(repo, "commit", "-m", "fixture")
-    monkeypatch.setattr(audit_cli, "PROJECT_ROOT", repo)
-    assert audit_cli._git_code_version().startswith("git:")
-
-    (repo / "unchecked_shadow.pyc").write_bytes(b"unchecked-bytecode")
-    with pytest.raises(RuntimeError, match="ignored repository files"):
-        audit_cli._git_code_version()
 
 
 def test_formal_audit_cli_has_no_dirty_or_sample_count_bypass():
@@ -171,11 +109,6 @@ def test_formal_audit_cli_rejects_paths_that_drift_from_resolved_config(
     )
     monkeypatch.setattr(audit_cli.OmegaConf, "load", lambda _path: object())
     monkeypatch.setattr(audit_cli, "resolve_stage2_config", lambda _config: resolved)
-    monkeypatch.setattr(
-        audit_cli,
-        "_git_code_version",
-        lambda: (_ for _ in ()).throw(AssertionError("path gate ran too late")),
-    )
     values = {
         "config_path": str(tmp_path / "stage2.yaml"),
         "cache_dir": None,

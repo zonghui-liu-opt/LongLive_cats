@@ -8,7 +8,6 @@ from datetime import timedelta
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any, Callable, TypeVar
 
@@ -30,39 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="New directory for role_init_manifest.json and ROLE_INIT_COMPLETE.",
     )
-    parser.add_argument(
-        "--expected-git-commit",
-        help="Optional exact 40-character commit required for this run.",
-    )
     return parser
-
-
-def _git_audit(project_root: Path) -> dict[str, Any]:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=project_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"git rev-parse failed: {result.stderr.strip()}")
-    commit = result.stdout.strip()
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-        cwd=project_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if status.returncode != 0:
-        raise RuntimeError(f"git status failed: {status.stderr.strip()}")
-    if status.stdout.strip():
-        raise RuntimeError(
-            "Stage-2 role preflight requires a clean worktree so HEAD exactly "
-            f"identifies executed code; dirty entries={status.stdout.splitlines()[:12]}"
-        )
-    return {"commit": commit, "worktree_clean": True}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,7 +57,6 @@ def main(argv: list[str] | None = None) -> int:
         write_stage2_role_init_artifacts,
     )
 
-    project_root = PROJECT_ROOT
     resolved = load_stage2_config(args.config)
     # This check precedes output inspection, asset hashing, CUDA model creation,
     # and all other side effects. Resume remains exclusively Step 10.
@@ -98,13 +64,6 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     if output_dir.exists():
         raise FileExistsError(output_dir)
-    git_audit = _git_audit(project_root)
-    commit = git_audit["commit"]
-    if args.expected_git_commit and commit != args.expected_git_commit:
-        raise RuntimeError(
-            f"Git commit mismatch: expected={args.expected_git_commit}, actual={commit}"
-        )
-
     initialized_here = False
     try:
         if not dist.is_initialized():
@@ -204,7 +163,6 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build_stage2_role_init_manifest(
                 contract_hash=resolved.contract_hash(),
                 launch_hash=resolved.launch_hash(),
-                git_commit=commit,
                 generator_asset=assets["generator"],
                 real_score_asset=assets["real_score"],
                 role_audits=local_audit["roles"],
@@ -223,7 +181,6 @@ def main(argv: list[str] | None = None) -> int:
                 "output_dir": str(output_dir),
                 "manifest_sha256": manifest["manifest_sha256"],
                 "rank_consensus_sha256": rank_consensus_sha256,
-                "git": git_audit,
             }
 
         publication = world_checked(

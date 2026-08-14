@@ -35,8 +35,6 @@ from utils.stage2_i2v_data import (
     upgrade_legacy_source_cache_manifest_text_encoding,
 )
 
-CODE_VERSION = "git:" + "a" * 40
-
 
 def _video(frames: int, *, h: int = 30, w: int = 52, row_id: int = 0):
     values = torch.empty(frames, 48, h, w, dtype=torch.bfloat16)
@@ -230,18 +228,6 @@ def _decoder(record, **kwargs):
         "fps_abs_tolerance": 1.0e-3,
     }
     return torch.full((1, 3, 97, 1, 1), record.row_id, dtype=torch.float32)
-
-
-@pytest.fixture(autouse=True)
-def _clean_code(monkeypatch):
-    monkeypatch.setattr(
-        "utils.stage2_f25_cache._resolve_clean_repo_code_version",
-        lambda: CODE_VERSION,
-    )
-    monkeypatch.setattr(
-        "utils.stage2_i2v_data._resolve_clean_repo_code_version",
-        lambda: CODE_VERSION,
-    )
 
 
 def _prepare(fixture, tmp_path, calls, *, output_name="f25"):
@@ -558,7 +544,6 @@ def test_native_manifest_upgrades_outside_cache_and_loader_closes_chain(
         external,
         expected_num_samples=2,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=CODE_VERSION,
     )
     assert loaded["schema"] == STAGE2_F25_SOURCE_CACHE_SCHEMA
 

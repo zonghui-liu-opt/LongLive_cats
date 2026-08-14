@@ -44,19 +44,6 @@ from utils.stage2_f25_cache import prepare_stage2_f25_cache
 ACTIONS = ("head_tilt", "jump", "toy_play")
 CONFIG_CONTRACT_HASH = "3" * 64
 CONFIG_LAUNCH_HASH = "4" * 64
-UPGRADE_CODE_VERSION = "git:" + "a" * 40
-
-
-@pytest.fixture(autouse=True)
-def _trusted_clean_repo_code_version(monkeypatch):
-    monkeypatch.setattr(
-        "utils.stage2_i2v_data._resolve_clean_repo_code_version",
-        lambda: UPGRADE_CODE_VERSION,
-    )
-    monkeypatch.setattr(
-        "utils.stage2_f25_cache._resolve_clean_repo_code_version",
-        lambda: UPGRADE_CODE_VERSION,
-    )
 
 
 def _locked_tokenizer_runtime_audit():
@@ -312,7 +299,6 @@ def _build_fixture(root: Path, *, source_actions=False):
             ],
         },
         "verification": {
-            "code_version": UPGRADE_CODE_VERSION,
             "validator_file": "utils/wan_5b_wrapper.py",
             "validator_file_sha256": sha256_file(validator_path),
             "text_encoding_contract_sha256": canonical_json_sha256(text_encoding),
@@ -766,25 +752,15 @@ def test_dataset_rejects_stale_config_bindings(tmp_path, override, match):
         )
 
 
-def test_dataset_resolves_clean_code_internally_and_has_no_public_bypass(
-    tmp_path, monkeypatch
-):
+def test_dataset_has_no_code_identity_runtime_binding_or_public_bypass(tmp_path):
     fixture = _build_fixture(tmp_path)
     _audit(fixture)
-    monkeypatch.setattr(
-        "utils.stage2_i2v_data._resolve_clean_repo_code_version",
-        lambda: "git:" + "b" * 40,
-    )
-    with pytest.raises(RuntimeError, match="code_version"):
+    Stage2I2VCacheDataset(fixture["cache_dir"], **_dataset_kwargs(fixture))
+    with pytest.raises(TypeError, match="code_identity"):
         Stage2I2VCacheDataset(
             fixture["cache_dir"],
             **_dataset_kwargs(fixture),
-        )
-    with pytest.raises(TypeError, match="code_version"):
-        Stage2I2VCacheDataset(
-            fixture["cache_dir"],
-            **_dataset_kwargs(fixture),
-            code_version=UPGRADE_CODE_VERSION,
+            code_identity="unused",
         )
     with pytest.raises(TypeError, match="verify_on_read"):
         Stage2I2VCacheDataset(
@@ -945,7 +921,6 @@ def test_legacy_text_upgrade_remains_migration_only_for_formal_negative(
         "audit_wan_text_encoding_tokenizer_contract",
         lambda _path: _locked_tokenizer_runtime_audit(),
     )
-    monkeypatch.setattr(audit_cli, "_git_code_version", lambda: UPGRADE_CODE_VERSION)
     upgraded_source = tmp_path / "upgraded" / "stage2_source_manifest.json"
     assert upgraded_source.parent.resolve() != fixture["cache_dir"].resolve()
     audit_cli._upgrade_source_manifest(
@@ -965,7 +940,6 @@ def test_legacy_text_upgrade_remains_migration_only_for_formal_negative(
         upgraded_source,
         expected_num_samples=6,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=UPGRADE_CODE_VERSION,
     )
     assert (
         upgraded["stage2_text_encoding_upgrade"]["original_source_manifest"][
@@ -1010,7 +984,6 @@ def test_prepare_negative_rehashes_model_trees_after_encoding_without_publishing
     fixture = _build_fixture(tmp_path / "fixture")
     t5_checkpoint = fixture["t5_checkpoint"]
     tokenizer_dir = fixture["tokenizer_dir"]
-    monkeypatch.setattr(audit_cli, "_git_code_version", lambda: UPGRADE_CODE_VERSION)
 
     class _MutatingWanTextEncoder:
         def __init__(self, *, t5_checkpoint, tokenizer_dir, device):
@@ -1141,39 +1114,6 @@ def test_legacy_upgrade_rehashes_model_trees_after_runtime_probe(
     assert not output.exists()
 
 
-def test_legacy_upgrade_rechecks_clean_head_before_atomic_publish(
-    tmp_path, monkeypatch
-):
-    from utils import wan_5b_wrapper
-
-    fixture, legacy, t5_checkpoint, tokenizer_dir = (
-        _build_official_legacy_upgrade_fixture(tmp_path / "fixture")
-    )
-    monkeypatch.setattr(
-        wan_5b_wrapper,
-        "audit_wan_text_encoding_tokenizer_contract",
-        lambda _path: _locked_tokenizer_runtime_audit(),
-    )
-    revisions = iter([UPGRADE_CODE_VERSION, "git:" + "b" * 40])
-    monkeypatch.setattr(
-        "utils.stage2_i2v_data._resolve_clean_repo_code_version",
-        lambda: next(revisions),
-    )
-    output = tmp_path / "must-not-publish.json"
-    with pytest.raises(RuntimeError, match="code version changed during"):
-        upgrade_legacy_source_cache_manifest_text_encoding(
-            fixture["source"],
-            output,
-            expected_source_manifest_sha256=legacy["manifest_sha256"],
-            t5_checkpoint_path=t5_checkpoint,
-            tokenizer_dir=tokenizer_dir,
-            operator_id="operator-test",
-            operator_attestation=STAGE2_TEXT_ENCODING_OPERATOR_ATTESTATION,
-            expected_num_samples=6,
-        )
-    assert not output.exists()
-
-
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -1207,7 +1147,6 @@ def test_attested_upgrade_rejects_resigned_tamper_and_loose_types(
             fixture["source"],
             expected_num_samples=6,
             require_text_encoding_upgrade=True,
-            expected_upgrade_code_version=UPGRADE_CODE_VERSION,
         )
 
 

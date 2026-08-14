@@ -109,7 +109,8 @@ def test_prepare_stage2_runs_exactly_the_five_pretrain_gates_without_training():
     assert "train.py" not in text
     assert "--no-auto-resume" not in text
     assert "stage1_step3075" not in text
-    assert "git clone --quiet --no-local" in text
+    assert "git " not in text
+    assert "STAGE2_PRETRAIN_INNER" not in text
 
     completed = subprocess.run(
         ["bash", "-n", str(PREPARE)],
@@ -119,3 +120,25 @@ def test_prepare_stage2_runs_exactly_the_five_pretrain_gates_without_training():
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_prepare_stage2_call_chain_has_no_git_clean_or_code_version_gate():
+    paths = (
+        PREPARE,
+        PROJECT_ROOT / "scripts" / "prepare_stage2_i2v_f25_cache.py",
+        PROJECT_ROOT / "scripts" / "audit_stage2_i2v_cache.py",
+        PROJECT_ROOT / "scripts" / "preflight_stage2_roles.py",
+        PROJECT_ROOT / "utils" / "stage2_f25_cache.py",
+        PROJECT_ROOT / "utils" / "stage2_i2v_data.py",
+    )
+    text = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+    for forbidden in (
+        "git rev-parse",
+        "git status",
+        "git clone",
+        "_resolve_clean_repo_code_version",
+        "_git_code_version",
+        "expected_upgrade_code_version",
+        "expected-git-commit",
+    ):
+        assert forbidden not in text

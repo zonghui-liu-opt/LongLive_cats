@@ -3,34 +3,9 @@ set -Eeuo pipefail
 
 trap 'echo "STAGE2_PRETRAIN_CHECK_FAILED (line ${LINENO})" >&2' ERR
 
-SOURCE_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_pretrain_check}"
-
-# 正式数据工具要求执行仓库绝对干净。自动创建只含已提交代码的副本，
-# checkpoints/results/logs 全部放在副本外面。
-if [[ "${STAGE2_PRETRAIN_INNER:-0}" != "1" ]]; then
-  SOURCE_COMMIT="$(git -C "$SOURCE_REPO" rev-parse HEAD)"
-  SOURCE_BRANCH="$(git -C "$SOURCE_REPO" branch --show-current)"
-  [[ -n "$SOURCE_BRANCH" ]] || { echo "请先切到 stage-2 分支。" >&2; exit 1; }
-  CLEAN_REPO="$STAGE2_WORK_ROOT/code-${SOURCE_COMMIT:0:12}"
-  mkdir -p "$STAGE2_WORK_ROOT"
-  if [[ ! -e "$CLEAN_REPO" ]]; then
-    git clone --quiet --no-local --branch "$SOURCE_BRANCH" "$SOURCE_REPO" "$CLEAN_REPO"
-  fi
-  [[ "$(git -C "$CLEAN_REPO" rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || {
-    echo "干净代码副本版本不一致，请换一个 STAGE2_WORK_ROOT。" >&2
-    exit 1
-  }
-  export STAGE2_PRETRAIN_INNER=1
-  export STAGE2_SOURCE_COMMIT="$SOURCE_COMMIT"
-  exec bash "$CLEAN_REPO/prepare_stage2.sh"
-fi
-
-REPO_ROOT="$SOURCE_REPO"
 cd "$REPO_ROOT"
-[[ "$(git rev-parse HEAD)" == "${STAGE2_SOURCE_COMMIT:?}" ]]
-[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
-[[ -z "$(git ls-files --others --ignored --exclude-standard)" ]]
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
@@ -285,7 +260,7 @@ if [[ ! -e "$F25_ATTESTED" ]]; then
     2>&1 | tee "$LOG_DIR/source_attestation.log"
 fi
 
-"$STAGE2_PYTHON" -B - "$F25_ATTESTED" "$(git rev-parse HEAD)" <<'PY'
+"$STAGE2_PYTHON" -B - "$F25_ATTESTED" <<'PY'
 import sys
 from pathlib import Path
 from utils.stage2_i2v_data import load_source_cache_manifest
@@ -293,7 +268,6 @@ load_source_cache_manifest(
     Path(sys.argv[1]),
     expected_num_samples=600,
     require_text_encoding_upgrade=True,
-    expected_upgrade_code_version=f"git:{sys.argv[2]}",
 )
 PY
 
@@ -379,7 +353,6 @@ if [[ ! -e "$ROLE_INIT_DIR" ]]; then
     scripts/preflight_stage2_roles.py \
     --config "$STAGE2_CONFIG" \
     --output-dir "$ROLE_INIT_DIR" \
-    --expected-git-commit "$(git rev-parse HEAD)" \
     2>&1 | tee "$LOG_DIR/role_init.log"
 elif [[ ! -f "$ROLE_INIT_DIR/role_init_manifest.json" || ! -f "$ROLE_INIT_DIR/ROLE_INIT_COMPLETE" ]]; then
   echo "角色初始化结果不完整；请换一个 STAGE2_WORK_ROOT。" >&2
@@ -387,7 +360,7 @@ elif [[ ! -f "$ROLE_INIT_DIR/role_init_manifest.json" || ! -f "$ROLE_INIT_DIR/RO
 fi
 
 "$STAGE2_PYTHON" -B - \
-  "$ROLE_INIT_DIR/role_init_manifest.json" "$CONTRACT_HASH" "$LAUNCH_HASH" "$(git rev-parse HEAD)" <<'PY'
+  "$ROLE_INIT_DIR/role_init_manifest.json" "$CONTRACT_HASH" "$LAUNCH_HASH" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -403,7 +376,6 @@ assert record["artifact_kind"] == "init_only_audit_not_training_checkpoint"
 assert record["initialization_mode"] == "init_from_stage1"
 assert record["config"]["contract_hash"] == sys.argv[2]
 assert record["config"]["launch_hash"] == sys.argv[3]
-assert record["code"]["git_commit"] == sys.argv[4]
 assert set(record["roles"]) == {"generator", "real_score", "fake_score"}
 assert record["side_effects"] == {
     "tripwires_enforced": [

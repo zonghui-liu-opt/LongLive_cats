@@ -17,101 +17,8 @@ import argparse  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 from pathlib import Path  # noqa: E402
-import subprocess  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_SYSTEM_GIT = Path("/usr/bin/git")
-_UNSAFE_GIT_ENV_KEYS = {
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CONFIG",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_DIR",
-    "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE",
-    "GIT_NAMESPACE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_SHALLOW_FILE",
-    "GIT_WORK_TREE",
-}
-
-
-def _git_environment() -> dict[str, str]:
-    unsafe = sorted(
-        key
-        for key in os.environ
-        if key in _UNSAFE_GIT_ENV_KEYS
-        or key.startswith("GIT_CONFIG_KEY_")
-        or key.startswith("GIT_CONFIG_VALUE_")
-    )
-    if unsafe:
-        raise RuntimeError(
-            "Refusing redirected Git provenance environment: " + ", ".join(unsafe)
-        )
-    return {
-        "PATH": "/usr/bin:/bin",
-        "LC_ALL": "C",
-        "LANG": "C",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-    }
-
-
-def _git_stdout(*args: str) -> str:
-    if not _SYSTEM_GIT.is_file():
-        raise RuntimeError(f"Trusted system Git executable is missing: {_SYSTEM_GIT}.")
-    try:
-        completed = subprocess.run(
-            [
-                str(_SYSTEM_GIT),
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.untrackedCache=false",
-                "-C",
-                str(PROJECT_ROOT),
-                *args,
-            ],
-            cwd=PROJECT_ROOT,
-            env=_git_environment(),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"Git provenance command failed: {' '.join(args)}") from exc
-    return completed.stdout.strip()
-
-
-def _clean_code_version() -> str:
-    top = Path(_git_stdout("rev-parse", "--show-toplevel")).resolve()
-    if top != PROJECT_ROOT.resolve():
-        raise RuntimeError("Git top-level differs from the physical project root.")
-    revision = _git_stdout("rev-parse", "HEAD")
-    if len(revision) not in {40, 64} or revision != revision.lower():
-        raise RuntimeError("Git HEAD is not a lowercase object id.")
-    try:
-        bytes.fromhex(revision)
-    except ValueError as exc:
-        raise RuntimeError("Git HEAD is not a lowercase object id.") from exc
-    if _git_stdout("status", "--porcelain=v1", "--untracked-files=all"):
-        raise RuntimeError(
-            "F25 preparation requires a clean committed physical checkout."
-        )
-    if _git_stdout("ls-files", "--others", "--ignored", "--exclude-standard"):
-        raise RuntimeError(
-            "F25 preparation rejects ignored repository files, including bytecode."
-        )
-    return f"git:{revision}"
-
-
-if __name__ == "__main__":
-    _clean_code_version()
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -139,7 +46,6 @@ def _distributed_device() -> tuple[int, int, torch.device]:
 
 
 def _run(args: argparse.Namespace) -> None:
-    code_version = _clean_code_version()
     config_path = Path(args.config_path).expanduser().resolve()
     resolved = resolve_stage2_config(OmegaConf.load(config_path))
     if resolved.video_latent_frames != 25 or resolved.future_latent_frames != 24:
@@ -166,8 +72,6 @@ def _run(args: argparse.Namespace) -> None:
         device=device,
         vae_checkpoint_path=args.vae_checkpoint,
     )
-    if _clean_code_version() != code_version:
-        raise RuntimeError("Clean checkout changed during F25 CLI execution.")
     if rank == 0:
         if manifest is None:
             raise AssertionError("rank 0 did not receive the F25 base manifest path")

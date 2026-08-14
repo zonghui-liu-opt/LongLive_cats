@@ -544,7 +544,6 @@ def _role_init_manifest_kwargs():
     return {
         "contract_hash": "a" * 64,
         "launch_hash": "b" * 64,
-        "git_commit": "c" * 40,
         "generator_asset": {"checkpoint_sha256": "d" * 64},
         "real_score_asset": {"checkpoint_sha256": "e" * 64},
         "role_audits": _role_init_audits(),

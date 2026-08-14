@@ -22,7 +22,6 @@ import json
 import math
 import os
 from pathlib import Path
-import subprocess
 from typing import Any
 
 import torch
@@ -167,7 +166,6 @@ _TEXT_ENCODING_UPGRADE_ORIGINAL_KEYS = {
     "source_fingerprint_sha256",
 }
 _TEXT_ENCODING_UPGRADE_VERIFICATION_KEYS = {
-    "code_version",
     "validator_file",
     "validator_file_sha256",
     "text_encoding_contract_sha256",
@@ -176,26 +174,6 @@ _TEXT_ENCODING_UPGRADE_VERIFICATION_KEYS = {
     "tokenizer_runtime_audit",
 }
 _TEXT_ENCODING_UPGRADE_ATTESTATION_KEYS = {"operator_id", "statement"}
-_PHYSICAL_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_SYSTEM_GIT = Path("/usr/bin/git")
-_UNSAFE_GIT_ENV_KEYS = {
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CONFIG",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_DIR",
-    "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE",
-    "GIT_NAMESPACE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_SHALLOW_FILE",
-    "GIT_WORK_TREE",
-}
 _NEGATIVE_ARTIFACT_KEYS = {
     "path",
     "size",
@@ -235,7 +213,6 @@ _STAGE2_PROVENANCE_KEYS = {
     "source_cache_manifest_sha256",
     "config_contract_sha256",
     "config_launch_sha256",
-    "code_version",
 }
 _STAGE2_NEGATIVE_BINDING_KEYS = {
     "manifest_path",
@@ -293,7 +270,7 @@ _F25_INPUT_MANIFEST_KEYS = {
     "schema",
     "schema_version",
 }
-_F25_PRODUCER_KEYS = {"code_version", "file", "file_sha256"}
+_F25_PRODUCER_KEYS = {"file", "file_sha256"}
 _F25_CONFIG_KEYS = {
     "path",
     "file_sha256",
@@ -392,6 +369,18 @@ def _require_exact_keys(
     extra = sorted(actual - expected)
     if missing or extra:
         raise RuntimeError(f"{label} keys mismatch: missing={missing}, extra={extra}.")
+    return mapping
+
+
+def _require_required_keys(
+    value: Any, *, label: str, required: set[str]
+) -> dict[str, Any]:
+    """Require functional fields while allowing inert legacy metadata."""
+
+    mapping = _require_mapping(value, label)
+    missing = sorted(required - set(mapping))
+    if missing:
+        raise RuntimeError(f"{label} keys mismatch: missing={missing}.")
     return mapping
 
 
@@ -917,12 +906,11 @@ def _validate_f25_source_preparation(
                 f"Stage-2 F25 input manifest provenance mismatch for {key}."
             )
 
-    producer = _require_exact_keys(
+    producer = _require_required_keys(
         preparation["producer"],
         label="Stage-2 F25 preparation.producer",
-        expected=_F25_PRODUCER_KEYS,
+        required=_F25_PRODUCER_KEYS,
     )
-    _require_git_code_version(producer["code_version"], "F25 producer code_version")
     if producer["file"] != "utils/stage2_f25_cache.py":
         raise RuntimeError("Unexpected Stage-2 F25 producer file.")
     producer_sha256 = _require_sha256(
@@ -1308,107 +1296,10 @@ def _validate_source_manifest_base(
     return fingerprint, fingerprint_hash
 
 
-def _require_git_code_version(value: Any, label: str) -> str:
-    value = _require_nonempty_string(value, label)
-    if not value.startswith("git:"):
-        raise RuntimeError(f"{label} must use the exact git:<commit> format.")
-    revision = value.removeprefix("git:")
-    if len(revision) not in {40, 64} or revision != revision.lower():
-        raise RuntimeError(f"{label} must contain a lowercase Git object id.")
-    try:
-        bytes.fromhex(revision)
-    except ValueError as exc:
-        raise RuntimeError(f"{label} must contain a lowercase Git object id.") from exc
-    return value
-
-
-def _sanitized_git_environment() -> dict[str, str]:
-    unsafe = sorted(
-        key
-        for key in os.environ
-        if key in _UNSAFE_GIT_ENV_KEYS
-        or key.startswith("GIT_CONFIG_KEY_")
-        or key.startswith("GIT_CONFIG_VALUE_")
-    )
-    if unsafe:
-        raise RuntimeError(
-            "Refusing redirected Git provenance environment: " + ", ".join(unsafe)
-        )
-    return {
-        "PATH": "/usr/bin:/bin",
-        "LC_ALL": "C",
-        "LANG": "C",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-    }
-
-
-def _physical_git_stdout(project_root: Path, *args: str) -> str:
-    if not _SYSTEM_GIT.is_file():
-        raise RuntimeError(f"Trusted system Git executable is missing: {_SYSTEM_GIT}.")
-    try:
-        completed = subprocess.run(
-            [
-                str(_SYSTEM_GIT),
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.untrackedCache=false",
-                "-C",
-                str(project_root),
-                *args,
-            ],
-            cwd=project_root,
-            env=_sanitized_git_environment(),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"Git provenance command failed: {' '.join(args)}") from exc
-    return completed.stdout.strip()
-
-
-def _resolve_clean_repo_code_version() -> str:
-    """Resolve the physical checkout's immutable clean HEAD for training."""
-
-    project_root = _PHYSICAL_PROJECT_ROOT.resolve()
-    top_level = Path(
-        _physical_git_stdout(project_root, "rev-parse", "--show-toplevel")
-    ).resolve()
-    if top_level != project_root:
-        raise RuntimeError(
-            "Git top-level differs from the physical Stage-2 project root: "
-            f"{top_level} != {project_root}."
-        )
-    revision = _physical_git_stdout(project_root, "rev-parse", "HEAD")
-    code_version = _require_git_code_version(
-        f"git:{revision}", "physical checkout code_version"
-    )
-    status = _physical_git_stdout(
-        project_root, "status", "--porcelain=v1", "--untracked-files=all"
-    )
-    if status:
-        raise RuntimeError(
-            "Stage-2 training requires a clean committed checkout at the physical "
-            "project root."
-        )
-    ignored = _physical_git_stdout(
-        project_root, "ls-files", "--others", "--ignored", "--exclude-standard"
-    )
-    if ignored:
-        raise RuntimeError(
-            "Stage-2 training rejects ignored files inside the repository, including "
-            "unchecked Python bytecode or native extensions."
-        )
-    return code_version
-
-
 def _validate_text_encoding_upgrade(
     source_manifest: Mapping[str, Any],
     *,
     expected_num_samples: int,
-    expected_code_version: str | None,
 ) -> dict[str, Any] | None:
     raw_upgrade = source_manifest.get(STAGE2_TEXT_ENCODING_UPGRADE_KEY)
     if raw_upgrade is None:
@@ -1458,20 +1349,11 @@ def _validate_text_encoding_upgrade(
             "Legacy source fingerprint hash differs from upgrade provenance."
         )
 
-    verification = _require_exact_keys(
+    verification = _require_required_keys(
         upgrade["verification"],
         label="text-encoding upgrade verification",
-        expected=_TEXT_ENCODING_UPGRADE_VERIFICATION_KEYS,
+        required=_TEXT_ENCODING_UPGRADE_VERIFICATION_KEYS,
     )
-    code_version = _require_git_code_version(
-        verification["code_version"], "text-encoding upgrade code_version"
-    )
-    if expected_code_version is not None and code_version != _require_git_code_version(
-        expected_code_version, "expected text-encoding upgrade code_version"
-    ):
-        raise RuntimeError(
-            "Text-encoding upgrade was produced by a different clean git revision."
-        )
     if verification["validator_file"] != "utils/wan_5b_wrapper.py":
         raise RuntimeError("Unexpected text-encoding validator file.")
     validator_path = (
@@ -1661,7 +1543,6 @@ def load_source_cache_manifest(
     *,
     expected_num_samples: int,
     require_text_encoding_upgrade: bool = False,
-    expected_upgrade_code_version: str | None = None,
 ) -> dict[str, Any]:
     """Load the producer manifest used to bind cache and text provenance."""
 
@@ -1682,7 +1563,6 @@ def load_source_cache_manifest(
     upgrade = _validate_text_encoding_upgrade(
         manifest,
         expected_num_samples=expected_num_samples,
-        expected_code_version=expected_upgrade_code_version,
     )
     if require_text_encoding_upgrade and upgrade is None:  # defensive tripwire
         raise AssertionError("required text-encoding upgrade validation was skipped")
@@ -1753,7 +1633,6 @@ def upgrade_legacy_source_cache_manifest_text_encoding(
         expected_source_manifest_sha256,
         "expected_source_manifest_sha256",
     )
-    code_version = _resolve_clean_repo_code_version()
     operator_id = _require_nonempty_string(operator_id, "operator_id")
     if operator_attestation != STAGE2_TEXT_ENCODING_OPERATOR_ATTESTATION:
         raise RuntimeError(
@@ -1808,7 +1687,7 @@ def upgrade_legacy_source_cache_manifest_text_encoding(
         validator_relative = validator_path.relative_to(project_root).as_posix()
     except ValueError as exc:
         raise RuntimeError(
-            "Wan text validator must live inside the clean checkout."
+            "Wan text validator must live inside the project directory."
         ) from exc
     if validator_relative != "utils/wan_5b_wrapper.py":
         raise RuntimeError(
@@ -1839,7 +1718,6 @@ def upgrade_legacy_source_cache_manifest_text_encoding(
             "source_fingerprint_sha256": fingerprint_hash,
         },
         "verification": {
-            "code_version": code_version,
             "validator_file": validator_relative,
             "validator_file_sha256": sha256_file(validator_path),
             "text_encoding_contract_sha256": canonical_json_sha256(contract),
@@ -1868,11 +1746,6 @@ def upgrade_legacy_source_cache_manifest_text_encoding(
             raise RuntimeError("Tokenizer tree changed during the upgrade audit.")
         if sha256_file(legacy_path) != original_bytes_hash:
             raise RuntimeError("Source base manifest changed during the upgrade audit.")
-        if _resolve_clean_repo_code_version() != code_version:
-            raise RuntimeError(
-                "Clean checkout code version changed during the source-manifest "
-                "upgrade."
-            )
 
     # The tokenizer probe executes code against the tokenizer tree.  Rehash
     # immediately after it, then again after the potentially long native-F25
@@ -1886,7 +1759,6 @@ def upgrade_legacy_source_cache_manifest_text_encoding(
             temporary,
             expected_num_samples=expected_num_samples,
             require_text_encoding_upgrade=True,
-            expected_upgrade_code_version=code_version,
         )
         verify_upgrade_inputs_unchanged()
     return output_path
@@ -1900,7 +1772,6 @@ def save_negative_conditioning_artifact(
 ) -> dict[str, Any]:
     """Save one offline negative embedding artifact after strict validation."""
 
-    _resolve_clean_repo_code_version()
     from safetensors.torch import save_file
 
     tensors = {
@@ -1936,29 +1807,15 @@ def write_negative_conditioning_manifest(
     source_cache_manifest_path: str | os.PathLike[str],
     expected_num_samples: int,
     require_text_encoding_upgrade: bool = False,
-    expected_upgrade_code_version: str | None = None,
 ) -> Path:
     """Bind an offline negative embedding to the positive cache provenance."""
 
-    code_version = _resolve_clean_repo_code_version()
-    if (
-        expected_upgrade_code_version is not None
-        and _require_git_code_version(
-            expected_upgrade_code_version, "expected_upgrade_code_version"
-        )
-        != code_version
-    ):
-        raise RuntimeError(
-            "Negative-conditioning producer expected code_version differs from "
-            "the clean physical checkout."
-        )
     output_path = Path(output_path).expanduser().resolve()
     artifact_path = Path(artifact_path).expanduser().resolve()
     source = load_source_cache_manifest(
         source_cache_manifest_path,
         expected_num_samples=expected_num_samples,
         require_text_encoding_upgrade=require_text_encoding_upgrade,
-        expected_upgrade_code_version=code_version,
     )
     if source.get("schema") != STAGE2_F25_SOURCE_CACHE_SCHEMA:
         raise RuntimeError(
@@ -2009,11 +1866,6 @@ def write_negative_conditioning_manifest(
         "artifact": artifact,
     }
     manifest["manifest_sha256"] = canonical_json_sha256(manifest)
-    if _resolve_clean_repo_code_version() != code_version:
-        raise RuntimeError(
-            "Clean checkout code version changed during negative-conditioning "
-            "manifest creation."
-        )
     atomic_write_json(output_path, manifest)
     return output_path
 
@@ -2314,8 +2166,6 @@ def audit_stage2_i2v_cache(
         config_contract_sha256, "config_contract_sha256"
     )
     config_launch_sha256 = _require_sha256(config_launch_sha256, "config_launch_sha256")
-    code_version = _resolve_clean_repo_code_version()
-
     cache_root = Path(cache_dir).expanduser().resolve()
     if not cache_root.is_dir():
         raise FileNotFoundError(cache_root)
@@ -2331,7 +2181,6 @@ def audit_stage2_i2v_cache(
         source_manifest_path,
         expected_num_samples=expected_num_samples,
         require_text_encoding_upgrade=require_text_encoding_upgrade,
-        expected_upgrade_code_version=code_version,
     )
     if (
         require_native_f25_source
@@ -2489,13 +2338,10 @@ def audit_stage2_i2v_cache(
             "source_cache_manifest_sha256": source_manifest["manifest_sha256"],
             "config_contract_sha256": config_contract_sha256,
             "config_launch_sha256": config_launch_sha256,
-            "code_version": code_version,
         },
         "records": audited_records,
     }
     manifest["manifest_sha256"] = canonical_json_sha256(manifest)
-    if _resolve_clean_repo_code_version() != code_version:
-        raise RuntimeError("Clean checkout code version changed during cache audit.")
     atomic_write_json(output_path, manifest)
     manifest["manifest_path"] = str(output_path)
     return manifest
@@ -2676,10 +2522,10 @@ def validate_stage2_i2v_runtime_bindings(
 ) -> dict[str, Any]:
     """Revalidate every mutable external input before a training process starts."""
 
-    provenance = _require_exact_keys(
+    provenance = _require_required_keys(
         manifest.get("provenance"),
         label="Stage-2 manifest.provenance",
-        expected=_STAGE2_PROVENANCE_KEYS,
+        required=_STAGE2_PROVENANCE_KEYS,
     )
     negative_binding = _require_exact_keys(
         manifest.get("negative_conditioning"),
@@ -2692,8 +2538,6 @@ def validate_stage2_i2v_runtime_bindings(
     config_launch_sha256 = _require_sha256(
         config_launch_sha256, "current config_launch_sha256"
     )
-    code_version = _resolve_clean_repo_code_version()
-
     metadata_path = Path(metadata_path).expanduser().resolve()
     if not metadata_path.is_file():
         raise FileNotFoundError(metadata_path)
@@ -2708,7 +2552,6 @@ def validate_stage2_i2v_runtime_bindings(
         "metadata_sha256": current_metadata_hash,
         "config_contract_sha256": config_contract_sha256,
         "config_launch_sha256": config_launch_sha256,
-        "code_version": code_version,
     }
     for key, actual in expected_values.items():
         if provenance[key] != actual or type(provenance[key]) is not type(actual):
@@ -2721,7 +2564,6 @@ def validate_stage2_i2v_runtime_bindings(
         source_cache_manifest_path,
         expected_num_samples=expected_num_samples,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=code_version,
     )
     if source.get("schema") != STAGE2_F25_SOURCE_CACHE_SCHEMA:
         raise RuntimeError(

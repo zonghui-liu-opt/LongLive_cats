@@ -48,7 +48,6 @@ from utils.stage2_i2v_data import (
 )
 
 ACTIONS = ("head_tilt", "jump", "toy_play")
-CODE_VERSION = "git:" + "a" * 40
 CONFIG_CONTRACT_SHA256 = "1" * 64
 CONFIG_LAUNCH_SHA256 = "2" * 64
 
@@ -97,14 +96,6 @@ def _resign_json(path: Path, value: dict) -> Path:
 
 @pytest.fixture(autouse=True)
 def _trusted_test_checkout(monkeypatch):
-    monkeypatch.setattr(
-        "utils.stage2_f25_cache._resolve_clean_repo_code_version",
-        lambda: CODE_VERSION,
-    )
-    monkeypatch.setattr(
-        "utils.stage2_i2v_data._resolve_clean_repo_code_version",
-        lambda: CODE_VERSION,
-    )
     monkeypatch.setattr(
         "utils.wan_5b_wrapper.audit_wan_text_encoding_tokenizer_contract",
         lambda _path: {
@@ -308,7 +299,6 @@ def _build_native_chain(root: Path) -> dict[str, Path]:
         source_cache_manifest_path=attested_path,
         expected_num_samples=6,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=CODE_VERSION,
     )
 
     sidecar = root / "actions.csv"
@@ -402,7 +392,6 @@ def test_native_chain_is_the_only_formal_audit_and_dataset_input(tmp_path):
             source_cache_manifest_path=chain["base"],
             expected_num_samples=6,
             require_text_encoding_upgrade=True,
-            expected_upgrade_code_version=CODE_VERSION,
         )
 
     # The F25 audit contract binds the exact metadata bytes, not merely the
@@ -438,7 +427,6 @@ def test_native_chain_is_the_only_formal_audit_and_dataset_input(tmp_path):
             source_cache_manifest_path=legacy_attested,
             expected_num_samples=6,
             require_text_encoding_upgrade=True,
-            expected_upgrade_code_version=CODE_VERSION,
         )
     with pytest.raises(RuntimeError, match="Formal Stage-2 audit.*native attested F25"):
         audit_stage2_i2v_cache(
@@ -460,7 +448,6 @@ def test_native_chain_is_the_only_formal_audit_and_dataset_input(tmp_path):
             resigned_tamper,
             expected_num_samples=6,
             require_text_encoding_upgrade=True,
-            expected_upgrade_code_version=CODE_VERSION,
         )
 
     # A self-consistent but stale negative manifest must remain bound to the
@@ -487,7 +474,6 @@ def test_native_chain_is_the_only_formal_audit_and_dataset_input(tmp_path):
         chain["attested"],
         expected_num_samples=6,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=CODE_VERSION,
     )
     with pytest.raises(RuntimeError, match="must be a relative path|escapes"):
         load_negative_conditioning(
@@ -641,14 +627,14 @@ def test_600_row_lightweight_plan_uses_real_decision_and_sharding_helpers():
     }
 
 
-def test_f25_cli_isolated_startup_runs_git_gate_before_project_import(tmp_path):
+def test_f25_cli_isolated_startup_does_not_depend_on_git_state(tmp_path):
     shadow_root = tmp_path / "shadow"
     shadow_root.mkdir()
     marker = tmp_path / "omegaconf-imported.txt"
     (shadow_root / "omegaconf.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('imported', encoding='utf-8')\n"
-        "raise RuntimeError('project import ran before provenance gate')\n",
+        "raise RuntimeError('isolated startup imported shadow module')\n",
         encoding="utf-8",
     )
     environment = dict(os.environ)
@@ -661,8 +647,7 @@ def test_f25_cli_isolated_startup_runs_git_gate_before_project_import(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert completed.returncode != 0
-    assert "Refusing redirected Git provenance environment" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
     assert not marker.exists()
 
 
@@ -708,7 +693,6 @@ def test_f25_cli_uses_only_config_bound_metadata_and_output_paths(
         captured.update(kwargs)
         raise ProducerReached
 
-    monkeypatch.setattr(f25_cli, "_clean_code_version", lambda: CODE_VERSION)
     monkeypatch.setattr(f25_cli.OmegaConf, "load", lambda _path: object())
     monkeypatch.setattr(f25_cli, "resolve_stage2_config", lambda _raw: resolved)
     monkeypatch.setattr(

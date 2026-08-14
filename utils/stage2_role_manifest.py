@@ -925,7 +925,6 @@ def build_stage2_role_init_manifest(
     *,
     contract_hash: str,
     launch_hash: str,
-    git_commit: str,
     generator_asset: Mapping[str, Any],
     real_score_asset: Mapping[str, Any],
     role_audits: Mapping[str, Any],
@@ -940,11 +939,6 @@ def build_stage2_role_init_manifest(
         (rank_consensus_sha256, "rank_consensus_sha256"),
     ):
         _sha256(value, path)
-    if (
-        not isinstance(git_commit, str)
-        or re.fullmatch(r"[0-9a-f]{40}", git_commit) is None
-    ):
-        raise ValueError("git_commit must be a 40-character lowercase Git SHA")
     if set(role_audits) != {"generator", "real_score", "fake_score"}:
         raise ValueError(
             "role_audits must contain exactly generator/real_score/fake_score"
@@ -1089,7 +1083,6 @@ def build_stage2_role_init_manifest(
             "contract_hash": contract_hash,
             "launch_hash": launch_hash,
         },
-        "code": {"git_commit": git_commit},
         "assets": {
             "generator": dict(generator_asset),
             "real_score": dict(real_score_asset),

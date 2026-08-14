@@ -48,7 +48,6 @@ from utils.stage2_i2v_data import (
     STAGE2_F25_SUCCESS_SCHEMA_VERSION,
     STAGE2_CACHE_MANIFEST_NAME,
     STAGE2_CACHE_SCHEMA,
-    _resolve_clean_repo_code_version,
     _stage1_manifest_declares_reusable_f25_policy,
     load_f25_preparation_input_manifest,
     stage2_f25_data_contract_sha256,
@@ -301,7 +300,6 @@ def _preparation_contract(
     config_contract_sha256: str,
     config_launch_sha256: str,
     vae_aggregate_sha256: str,
-    code_version: str,
 ) -> dict[str, Any]:
     project_root = Path(__file__).resolve().parents[1]
     producer_path = project_root / _PRODUCER_RELATIVE_PATH
@@ -319,7 +317,6 @@ def _preparation_contract(
             "schema_version": source_manifest["schema_version"],
         },
         "producer": {
-            "code_version": code_version,
             "file": _PRODUCER_RELATIVE_PATH,
             "file_sha256": sha256_file(producer_path),
         },
@@ -700,7 +697,6 @@ def prepare_stage2_f25_cache(
         raise ValueError("expected_num_samples must be a positive integer.")
     if type(world_size) is not int or world_size <= 0 or not 0 <= rank < world_size:
         raise ValueError("rank/world_size are invalid.")
-    code_version = _resolve_clean_repo_code_version()
     metadata_path = Path(metadata_path).expanduser().resolve()
     source_manifest_path = Path(source_cache_manifest_path).expanduser().resolve()
     config_path = Path(config_path).expanduser().resolve()
@@ -750,7 +746,6 @@ def prepare_stage2_f25_cache(
         config_contract_sha256=config_contract_sha256,
         config_launch_sha256=config_launch_sha256,
         vae_aggregate_sha256=vae_hash,
-        code_version=code_version,
     )
     contract_sha256 = preparation["contract_sha256"]
     if rank == 0:
@@ -1093,8 +1088,6 @@ def prepare_stage2_f25_cache(
         raise RuntimeError("Metadata changed during F25 materialization.")
     if sha256_file(config_path) != preparation["config"]["file_sha256"]:
         raise RuntimeError("Stage-2 config changed during F25 materialization.")
-    if _resolve_clean_repo_code_version() != code_version:
-        raise RuntimeError("Clean Git revision changed during F25 materialization.")
     manifest_path = output_root / F25_BASE_MANIFEST_NAME
     success_path = output_root / STAGE2_F25_SUCCESS_NAME
     expected_names = {F25_OUTPUT_OWNERSHIP_NAME, manifest_path.name, success_path.name}

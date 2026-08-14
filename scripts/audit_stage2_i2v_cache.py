@@ -18,120 +18,9 @@ import argparse  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 from pathlib import Path  # noqa: E402
-import subprocess  # noqa: E402
 from typing import Any  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_SYSTEM_GIT = Path("/usr/bin/git")
-_UNSAFE_GIT_ENV_KEYS = {
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CONFIG",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_DIR",
-    "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE",
-    "GIT_NAMESPACE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_SHALLOW_FILE",
-    "GIT_WORK_TREE",
-}
-
-
-def _stdlib_git_environment() -> dict[str, str]:
-    unsafe = sorted(
-        key
-        for key in os.environ
-        if key in _UNSAFE_GIT_ENV_KEYS
-        or key.startswith("GIT_CONFIG_KEY_")
-        or key.startswith("GIT_CONFIG_VALUE_")
-    )
-    if unsafe:
-        raise RuntimeError(
-            "Refusing redirected Git provenance environment: " + ", ".join(unsafe)
-        )
-    return {
-        "PATH": "/usr/bin:/bin",
-        "LC_ALL": "C",
-        "LANG": "C",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-    }
-
-
-def _stdlib_git_stdout(project_root: Path, *args: str) -> str:
-    if not _SYSTEM_GIT.is_file():
-        raise RuntimeError(f"Trusted system Git executable is missing: {_SYSTEM_GIT}.")
-    try:
-        completed = subprocess.run(
-            [
-                str(_SYSTEM_GIT),
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.untrackedCache=false",
-                "-C",
-                str(project_root),
-                *args,
-            ],
-            cwd=project_root,
-            env=_stdlib_git_environment(),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"Git provenance command failed: {' '.join(args)}") from exc
-    return completed.stdout.strip()
-
-
-def _stdlib_clean_git_code_version(project_root: Path) -> str:
-    project_root = project_root.resolve()
-    top_level = Path(
-        _stdlib_git_stdout(project_root, "rev-parse", "--show-toplevel")
-    ).resolve()
-    if top_level != project_root:
-        raise RuntimeError(
-            "Git top-level differs from the physical Stage-2 project root: "
-            f"{top_level} != {project_root}."
-        )
-    revision = _stdlib_git_stdout(project_root, "rev-parse", "HEAD")
-    if len(revision) not in {40, 64} or revision != revision.lower():
-        raise RuntimeError("Git HEAD is not a lowercase object id.")
-    try:
-        bytes.fromhex(revision)
-    except ValueError as exc:
-        raise RuntimeError("Git HEAD is not a lowercase object id.") from exc
-    status = _stdlib_git_stdout(
-        project_root, "status", "--porcelain=v1", "--untracked-files=all"
-    )
-    if status:
-        raise RuntimeError(
-            "Stage-2 cache tooling requires a clean committed checkout at the "
-            "physical project root."
-        )
-    ignored = _stdlib_git_stdout(
-        project_root, "ls-files", "--others", "--ignored", "--exclude-standard"
-    )
-    if ignored:
-        raise RuntimeError(
-            "Stage-2 cache tooling rejects ignored repository files, including "
-            "unchecked Python bytecode or native extensions."
-        )
-    return f"git:{revision}"
-
-
-# A directly executed formal CLI must prove the checkout before sys.path is
-# changed or any project/external module can be imported.  Importing this file
-# in unit tests deliberately skips only this early bootstrap; each producer
-# command still calls the same gate explicitly.
-if __name__ == "__main__":
-    _stdlib_clean_git_code_version(PROJECT_ROOT)
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -173,12 +62,10 @@ def _positive_encoder_hashes(source: dict[str, Any]) -> tuple[str, str]:
 def _prepare_negative(args: argparse.Namespace) -> None:
     import torch
 
-    code_version = _git_code_version()
     source = load_source_cache_manifest(
         args.source_cache_manifest,
         expected_num_samples=args.expected_num_samples,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=code_version,
     )
     if source.get("schema") != STAGE2_F25_SOURCE_CACHE_SCHEMA:
         raise RuntimeError(
@@ -245,7 +132,6 @@ def _prepare_negative(args: argparse.Namespace) -> None:
         source_cache_manifest_path=args.source_cache_manifest,
         expected_num_samples=args.expected_num_samples,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=code_version,
     )
     print(
         json.dumps(
@@ -263,12 +149,7 @@ def _prepare_negative(args: argparse.Namespace) -> None:
     )
 
 
-def _git_code_version() -> str:
-    return _stdlib_clean_git_code_version(PROJECT_ROOT)
-
-
 def _upgrade_source_manifest(args: argparse.Namespace) -> None:
-    code_version = _git_code_version()
     output = upgrade_legacy_source_cache_manifest_text_encoding(
         args.legacy_source_cache_manifest,
         args.output_manifest,
@@ -283,7 +164,6 @@ def _upgrade_source_manifest(args: argparse.Namespace) -> None:
         output,
         expected_num_samples=args.expected_num_samples,
         require_text_encoding_upgrade=True,
-        expected_upgrade_code_version=code_version,
     )
     upgrade = upgraded["stage2_text_encoding_upgrade"]
     print(
@@ -298,7 +178,6 @@ def _upgrade_source_manifest(args: argparse.Namespace) -> None:
                 "text_encoding_contract_sha256": upgrade["verification"][
                     "text_encoding_contract_sha256"
                 ],
-                "code_version": code_version,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -344,8 +223,6 @@ def _audit(args: argparse.Namespace) -> None:
     source_manifest = Path(args.source_cache_manifest).expanduser().resolve()
     action_sidecar = resolved_action_sidecar
     output = expected_output
-    _git_code_version()
-
     manifest = audit_stage2_i2v_cache(
         metadata_path=metadata_path,
         cache_dir=cache_dir,
