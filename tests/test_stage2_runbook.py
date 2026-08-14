@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).parents[1]
 RUNBOOK = PROJECT_ROOT / "docs" / "STAGE2_H100_QUICK_DEPLOY_ZH.md"
 CONFIG = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats.yaml"
 PREPARE = PROJECT_ROOT / "prepare_stage2.sh"
+PRECOMPUTE = PROJECT_ROOT / "precompute_stage2_i2v_cache_h100_8gpu.sh"
 CONTRACT_HASH = "dae3f4075f073351f27126d86a61be38d3c370fd5399a381788a0f51d959a5ea"
 
 
@@ -120,6 +121,15 @@ def test_prepare_stage2_runs_exactly_the_five_pretrain_gates_without_training():
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_stage2_audit_commands_pass_the_operator_action_sidecar_explicitly():
+    prepare_text = PREPARE.read_text(encoding="utf-8")
+    precompute_text = PRECOMPUTE.read_text(encoding="utf-8")
+
+    sidecar_argument = '--action-labels-path "$ACTION_SIDECAR_600"'
+    assert prepare_text.count(sidecar_argument) == 1
+    assert precompute_text.count(sidecar_argument) == 2
 
 
 def test_prepare_stage2_call_chain_has_no_git_clean_or_code_version_gate():

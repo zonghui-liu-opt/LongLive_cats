@@ -208,7 +208,6 @@ def _audit(args: argparse.Namespace) -> None:
             negative_manifest,
             "--negative-conditioning-manifest",
         ),
-        (args.action_labels_path, resolved_action_sidecar, "--action-labels-path"),
         (args.output_manifest, expected_output, "--output-manifest"),
     ):
         if supplied is not None and (
@@ -220,8 +219,22 @@ def _audit(args: argparse.Namespace) -> None:
                 "environment variable when that field is environment-backed); do "
                 "not use this CLI flag to point the signed launch at different data."
             )
+    supplied_action_sidecar = (
+        None
+        if args.action_labels_path is None
+        else Path(args.action_labels_path).expanduser().resolve()
+    )
+    if (
+        supplied_action_sidecar is not None
+        and resolved_action_sidecar is not None
+        and supplied_action_sidecar != resolved_action_sidecar
+    ):
+        raise RuntimeError(
+            "--action-labels-path must exactly match the resolved Stage-2 config "
+            f"path: {resolved_action_sidecar}."
+        )
     source_manifest = Path(args.source_cache_manifest).expanduser().resolve()
-    action_sidecar = resolved_action_sidecar
+    action_sidecar = supplied_action_sidecar or resolved_action_sidecar
     output = expected_output
     manifest = audit_stage2_i2v_cache(
         metadata_path=metadata_path,

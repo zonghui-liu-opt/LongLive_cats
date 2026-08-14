@@ -124,6 +124,55 @@ def test_formal_audit_cli_rejects_paths_that_drift_from_resolved_config(
         audit_cli._audit(SimpleNamespace(**values))
 
 
+def test_formal_audit_cli_uses_explicit_sidecar_when_config_has_none(
+    tmp_path, monkeypatch
+):
+    sidecar = tmp_path / "actions.csv"
+    cache_dir = tmp_path / "cache"
+    resolved = SimpleNamespace(
+        cache_dir=cache_dir,
+        metadata_path=tmp_path / "metadata.csv",
+        negative_conditioning_manifest=tmp_path / "negative.json",
+        action_labels_path=None,
+        expected_num_samples=600,
+        expected_action_counts=(("jump", 600),),
+        allowed_latent_spatial_shapes=((30, 52), (52, 30)),
+        contract_hash=lambda: "a" * 64,
+        launch_hash=lambda: "b" * 64,
+    )
+    captured = {}
+
+    def fake_audit(**kwargs):
+        captured.update(kwargs)
+        return {
+            "manifest_path": str(cache_dir / "stage2_i2v_manifest.json"),
+            "manifest_sha256": "c" * 64,
+            "num_samples": 600,
+            "actions": {"counts": {"jump": 600}},
+            "orientation_counts": {"landscape": 600},
+            "total_bytes": 123,
+        }
+
+    monkeypatch.setattr(audit_cli.OmegaConf, "load", lambda _path: object())
+    monkeypatch.setattr(audit_cli, "resolve_stage2_config", lambda _config: resolved)
+    monkeypatch.setattr(audit_cli, "audit_stage2_i2v_cache", fake_audit)
+    audit_cli._audit(
+        SimpleNamespace(
+            config_path=str(tmp_path / "stage2.yaml"),
+            cache_dir=None,
+            metadata_path=None,
+            negative_conditioning_manifest=None,
+            action_labels_path=str(sidecar),
+            output_manifest=None,
+            source_cache_manifest=str(tmp_path / "attested-source.json"),
+            action_id=["jump"],
+        )
+    )
+
+    assert captured["action_labels_path"] == sidecar.resolve()
+    assert captured["config_launch_sha256"] == "b" * 64
+
+
 @pytest.mark.parametrize("padding_side", ["right", "left"])
 def test_wan_text_contract_validator_executes_special_token_and_padding_probe(
     monkeypatch, padding_side

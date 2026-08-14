@@ -319,6 +319,7 @@ if [[ ! -e "$FINAL_CACHE_MANIFEST" ]]; then
   "$STAGE2_PYTHON" -I -B scripts/audit_stage2_i2v_cache.py audit \
     --config-path "$STAGE2_CONFIG" \
     --source-cache-manifest "$F25_ATTESTED" \
+    --action-labels-path "$ACTION_SIDECAR_600" \
     --action-id "${ACTION_IDS[0]}" \
     --action-id "${ACTION_IDS[1]}" \
     --action-id "${ACTION_IDS[2]}" \
