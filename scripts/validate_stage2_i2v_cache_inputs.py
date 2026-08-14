@@ -15,15 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.stage1_i2v_data import (  # noqa: E402
-    STAGE1_REQUIRED_COLUMNS,
-    load_stage1_i2v_manifest,
-)
+from utils.stage1_i2v_schema import STAGE1_REQUIRED_COLUMNS  # noqa: E402
+from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS  # noqa: E402
 from utils.stage2_i2v_data import (  # noqa: E402
     load_f25_preparation_input_manifest,
-)
-from utils.stage2_action_contract import (  # noqa: E402
-    STAGE2_EXPECTED_ACTION_COUNTS,
 )
 
 
@@ -58,6 +53,8 @@ def validate_stage2_i2v_cache_inputs(
     expected_action_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Return a deterministic report or fail before any GPU process starts."""
+
+    from utils.stage1_i2v_data import load_stage1_i2v_manifest
 
     if expected_samples_per_action is not None and expected_action_counts is not None:
         raise ValueError(

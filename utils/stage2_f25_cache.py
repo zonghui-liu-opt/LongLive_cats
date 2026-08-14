@@ -17,16 +17,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from utils.stage1_i2v_data import (
-    Stage1I2VRecord,
-    decode_stage1_video,
-    load_stage1_i2v_manifest,
-    validate_cache_tensors as validate_stage1_cache_tensors,
-)
 from utils.stage1_io import (
     aggregate_file_hash,
     atomic_output_path,
@@ -54,6 +48,9 @@ from utils.stage2_i2v_data import (
     tensor_sha256,
     validate_stage2_cache_tensors,
 )
+
+if TYPE_CHECKING:
+    from utils.stage1_i2v_data import Stage1I2VRecord
 
 F25_BASE_MANIFEST_NAME = "cache_manifest.json"
 F25_OUTPUT_OWNERSHIP_NAME = ".stage2_f25_output.json"
@@ -267,6 +264,10 @@ def _input_kind(
     expected_spatial_shape: tuple[int, int],
     row_id: int,
 ) -> str:
+    from utils.stage1_i2v_data import (
+        validate_cache_tensors as validate_stage1_cache_tensors,
+    )
+
     video = tensors.get("video_latent")
     if not isinstance(video, torch.Tensor):
         raise RuntimeError(f"Stage-1 source row {row_id} has no video_latent tensor.")
@@ -689,9 +690,14 @@ def prepare_stage2_f25_cache(
     device: torch.device,
     vae_checkpoint_path: str | os.PathLike[str] | None = None,
     vae_factory: Callable[[str | os.PathLike[str], torch.device], Any] | None = None,
-    decode_video: Callable[..., torch.Tensor] = decode_stage1_video,
+    decode_video: Callable[..., torch.Tensor] | None = None,
 ) -> Path | None:
     """Materialize an independently owned native F25 cache and base manifest."""
+
+    from utils.stage1_i2v_data import decode_stage1_video, load_stage1_i2v_manifest
+
+    if decode_video is None:
+        decode_video = decode_stage1_video
 
     if type(expected_num_samples) is not int or expected_num_samples <= 0:
         raise ValueError("expected_num_samples must be a positive integer.")
