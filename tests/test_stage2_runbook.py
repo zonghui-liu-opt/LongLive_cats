@@ -132,6 +132,15 @@ def test_stage2_audit_commands_pass_the_operator_action_sidecar_explicitly():
     assert precompute_text.count(sidecar_argument) == 2
 
 
+def test_stage2_shells_recompute_config_hashes_without_shell_temporaries():
+    for path in (PREPARE, PRECOMPUTE):
+        text = path.read_text(encoding="utf-8")
+        assert "$CONTRACT_HASH" not in text
+        assert "$LAUNCH_HASH" not in text
+        assert "config_fields=" not in text
+        assert "resolve_stage2_config(OmegaConf.load" in text
+
+
 def test_prepare_stage2_call_chain_has_no_git_clean_or_code_version_gate():
     paths = (
         PREPARE,

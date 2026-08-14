@@ -122,7 +122,7 @@ export LONG_LIVE_STAGE2_GENERATOR_MANIFEST="$G_MANIFEST"
 export LONG_LIVE_STAGE2_REAL_SCORE_BASE="$TEACHER_CKPT"
 export LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST="$TEACHER_MANIFEST"
 
-config_fields="$("$STAGE2_PYTHON" -B - "$STAGE2_CONFIG" <<'PY'
+"$STAGE2_PYTHON" -B - "$STAGE2_CONFIG" <<'PY'
 import sys
 from omegaconf import OmegaConf
 from utils.stage2_config import resolve_stage2_config
@@ -131,10 +131,7 @@ r = resolve_stage2_config(OmegaConf.load(sys.argv[1]))
 assert r.video_latent_frames == 25
 assert r.initial_latent_frames == 1
 assert r.future_latent_frames == 24
-print("\t".join((r.contract_hash(), r.launch_hash())), end="")
 PY
-)"
-IFS=$'\t' read -r CONTRACT_HASH LAUNCH_HASH <<< "$config_fields"
 
 "$STAGE2_TORCHRUN" \
   --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
@@ -223,23 +220,26 @@ fi
 
 "$STAGE2_PYTHON" -B - \
   "$FINAL_CACHE_MANIFEST" "$METADATA_600" "$F25_ATTESTED" \
-  "$NEGATIVE_MANIFEST" "$CONTRACT_HASH" "$LAUNCH_HASH" <<'PY'
+  "$NEGATIVE_MANIFEST" "$STAGE2_CONFIG" <<'PY'
 import sys
 from pathlib import Path
+from omegaconf import OmegaConf
 from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS
+from utils.stage2_config import resolve_stage2_config
 from utils.stage2_i2v_data import (
     load_stage2_i2v_manifest,
     validate_stage2_i2v_runtime_bindings,
 )
 
+resolved = resolve_stage2_config(OmegaConf.load(sys.argv[5]))
 manifest = load_stage2_i2v_manifest(Path(sys.argv[1]), expected_num_samples=600)
 validate_stage2_i2v_runtime_bindings(
     manifest,
     metadata_path=Path(sys.argv[2]),
     source_cache_manifest_path=Path(sys.argv[3]),
     negative_conditioning_manifest_path=Path(sys.argv[4]),
-    config_contract_sha256=sys.argv[5],
-    config_launch_sha256=sys.argv[6],
+    config_contract_sha256=resolved.contract_hash(),
+    config_launch_sha256=resolved.launch_hash(),
     expected_num_samples=600,
 )
 assert manifest["actions"]["counts"] == STAGE2_EXPECTED_ACTION_COUNTS

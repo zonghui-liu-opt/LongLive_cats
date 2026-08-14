@@ -187,8 +187,9 @@ export LONG_LIVE_STAGE2_ACTION_LABELS_PATH="$ACTION_SIDECAR_600"
 export LONG_LIVE_STAGE2_CACHE_DIR="$STAGE2_CACHE_DIR"
 export LONG_LIVE_STAGE2_NEGATIVE_MANIFEST="$NEGATIVE_MANIFEST"
 
-config_fields="$("$STAGE2_PYTHON" -B - "$STAGE2_CONFIG" "$RUN_DIR/resolved_config.json" <<'PY'
+"$STAGE2_PYTHON" -B - "$STAGE2_CONFIG" "$RUN_DIR/resolved_config.json" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 from omegaconf import OmegaConf
@@ -199,27 +200,13 @@ payload = resolved.to_dict()
 payload["contract_sha256"] = resolved.contract_hash()
 payload["launch_sha256"] = resolved.launch_hash()
 Path(sys.argv[2]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-print("\t".join((resolved.contract_hash(), resolved.launch_hash())), end="")
-PY
-)"
-IFS=$'\t' read -r CONTRACT_HASH LAUNCH_HASH <<< "$config_fields"
-
-"$STAGE2_PYTHON" -B - "$STAGE2_CONFIG" "$CONTRACT_HASH" "$LAUNCH_HASH" <<'PY'
-import os
-import sys
-from omegaconf import OmegaConf
-from utils.stage2_config import resolve_stage2_config
-
-r = resolve_stage2_config(OmegaConf.load(sys.argv[1]))
-assert r.contract_hash() == sys.argv[2]
-assert r.launch_hash() == sys.argv[3]
-assert r.generator_stage1_step == 3750
-assert r.init_generator_checkpoint == os.environ["LONG_LIVE_STAGE2_GENERATOR_BASE"]
-assert r.init_generator_manifest == os.environ["LONG_LIVE_STAGE2_GENERATOR_MANIFEST"]
-assert r.init_real_score_checkpoint == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_BASE"]
-assert r.init_real_score_manifest == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST"]
-assert r.source_cache_manifest == os.environ["LONG_LIVE_STAGE2_SOURCE_MANIFEST"]
-assert r.negative_conditioning_manifest == os.environ["LONG_LIVE_STAGE2_NEGATIVE_MANIFEST"]
+assert resolved.generator_stage1_step == 3750
+assert resolved.init_generator_checkpoint == os.environ["LONG_LIVE_STAGE2_GENERATOR_BASE"]
+assert resolved.init_generator_manifest == os.environ["LONG_LIVE_STAGE2_GENERATOR_MANIFEST"]
+assert resolved.init_real_score_checkpoint == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_BASE"]
+assert resolved.init_real_score_manifest == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST"]
+assert resolved.source_cache_manifest == os.environ["LONG_LIVE_STAGE2_SOURCE_MANIFEST"]
+assert resolved.negative_conditioning_manifest == os.environ["LONG_LIVE_STAGE2_NEGATIVE_MANIFEST"]
 PY
 echo "CHECK_3_CONFIG_PASS"
 
@@ -328,20 +315,23 @@ fi
 
 "$STAGE2_PYTHON" -B - \
   "$FINAL_CACHE_MANIFEST" "$METADATA_600" "$F25_ATTESTED" "$NEGATIVE_MANIFEST" \
-  "$CONTRACT_HASH" "$LAUNCH_HASH" <<'PY'
+  "$STAGE2_CONFIG" <<'PY'
 import sys
 from pathlib import Path
+from omegaconf import OmegaConf
 from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS
+from utils.stage2_config import resolve_stage2_config
 from utils.stage2_i2v_data import load_stage2_i2v_manifest, validate_stage2_i2v_runtime_bindings
 
+resolved = resolve_stage2_config(OmegaConf.load(sys.argv[5]))
 manifest = load_stage2_i2v_manifest(Path(sys.argv[1]), expected_num_samples=600)
 validate_stage2_i2v_runtime_bindings(
     manifest,
     metadata_path=Path(sys.argv[2]),
     source_cache_manifest_path=Path(sys.argv[3]),
     negative_conditioning_manifest_path=Path(sys.argv[4]),
-    config_contract_sha256=sys.argv[5],
-    config_launch_sha256=sys.argv[6],
+    config_contract_sha256=resolved.contract_hash(),
+    config_launch_sha256=resolved.launch_hash(),
     expected_num_samples=600,
 )
 assert manifest["actions"]["counts"] == STAGE2_EXPECTED_ACTION_COUNTS
@@ -363,13 +353,16 @@ elif [[ ! -f "$ROLE_INIT_DIR/role_init_manifest.json" || ! -f "$ROLE_INIT_DIR/RO
 fi
 
 "$STAGE2_PYTHON" -B - \
-  "$ROLE_INIT_DIR/role_init_manifest.json" "$CONTRACT_HASH" "$LAUNCH_HASH" <<'PY'
+  "$ROLE_INIT_DIR/role_init_manifest.json" "$STAGE2_CONFIG" <<'PY'
 import json
 import sys
 from pathlib import Path
+from omegaconf import OmegaConf
 from utils.stage1_io import canonical_json_sha256
+from utils.stage2_config import resolve_stage2_config
 
 path = Path(sys.argv[1])
+resolved = resolve_stage2_config(OmegaConf.load(sys.argv[2]))
 record = json.loads(path.read_text(encoding="utf-8"))
 body = dict(record)
 recorded_hash = body.pop("manifest_sha256")
@@ -377,8 +370,8 @@ assert canonical_json_sha256(body) == recorded_hash
 assert record["schema"] == "longlive_stage2_role_init_manifest"
 assert record["artifact_kind"] == "init_only_audit_not_training_checkpoint"
 assert record["initialization_mode"] == "init_from_stage1"
-assert record["config"]["contract_hash"] == sys.argv[2]
-assert record["config"]["launch_hash"] == sys.argv[3]
+assert record["config"]["contract_hash"] == resolved.contract_hash()
+assert record["config"]["launch_hash"] == resolved.launch_hash()
 assert set(record["roles"]) == {"generator", "real_score", "fake_score"}
 assert record["side_effects"] == {
     "tripwires_enforced": [
