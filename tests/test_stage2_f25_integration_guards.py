@@ -330,7 +330,7 @@ def _audit_kwargs(chain: dict[str, Path], **overrides):
         "expected_action_ids": ACTIONS,
         "action_labels_path": chain["sidecar"],
         "expected_num_samples": 6,
-        "expected_samples_per_action": 2,
+        "expected_action_counts": {action: 2 for action in ACTIONS},
         "config_contract_sha256": CONFIG_CONTRACT_SHA256,
         "config_launch_sha256": CONFIG_LAUNCH_SHA256,
         "require_text_encoding_upgrade": True,

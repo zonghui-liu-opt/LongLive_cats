@@ -421,7 +421,7 @@ def _audit(fixture, **overrides):
         "expected_action_ids": ACTIONS,
         "action_labels_path": fixture["sidecar"],
         "expected_num_samples": 6,
-        "expected_samples_per_action": 2,
+        "expected_action_counts": {action: 2 for action in ACTIONS},
         "config_contract_sha256": CONFIG_CONTRACT_HASH,
         "config_launch_sha256": CONFIG_LAUNCH_HASH,
     }

@@ -232,7 +232,7 @@ def _audit(args: argparse.Namespace) -> None:
         action_labels_path=action_sidecar,
         output_manifest_path=output,
         expected_num_samples=resolved.expected_num_samples,
-        expected_samples_per_action=resolved.expected_samples_per_action,
+        expected_action_counts=dict(resolved.expected_action_counts),
         allowed_latent_spatial_shapes=resolved.allowed_latent_spatial_shapes,
         config_contract_sha256=resolved.contract_hash(),
         config_launch_sha256=resolved.launch_hash(),

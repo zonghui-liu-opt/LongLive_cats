@@ -300,6 +300,7 @@ mapfile -t ACTION_IDS < <("$STAGE2_PYTHON" -B - "$ACTION_SIDECAR_600" <<'PY'
 import csv
 import sys
 from collections import Counter
+from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS
 
 with open(sys.argv[1], "r", encoding="utf-8-sig", newline="") as handle:
     reader = csv.DictReader(handle)
@@ -307,7 +308,7 @@ with open(sys.argv[1], "r", encoding="utf-8-sig", newline="") as handle:
     rows = list(reader)
 assert len(rows) == 600, len(rows)
 counts = Counter(row["action_id"].strip() for row in rows)
-assert len(counts) == 3 and sorted(counts.values()) == [200, 200, 200], counts
+assert dict(counts) == STAGE2_EXPECTED_ACTION_COUNTS, counts
 for action_id in sorted(counts):
     print(action_id)
 PY
@@ -329,6 +330,7 @@ fi
   "$CONTRACT_HASH" "$LAUNCH_HASH" <<'PY'
 import sys
 from pathlib import Path
+from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS
 from utils.stage2_i2v_data import load_stage2_i2v_manifest, validate_stage2_i2v_runtime_bindings
 
 manifest = load_stage2_i2v_manifest(Path(sys.argv[1]), expected_num_samples=600)
@@ -341,7 +343,7 @@ validate_stage2_i2v_runtime_bindings(
     config_launch_sha256=sys.argv[6],
     expected_num_samples=600,
 )
-assert sorted(manifest["actions"]["counts"].values()) == [200, 200, 200]
+assert manifest["actions"]["counts"] == STAGE2_EXPECTED_ACTION_COUNTS
 PY
 echo "CHECK_4_DATA_PASS"
 

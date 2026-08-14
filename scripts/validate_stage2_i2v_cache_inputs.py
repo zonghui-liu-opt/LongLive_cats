@@ -22,6 +22,9 @@ from utils.stage1_i2v_data import (  # noqa: E402
 from utils.stage2_i2v_data import (  # noqa: E402
     load_f25_preparation_input_manifest,
 )
+from utils.stage2_action_contract import (  # noqa: E402
+    STAGE2_EXPECTED_ACTION_COUNTS,
+)
 
 
 def _read_csv(
@@ -51,15 +54,55 @@ def validate_stage2_i2v_cache_inputs(
     source_cache_manifest_path: str | Path,
     expected_num_samples: int = 600,
     expected_num_actions: int = 3,
-    expected_samples_per_action: int = 200,
+    expected_samples_per_action: int | None = None,
+    expected_action_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Return a deterministic report or fail before any GPU process starts."""
 
-    if expected_num_samples != expected_num_actions * expected_samples_per_action:
+    if expected_samples_per_action is not None and expected_action_counts is not None:
         raise ValueError(
-            "expected_num_samples must equal expected_num_actions * "
-            "expected_samples_per_action."
+            "Specify expected_samples_per_action or expected_action_counts, not both."
         )
+    uniform_expected_count: int | None = None
+    if expected_action_counts is None:
+        if expected_samples_per_action is None:
+            expected_action_counts = dict(STAGE2_EXPECTED_ACTION_COUNTS)
+        else:
+            if (
+                isinstance(expected_samples_per_action, bool)
+                or not isinstance(expected_samples_per_action, int)
+                or expected_samples_per_action <= 0
+            ):
+                raise ValueError("expected_samples_per_action must be positive.")
+            if (
+                expected_num_samples
+                != expected_num_actions * expected_samples_per_action
+            ):
+                raise ValueError(
+                    "expected_num_samples must equal expected_num_actions * "
+                    "expected_samples_per_action."
+                )
+            uniform_expected_count = expected_samples_per_action
+    if expected_action_counts is not None:
+        if len(expected_action_counts) != expected_num_actions:
+            raise ValueError(
+                "expected_action_counts must contain expected_num_actions entries."
+            )
+        for action_id, count in expected_action_counts.items():
+            if (
+                not isinstance(action_id, str)
+                or not action_id
+                or action_id != action_id.strip()
+            ):
+                raise ValueError(
+                    "expected_action_counts keys must be clean action ids."
+                )
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                raise ValueError(
+                    "expected_action_counts values must be positive integers."
+                )
+        if sum(expected_action_counts.values()) != expected_num_samples:
+            raise ValueError("expected_action_counts must sum to expected_num_samples.")
     metadata_path = Path(metadata_path).expanduser().resolve()
     action_labels_path = Path(action_labels_path).expanduser().resolve()
     source_cache_manifest_path = Path(source_cache_manifest_path).expanduser().resolve()
@@ -158,12 +201,19 @@ def validate_stage2_i2v_cache_inputs(
             f"first={missing[0]!r}."
         )
     counts = Counter(actions_by_video[video] for video in metadata_videos)
-    if len(counts) != expected_num_actions or set(counts.values()) != {
-        expected_samples_per_action
-    }:
+    if uniform_expected_count is not None:
+        if len(counts) != expected_num_actions or set(counts.values()) != {
+            uniform_expected_count
+        }:
+            raise ValueError(
+                f"action sidecar must contain exactly {expected_num_actions} actions "
+                f"with {uniform_expected_count} samples each; got "
+                f"{dict(sorted(counts.items()))}."
+            )
+    elif dict(counts) != expected_action_counts:
         raise ValueError(
-            f"action sidecar must contain exactly {expected_num_actions} actions "
-            f"with {expected_samples_per_action} samples each; got "
+            "action sidecar counts must be exactly "
+            f"{expected_action_counts}; got "
             f"{dict(sorted(counts.items()))}."
         )
 
@@ -188,7 +238,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-cache-manifest", required=True)
     parser.add_argument("--expected-num-samples", type=int, default=600)
     parser.add_argument("--expected-num-actions", type=int, default=3)
-    parser.add_argument("--expected-samples-per-action", type=int, default=200)
+    parser.add_argument("--expected-samples-per-action", type=int)
     parser.add_argument(
         "--action-ids-only",
         action="store_true",

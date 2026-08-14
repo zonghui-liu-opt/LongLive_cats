@@ -90,7 +90,6 @@ mapfile -t ACTION_IDS < <(
     --source-cache-manifest "$STAGE1_CACHE_MANIFEST" \
     --expected-num-samples 600 \
     --expected-num-actions 3 \
-    --expected-samples-per-action 200 \
     --action-ids-only
 )
 [[ "${#ACTION_IDS[@]}" == "3" ]] || {
@@ -251,6 +250,7 @@ fi
   "$NEGATIVE_MANIFEST" "$CONTRACT_HASH" "$LAUNCH_HASH" <<'PY'
 import sys
 from pathlib import Path
+from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS
 from utils.stage2_i2v_data import (
     load_stage2_i2v_manifest,
     validate_stage2_i2v_runtime_bindings,
@@ -266,7 +266,7 @@ validate_stage2_i2v_runtime_bindings(
     config_launch_sha256=sys.argv[6],
     expected_num_samples=600,
 )
-assert sorted(manifest["actions"]["counts"].values()) == [200, 200, 200]
+assert manifest["actions"]["counts"] == STAGE2_EXPECTED_ACTION_COUNTS
 assert all(record["real_future_shape"][:2] == [24, 48] for record in manifest["records"])
 assert {
     tuple(record["latent_spatial_shape"]) for record in manifest["records"]

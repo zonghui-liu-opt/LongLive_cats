@@ -20,6 +20,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from utils.config import DEFAULT_NEGATIVE_PROMPT, wan_default_config
+from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS
 
 STAGE2_CONFIG_SCHEMA = "longlive_stage2_train/v1"
 STAGE2_METRICS_SCHEMA = "longlive_stage2_metrics/v1"
@@ -165,7 +166,7 @@ _DATA_KEYS = {
     "cache_dir",
     "expected_num_samples",
     "expected_num_actions",
-    "expected_samples_per_action",
+    "expected_action_counts",
     "video_latent_frames",
     "initial_latent_frames",
     "future_latent_frames",
@@ -369,7 +370,7 @@ class Stage2ResolvedConfig:
     baseline_deploy_dit_calls: int
     expected_num_samples: int
     expected_num_actions: int
-    expected_samples_per_action: int
+    expected_action_counts: tuple[tuple[str, int], ...]
     metadata_path: str
     source_cache_manifest: str
     cache_dir: str
@@ -1073,13 +1074,31 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         _string(action_labels_path, "data.action_labels_path")
     expected_num_samples = _locked_integer(data, "expected_num_samples", "data", 600)
     expected_num_actions = _locked_integer(data, "expected_num_actions", "data", 3)
-    expected_samples_per_action = _locked_integer(
-        data, "expected_samples_per_action", "data", 200
+    action_populations = _exact_keys(
+        data["expected_action_counts"],
+        "data.expected_action_counts",
+        set(STAGE2_EXPECTED_ACTION_COUNTS),
     )
-    if expected_num_actions * expected_samples_per_action != expected_num_samples:
+    expected_action_counts = tuple(
+        (
+            action_id,
+            _locked_integer(
+                action_populations,
+                action_id,
+                "data.expected_action_counts",
+                expected_count,
+            ),
+        )
+        for action_id, expected_count in STAGE2_EXPECTED_ACTION_COUNTS.items()
+    )
+    if len(expected_action_counts) != expected_num_actions:
         raise ValueError(
-            "data.expected_num_actions * data.expected_samples_per_action "
-            "must equal data.expected_num_samples."
+            "data.expected_action_counts must contain data.expected_num_actions "
+            "entries."
+        )
+    if sum(count for _, count in expected_action_counts) != expected_num_samples:
+        raise ValueError(
+            "data.expected_action_counts must sum to data.expected_num_samples."
         )
     video_latent_frames = _locked_integer(data, "video_latent_frames", "data", 25)
     initial_latent_frames = _locked_integer(data, "initial_latent_frames", "data", 1)
@@ -1529,7 +1548,7 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         baseline_deploy_dit_calls=baseline_deploy_dit_calls,
         expected_num_samples=expected_num_samples,
         expected_num_actions=expected_num_actions,
-        expected_samples_per_action=expected_samples_per_action,
+        expected_action_counts=expected_action_counts,
         metadata_path=metadata_path,
         source_cache_manifest=source_cache_manifest,
         cache_dir=cache_dir,

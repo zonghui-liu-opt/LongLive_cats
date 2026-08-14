@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).parents[1]
 RUNBOOK = PROJECT_ROOT / "docs" / "STAGE2_H100_QUICK_DEPLOY_ZH.md"
 CONFIG = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats.yaml"
 PREPARE = PROJECT_ROOT / "prepare_stage2.sh"
-CONTRACT_HASH = "aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00"
+CONTRACT_HASH = "dae3f4075f073351f27126d86a61be38d3c370fd5399a381788a0f51d959a5ea"
 
 
 def test_stage2_runbook_exposes_only_the_five_pretrain_checks():

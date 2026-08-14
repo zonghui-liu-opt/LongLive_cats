@@ -27,7 +27,6 @@ STAGE2_SAMPLER_ROLES = ("fake_score", "generator")
 STAGE2_PER_ACTION_BATCH_COUNTS = (22, 21, 21)
 STAGE2_GLOBAL_BATCH_SIZE = 64
 STAGE2_NUM_SAMPLES = 600
-STAGE2_SAMPLES_PER_ACTION = 200
 STAGE2_ALLOWED_SPATIAL_SHAPES = ((30, 52), (52, 30))
 STAGE2_BATCHES_PER_STREAM_EPOCH = math.ceil(
     STAGE2_NUM_SAMPLES / STAGE2_GLOBAL_BATCH_SIZE
@@ -185,13 +184,14 @@ class Stage2BalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
         if unknown:
             raise ValueError(f"Dataset contains unknown action ids: {unknown}.")
         counts = Counter(self.action_ids)
-        expected_counts = {
-            action_id: STAGE2_SAMPLES_PER_ACTION for action_id in self.action_order
-        }
-        if dict(counts) != expected_counts:
+        if set(counts) != set(self.action_order):
             raise ValueError(
-                f"Stage-2 action counts must be exactly {expected_counts}, got {dict(counts)}."
+                "Stage-2 dataset must contain every configured action; got counts "
+                f"{dict(counts)}."
             )
+        self.action_populations = {
+            action_id: counts[action_id] for action_id in self.action_order
+        }
 
         if len(spatial_shapes) != STAGE2_NUM_SAMPLES:
             raise ValueError(
@@ -342,14 +342,14 @@ class Stage2BalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
                     projected_total = sum(consumed) + count
                     # Integer-only proportional-deficit score.  This keeps each
                     # action's two orientation streams close to its immutable
-                    # 200-row population while the global divisibility constraint
+                    # source population while the global divisibility constraint
                     # decides only between equally valid nearby allocations.
                     score = 0
                     for index, shape in enumerate(self.spatial_shape_order):
                         population = len(self._base_indices.get((action_id, shape), ()))
                         score += abs(
                             (consumed[index] + allocation[index])
-                            * STAGE2_SAMPLES_PER_ACTION
+                            * self.action_populations[action_id]
                             - projected_total * population
                         )
                     candidates.append((allocation, score))

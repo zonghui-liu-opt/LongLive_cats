@@ -311,7 +311,7 @@ def test_stream_epoch_is_ten_successful_batches_and_iterator_resumes_cursor():
     assert STAGE2_BATCHES_PER_STREAM_EPOCH == 10
 
 
-def test_sampler_rejects_non_600_or_non_200_200_200_action_mapping():
+def test_sampler_rejects_non_600_or_missing_action_mapping():
     with pytest.raises(ValueError, match="exactly 600"):
         Stage2BalancedBatchSampler(
             ACTION_IDS[:-1],
@@ -320,15 +320,34 @@ def test_sampler_rejects_non_600_or_non_200_200_200_action_mapping():
             base_seed=1,
             role="generator",
         )
-    unbalanced = list(ACTION_IDS)
-    unbalanced[0] = ACTIONS[1]
-    with pytest.raises(ValueError, match="action counts"):
+    missing_action = tuple(
+        ACTIONS[1] if action_id == ACTIONS[0] else action_id for action_id in ACTION_IDS
+    )
+    with pytest.raises(ValueError, match="every configured action"):
         Stage2BalancedBatchSampler(
-            unbalanced,
+            missing_action,
             SPATIAL_SHAPES,
             action_order=ACTIONS,
             base_seed=1,
             role="generator",
+        )
+
+
+def test_sampler_accepts_real_202_200_198_action_populations():
+    action_ids = (ACTIONS[0],) * 198 + (ACTIONS[1],) * 202 + (ACTIONS[2],) * 200
+    sampler = Stage2BalancedBatchSampler(
+        action_ids,
+        SPATIAL_SHAPES,
+        action_order=ACTIONS,
+        base_seed=1,
+        role="generator",
+    )
+
+    for batch_index in range(12):
+        batch = sampler.next_global_batch()
+        expected = rotating_action_batch_counts(batch_index)
+        assert Counter(action_ids[index] for index in batch) == Counter(
+            dict(zip(ACTIONS, expected))
         )
 
 

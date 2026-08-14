@@ -149,7 +149,10 @@ data:
   cache_dir: ${oc.env:LONG_LIVE_STAGE2_CACHE_DIR,/path/to/stage2_i2v_600_bf16}
   expected_num_samples: 600
   expected_num_actions: 3
-  expected_samples_per_action: 200
+  expected_action_counts:
+    head_tilt_and_wink: 198
+    jump: 202
+    play_with_a_cat_wand: 200
   # Stage-2 requires source sink + 24 real future latents. The official
   # Stage-1 F24 cache contains only sink + 23 futures and is insufficient.
   video_latent_frames: 25

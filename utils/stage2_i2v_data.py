@@ -2140,7 +2140,7 @@ def audit_stage2_i2v_cache(
     action_labels_path: str | os.PathLike[str] | None = None,
     output_manifest_path: str | os.PathLike[str] | None = None,
     expected_num_samples: int = 600,
-    expected_samples_per_action: int = 200,
+    expected_action_counts: Mapping[str, int] | None = None,
     allowed_latent_spatial_shapes: Iterable[tuple[int, int]] = ((30, 52), (52, 30)),
     require_text_encoding_upgrade: bool = False,
     require_native_f25_source: bool = False,
@@ -2151,13 +2151,7 @@ def audit_stage2_i2v_cache(
 
     if isinstance(expected_num_samples, bool) or int(expected_num_samples) <= 0:
         raise ValueError("expected_num_samples must be a positive integer.")
-    if (
-        isinstance(expected_samples_per_action, bool)
-        or int(expected_samples_per_action) <= 0
-    ):
-        raise ValueError("expected_samples_per_action must be a positive integer.")
     expected_num_samples = int(expected_num_samples)
-    expected_samples_per_action = int(expected_samples_per_action)
     action_order = tuple(expected_action_ids)
     if len(action_order) != 3 or len(set(action_order)) != 3:
         raise ValueError(
@@ -2165,10 +2159,33 @@ def audit_stage2_i2v_cache(
         )
     for index, action_id in enumerate(action_order):
         _require_nonempty_string(action_id, f"expected_action_ids[{index}]")
-    if expected_num_samples != len(action_order) * expected_samples_per_action:
-        raise ValueError(
-            "expected_num_samples must equal three times expected_samples_per_action."
-        )
+    if expected_action_counts is None:
+        if expected_num_samples % len(action_order):
+            raise ValueError(
+                "expected_num_samples must be divisible by the number of actions "
+                "when expected_action_counts is omitted."
+            )
+        uniform_count = expected_num_samples // len(action_order)
+        normalized_expected_counts = {
+            action_id: uniform_count for action_id in action_order
+        }
+    else:
+        if not isinstance(expected_action_counts, Mapping):
+            raise ValueError("expected_action_counts must be a mapping.")
+        if set(expected_action_counts) != set(action_order):
+            raise ValueError(
+                "expected_action_counts keys must exactly match expected_action_ids."
+            )
+        normalized_expected_counts = {}
+        for action_id in action_order:
+            count = expected_action_counts[action_id]
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                raise ValueError(
+                    f"expected_action_counts[{action_id!r}] must be a positive integer."
+                )
+            normalized_expected_counts[action_id] = count
+        if sum(normalized_expected_counts.values()) != expected_num_samples:
+            raise ValueError("expected_action_counts must sum to expected_num_samples.")
     config_contract_sha256 = _require_sha256(
         config_contract_sha256, "config_contract_sha256"
     )
@@ -2219,12 +2236,10 @@ def audit_stage2_i2v_cache(
         action_labels_path=action_labels_path,
     )
     action_counts = Counter(actions)
-    expected_counts = {
-        action_id: expected_samples_per_action for action_id in action_order
-    }
-    if dict(action_counts) != expected_counts:
+    if dict(action_counts) != normalized_expected_counts:
         raise RuntimeError(
-            f"Action counts must be exactly {expected_counts}, got {dict(action_counts)}."
+            "Action counts must be exactly "
+            f"{normalized_expected_counts}, got {dict(action_counts)}."
         )
 
     negative = load_negative_conditioning(

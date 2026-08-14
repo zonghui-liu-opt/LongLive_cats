@@ -137,7 +137,11 @@ def test_release_stage2_config_resolves_locked_baseline_contract():
 
     assert resolved.expected_num_samples == 600
     assert resolved.expected_num_actions == 3
-    assert resolved.expected_samples_per_action == 200
+    assert dict(resolved.expected_action_counts) == {
+        "head_tilt_and_wink": 198,
+        "jump": 202,
+        "play_with_a_cat_wand": 200,
+    }
     assert resolved.metadata_path.endswith("metadata_600clips_480x832_buckets.csv")
     assert resolved.cache_dir.endswith("stage2_i2v_600_bf16")
     assert resolved.source_cache_manifest.endswith(
@@ -445,7 +449,7 @@ def test_release_data_paths_support_h100_environment_overrides(monkeypatch):
     )
     assert (
         baseline.contract_hash()
-        == "aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00"
+        == "dae3f4075f073351f27126d86a61be38d3c370fd5399a381788a0f51d959a5ea"
     )
 
     monkeypatch.setenv("LONG_LIVE_STAGE2_METADATA_PATH", "/mnt/stage2/metadata_600.csv")
