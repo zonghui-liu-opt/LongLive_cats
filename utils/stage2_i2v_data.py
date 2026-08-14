@@ -1559,11 +1559,17 @@ def load_source_cache_manifest(
             "This command requires the attested output of upgrade-source-manifest; "
             "the legacy Stage-1 manifest must never be edited in place."
         )
-    _source_encoder_hashes(manifest)
     upgrade = _validate_text_encoding_upgrade(
         manifest,
         expected_num_samples=expected_num_samples,
     )
+    if upgrade is None:
+        # A native F25 base manifest intentionally has no text-encoding contract
+        # until upgrade-source-manifest adds the append-only attestation block.
+        # Its positive encoder assets are still bound by their aggregate hashes.
+        _source_model_hashes(manifest)
+    else:
+        _source_encoder_hashes(manifest)
     if require_text_encoding_upgrade and upgrade is None:  # defensive tripwire
         raise AssertionError("required text-encoding upgrade validation was skipped")
     if manifest.get("schema") == STAGE2_F25_SOURCE_CACHE_SCHEMA:

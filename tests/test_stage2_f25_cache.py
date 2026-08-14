@@ -30,6 +30,7 @@ from utils.stage2_f25_cache import (
 )
 from utils.stage2_i2v_data import (
     STAGE2_F25_SOURCE_CACHE_SCHEMA,
+    STAGE2_TEXT_ENCODING_UPGRADE_KEY,
     STAGE2_TEXT_ENCODING_OPERATOR_ATTESTATION,
     load_source_cache_manifest,
     upgrade_legacy_source_cache_manifest_text_encoding,
@@ -515,6 +516,9 @@ def test_native_manifest_upgrades_outside_cache_and_loader_closes_chain(
 ):
     fixture = _fixture(tmp_path, [25, 24], proven_f25=True)
     base = _prepare(fixture, tmp_path, [])
+    base_loaded = load_source_cache_manifest(base, expected_num_samples=2)
+    assert STAGE2_TEXT_ENCODING_UPGRADE_KEY not in base_loaded
+    assert "text_encoding" not in base_loaded["source_fingerprint"]
     monkeypatch.setattr(
         "utils.wan_5b_wrapper.audit_wan_text_encoding_tokenizer_contract",
         lambda _path: {
