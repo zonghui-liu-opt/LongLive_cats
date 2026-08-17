@@ -1,5 +1,21 @@
 # 发现与决策
 
+## 2026-08-17 Phase 19：Stage‑2 smoke 新接口异常
+
+- 新异常已越过上一轮cross-KV sink preload，说明FSDP2 cross-KV状态修复在真实H100路径上生效；当前中止点推进到`_compute_micro_loss`的fake-score DSM loss调用。
+- 直接错误是调用者传入`timing_callback`而callee拒绝，但必须进一步核对callback契约是否也缺少内部阶段上报、其他model方法是否存在同类kwargs/返回值漂移，不能只在签名末尾机械加参数。
+- 当前Git HEAD `8eb75e4`中的`model/stage2_dmd.py`其实已从提交`72465ff`起同时为F/G两个from-model方法接受并执行`timing_callback`；AST矩阵证明trainer两处`self.model.*`调用的全部kwargs在当前callee签名中均被接受。因此内网异常不是当前分支的静态接口缺口，而是运行时加载了与trainer不同步的旧`Stage2DMD`定义（source/API skew）。
+- 仅删除callback或捕获`TypeError`会掩盖混合版本部署，并可能继续运行缺少其他训练修复的旧模型代码；正式方案应给Stage2DMD增加显式runtime API版本与精确签名握手，在角色初始化后、首个昂贵rollout前fail-fast，并用测试锁定trainer调用矩阵和callback标签/返回值。
+- 现有loss测试验证了F/G/DFD的张量共享、梯度隔离和返回loss，但调用时都省略`timing_callback`；完整663项因而未覆盖生产trainer实际传参。角色初始化也直接返回`Stage2DMD`，没有对trainer所需runtime API版本/签名做握手，这是本次“单测全绿、H100首轮才失败”的具体覆盖缺口。
+- 当前F路径callback应精确上报一次`fake_score`；G的DMD/DFD路径都应依次上报`fake_score`、`real_cond`、`real_uncond`并原样返回role forward结果。后续回归必须同时锁定标签、次数、执行顺序和loss/梯度不变。
+- 静态矩阵继续覆盖到完整micro-loss链：trainer→rollout、rollout→Generator、Stage2DMD→fake/real score四处调用均无额外kwargs；trainer读取的F/G output字段与两个冻结dataclass完全一致。当前未发现callback之外的第二个HEAD接口漂移。
+- 新门禁采用`longlive_stage2_dmd_runtime/v2`类版本+两个from-model方法的精确keyword-only参数顺序/default审计，并在Trainer构造期及角色初始化后各执行一次；旧callee会在任何模型forward/rollout前报告实际source path和缺失参数，不再消耗一次H100训练才能发现。
+- callback之后的联合回归覆盖loss、Trainer 5F→1G、C0/C1/C2 options、role init/manifest、transaction、FSDP init-only与true-Wan rollout，共142项全部通过；这批测试同时覆盖optimizer/EMA/checkpoint smoke所依赖的本地状态机边界，未发现新的HEAD错误。
+- 完整`tests/test_stage2_*.py`更新后为665 passed、14条既有TorchScript弃用warning；功能回归没有暴露第二个错误。首次Black静态门禁只要求机械格式化本轮trainer审计代码。
+- 仅格式化新增trainer审计段后，Black、Ruff、py_compile与任务范围diff-check全部通过；生产修复范围收敛为`model/stage2_dmd.py`的API版本和trainer双握手，没有删除timing或放宽旧代码兼容。
+- 为避免8个rank完成三角色5B加载后才发现source skew，顶层H100 wrapper的`require_runtime`也应使用隔离Python、显式插入当前`SCRIPT_ROOT`执行同一API审计，并要求实际`Stage2DMD` source恰为当前checkout的`model/stage2_dmd.py`；成功打印单一`STAGE2_DMD_RUNTIME_API=PASS`证据。
+- wrapper前置门禁、guide、trainer与loss联合回归83项通过；本地以与shell相同的isolated import/path检查实跑并打印`STAGE2_DMD_RUNTIME_API=PASS version=longlive_stage2_dmd_runtime/v2`，证明当前checkout source解析正确。
+
 ## 2026-08-17 Phase 18：cross-KV FSDP2 修复实现
 
 - 新增`Stage2CrossKVInitState`作为普通Python leaf，不使用dataclass/container，确保PyTorch FSDP2 root `_to_kwargs`和block `_apply_to_tensors`重建kwargs时保持同一对象identity。

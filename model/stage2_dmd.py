@@ -476,6 +476,8 @@ def compute_stage2_fake_score_flow_dsm_loss(
 class Stage2DMD(nn.Module):
     """Three owned roles plus explicit, gradient-audited loss reductions."""
 
+    RUNTIME_API_VERSION = "longlive_stage2_dmd_runtime/v2"
+
     def __init__(
         self,
         *,

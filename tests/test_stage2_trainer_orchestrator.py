@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
 import random
 import copy
+import textwrap
 from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
@@ -19,12 +22,81 @@ import utils.distributed as distributed_utils
 import utils.stage2_checkpoint as stage2_checkpoint
 import utils.stage2_metrics as stage2_metrics
 import utils.stage2_train_state as train_state_module
-from trainer.stage2_distillation import Trainer
+from model.stage2_dmd import Stage2DMD
+from trainer.stage2_distillation import (
+    Trainer,
+    _STAGE2_DMD_RUNTIME_METHODS,
+    _audit_stage2_dmd_runtime_api,
+)
 from utils.stage2_config import load_stage2_config
 from utils.stage2_sampler import build_stage2_role_samplers
 from utils.stage2_train_state import Stage2TrainingSchedule, Stage2TrainingState
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "train_i2v_stage2_600cats.yaml"
+
+
+def test_stage2_dmd_runtime_api_rejects_stale_loss_signatures():
+    audit = _audit_stage2_dmd_runtime_api(Stage2DMD)
+    assert audit["api_version"] == Stage2DMD.RUNTIME_API_VERSION
+    assert set(audit["methods"]) == {
+        "fake_score_flow_dsm_loss_from_model",
+        "generator_distribution_matching_loss_from_models",
+    }
+
+    class _UnversionedStage2DMD:
+        pass
+
+    with pytest.raises(RuntimeError, match=r"version mismatch.*actual=None"):
+        _audit_stage2_dmd_runtime_api(_UnversionedStage2DMD)
+
+    class _StaleStage2DMD:
+        RUNTIME_API_VERSION = Stage2DMD.RUNTIME_API_VERSION
+
+        def fake_score_flow_dsm_loss_from_model(
+            self,
+            *,
+            generated_future,
+            noised_fake_score,
+            conditional_dict,
+        ):
+            del generated_future, noised_fake_score, conditional_dict
+
+        def generator_distribution_matching_loss_from_models(
+            self,
+            *,
+            branch,
+            generated_future,
+            noised_score,
+            conditional_dict,
+            real_unconditional_dict,
+            timing_callback=None,
+        ):
+            del (
+                branch,
+                generated_future,
+                noised_score,
+                conditional_dict,
+                real_unconditional_dict,
+                timing_callback,
+            )
+
+    with pytest.raises(RuntimeError, match=r"fake_score.*timing_callback"):
+        _audit_stage2_dmd_runtime_api(_StaleStage2DMD)
+
+
+def test_trainer_micro_loss_call_keywords_match_audited_runtime_api():
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Trainer._compute_micro_loss)))
+    calls = {
+        node.func.attr: tuple(
+            keyword.arg for keyword in node.keywords if keyword.arg is not None
+        )
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _STAGE2_DMD_RUNTIME_METHODS
+    }
+
+    assert calls == _STAGE2_DMD_RUNTIME_METHODS
 
 
 class _CapturedLogger:
@@ -387,6 +459,9 @@ def test_smoke_options_encode_one_formal_or_c0_c1_c2_contract(
     assert trainer.options.no_save is no_save
     assert trainer.options.auto_resume is auto_resume
     assert trainer.options.dry_run is expected_dry_run
+    assert trainer.model_runtime_api_audit["api_version"] == (
+        Stage2DMD.RUNTIME_API_VERSION
+    )
 
 
 @pytest.mark.parametrize("smoke_mode", ["C1", "C2"])

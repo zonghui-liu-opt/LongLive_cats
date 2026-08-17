@@ -590,6 +590,11 @@ def test_model_level_dmd_calls_all_teachers_on_one_exact_noised_fake_object():
     )
     positive = {"prompt_embeds": torch.tensor([1.0])}
     negative = {"prompt_embeds": torch.tensor([-1.0])}
+    timed_labels = []
+
+    def timing_callback(label, callback):
+        timed_labels.append(label)
+        return callback()
 
     output = model.generator_distribution_matching_loss_from_models(
         branch="dmd",
@@ -597,6 +602,7 @@ def test_model_level_dmd_calls_all_teachers_on_one_exact_noised_fake_object():
         noised_score=noised,
         conditional_dict=positive,
         real_unconditional_dict=negative,
+        timing_callback=timing_callback,
     )
 
     calls = [fake_role.calls[0], *real_role.calls]
@@ -605,6 +611,7 @@ def test_model_level_dmd_calls_all_teachers_on_one_exact_noised_fake_object():
     assert all(call["noisy"] is noised.noisy_score for call in calls)
     assert all(call["frame_timestep"] is noised.frame_timestep for call in calls)
     assert all(not call["grad_enabled"] for call in calls)
+    assert timed_labels == ["fake_score", "real_cond", "real_uncond"]
     output.loss.backward()
     assert torch.isfinite(generator_role.model.weight.grad).all()
     assert fake_role.model.weight.grad is None
@@ -638,12 +645,19 @@ def test_model_level_dfd_calls_teachers_no_grad_with_shared_objects_and_only_g_g
     )
     positive = {"prompt_embeds": torch.tensor([1.0])}
     negative = {"prompt_embeds": torch.tensor([-1.0])}
+    timed_labels = []
+
+    def timing_callback(label, callback):
+        timed_labels.append(label)
+        return callback()
+
     output = model.generator_distribution_matching_loss_from_models(
         branch="dfd",
         generated_future=generated,
         noised_score=pair,
         conditional_dict=positive,
         real_unconditional_dict=negative,
+        timing_callback=timing_callback,
     )
 
     assert len(fake_role.calls) == 1
@@ -659,6 +673,7 @@ def test_model_level_dfd_calls_teachers_no_grad_with_shared_objects_and_only_g_g
     assert not fake_role.calls[0]["grad_enabled"]
     assert not real_role.calls[0]["grad_enabled"]
     assert not real_role.calls[1]["grad_enabled"]
+    assert timed_labels == ["fake_score", "real_cond", "real_uncond"]
 
     output.loss.backward()
     assert torch.isfinite(generator_role.model.weight.grad).all()
@@ -753,10 +768,17 @@ def test_model_level_fake_dsm_calls_only_fake_score_and_only_f_gets_grad():
         future_epsilon=torch.full_like(generated, 5.0),
     )
     positive = {"prompt_embeds": torch.tensor([1.0])}
+    timed_labels = []
+
+    def timing_callback(label, callback):
+        timed_labels.append(label)
+        return callback()
+
     output = model.fake_score_flow_dsm_loss_from_model(
         generated_future=generated,
         noised_fake_score=noised,
         conditional_dict=positive,
+        timing_callback=timing_callback,
     )
 
     assert output.loss.item() == 1.0
@@ -766,6 +788,7 @@ def test_model_level_fake_dsm_calls_only_fake_score_and_only_f_gets_grad():
     assert fake_role.calls[0]["frame_timestep"] is frame_timestep
     assert fake_role.calls[0]["conditioning"] is positive
     assert fake_role.calls[0]["grad_enabled"]
+    assert timed_labels == ["fake_score"]
     output.loss.backward()
     assert torch.isfinite(fake_role.model.weight.grad).all()
     assert generator_role.model.weight.grad is None

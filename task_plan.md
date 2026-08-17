@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 18 已完成：FSDP2-safe cross-KV可变leaf state、严格审计/reset与root/block双重容器重建回归已落地并完成663项Stage‑2验证；本轮精确提交发布到GitHub `stage-2`分支，真实8×H100 smoke待内网复验。
+Phase 19 已完成：内网异常已收敛为新trainer/旧Stage2DMD混合加载；v2 runtime API版本、精确签名双握手与wrapper source-path门禁已落地，完整Stage‑2 665项通过并重新发布`stage-2`。
 
 ## 各阶段
 
@@ -163,6 +163,14 @@ Phase 18 已完成：FSDP2-safe cross-KV可变leaf state、严格审计/reset与
 - [x] 只暂存本轮文件，commit并push到GitHub `stage-2`
 - **Status:** complete（聚焦55 passed；完整Stage‑2 663 passed；本轮文件精确发布；真实8×H100 smoke待内网复验）
 
+### Phase 19：Stage‑2 smoke 全调用链接口闭环
+- [x] 19.1 复现`timing_callback`失败并建立trainer→Stage2DMD全部调用/签名矩阵
+- [x] 19.2 审计F/G、DMD/DFD、rollout/score、timing与返回值的所有动态接口漂移
+- [x] 19.3 先补生产调用级红测，再最小修复全部已证实缺口
+- [x] 19.4 运行聚焦、完整Stage‑2、训练状态机与静态回归
+- [x] 19.5 精确审阅、commit并push GitHub `stage-2`
+- **Status:** complete（联合142 passed；完整Stage‑2 665 passed；wrapper isolated API probe PASS；真实8×H100 smoke待内网复验）
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -220,6 +228,9 @@ Phase 18 已完成：FSDP2-safe cross-KV可变leaf state、严格审计/reset与
 | Phase 18红测首次收集因`utils.stage2_cross_kv`尚不存在而失败 | 1 | 确认测试锁定缺失契约后新增非dataclass leaf state并复跑，聚焦测试通过 |
 | Phase 18全文件Black/Ruff检查命中`causal_model.py`既有格式与7项lint债务 | 1 | 不扩大提交；修正本轮测试格式，严格检查其余文件，并对比HEAD证明causal_model当前仍是相同7项、无新增lint |
 | planning完成检查脚本没有可执行位，直接调用被拒绝 | 1 | 保留脚本不改权限，改由`bash`显式执行同一只读检查 |
+| Phase 19 runtime API红测首次收集因审计helper不存在而失败 | 1 | 确认启动期握手覆盖缺口后实现版本/签名双重审计，目标测试转为通过 |
+| 一次组合pytest命令写了两个`-k`，后者覆盖前者而只运行3项loss测试 | 1 | 不把该结果冒充trainer覆盖；拆开命令后单独运行runtime API/smoke options 6项并通过 |
+| Phase 19首次Black check要求格式化trainer新增审计代码 | 1 | 先记录再仅对该任务文件机械格式化，随后重跑全部静态门禁 |
 
 ## 备注
 - 重大决策前重新读取本计划。

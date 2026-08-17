@@ -133,6 +133,29 @@ require_runtime() {
   [[ -x "$STAGE2_TORCHRUN" ]] || fail "torchrun不可执行：$STAGE2_TORCHRUN"
   [[ -f "$STAGE2_CONFIG" ]] || fail "训练配置不存在：$STAGE2_CONFIG"
   [[ -f "$SCRIPT_ROOT/train.py" ]] || fail "缺少train.py"
+  "$STAGE2_PYTHON" -I -B - "$SCRIPT_ROOT" <<'PY'
+from pathlib import Path
+import sys
+
+project_root = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(project_root))
+
+from model.stage2_dmd import Stage2DMD
+from trainer.stage2_distillation import _audit_stage2_dmd_runtime_api
+
+audit = _audit_stage2_dmd_runtime_api(Stage2DMD)
+expected_source = (project_root / "model" / "stage2_dmd.py").resolve(strict=True)
+actual_source = Path(audit["source_file"])
+if actual_source != expected_source:
+    raise SystemExit(
+        "Stage-2 DMD加载路径不是当前checkout："
+        f"expected={expected_source}, actual={actual_source}"
+    )
+print(
+    "STAGE2_DMD_RUNTIME_API=PASS "
+    f"version={audit['api_version']} source={actual_source}"
+)
+PY
 }
 
 require_distinct_run_paths() {

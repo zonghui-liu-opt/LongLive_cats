@@ -183,6 +183,9 @@ def test_stage2_h100_guide_keeps_release_safety_and_validation_order():
     assert "expected_resolved_config=inference_config.to_dict()" in text
     assert "expected_samples=samples" in text
     assert "require_distinct_run_paths" in text
+    assert "_audit_stage2_dmd_runtime_api" in text
+    assert "STAGE2_DMD_RUNTIME_API=PASS" in text
+    assert 'project_root / "model" / "stage2_dmd.py"' in text
     assert "tee -a" in text
     assert "rm -rf" not in text
     assert "git clean" not in text

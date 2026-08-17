@@ -1,5 +1,24 @@
 # 进度日志
 
+## 会话：2026-08-17（Phase 19）
+
+### Stage‑2 smoke 全调用链接口闭环
+- **状态：** complete（runtime API/source-path闭环已发布；真实8×H100 smoke待内网复验）
+- 内网新失败发生在C0首个fake-score DSM loss：trainer传入`timing_callback`，但`Stage2DMD.fake_score_flow_dsm_loss_from_model()`签名不接受该参数。
+- 本轮按用户要求不做单点止血：将建立trainer所有`self.model.*`生产调用与Stage2DMD签名矩阵，并继续审计callback调用时机、返回结构、F/G/DFD分支和checkpoint smoke边界。
+- 当前分支/远端仍为`stage-2`/`longlive-cats`，HEAD=`8eb75e4`；用户metadata、checkpoints、results、tmp与prepare_stage1继续保护，不暂存。
+- 已建立AST调用矩阵：trainer只有F/G两处`self.model.*`调用，当前HEAD的两个Stage2DMD签名均完整接受所传kwargs；`timing_callback`已存在于历史提交`72465ff`。这把根因收敛为内网运行时source/API skew，而非HEAD缺少该参数。
+- 已确认现有loss测试未传callback，角色初始化也没有runtime API握手；将以“显式API版本+精确签名审计+F/G callback行为测试+trainer生产调用测试”补齐覆盖，而不是对TypeError做兼容吞错。
+- runtime API红测先按预期因helper缺失失败；现已加入v2版本/精确签名握手并接入Trainer构造和角色初始化后双门禁，目标测试通过。
+- 已给F-DMD、G-DMD、G-DFD三条真实Stage2DMD loss路径补callback标签/执行顺序测试，4项聚焦测试通过；静态接口矩阵确认rollout、Generator、fake/real score与output字段无其他漂移。
+- 新增AST生产调用矩阵测试并让现有C0/C1/C2 Trainer构造测试断言runtime audit；一次组合命令因后一个`-k`覆盖前者只跑3项，已拆开复验trainer门禁6项通过。
+- callback后联合目标回归142 passed（loss/trainer/role/manifest/transaction/init-only/true-Wan），14条均为既有TorchScript弃用warning；下一步执行完整Stage‑2与静态/发布门禁。
+- 完整Stage‑2回归665 passed、14条既有warning；首次Black check仅报告`trainer/stage2_distillation.py`新增审计段需机械格式化，尚未把该静态结果标为通过。
+- 仅机械格式化新增trainer审计段后，Black、Ruff、py_compile和精确diff-check全部通过；Phase 19仅剩最终diff审阅、精确commit/push与远端核验。
+- 最终diff审阅后决定把同一runtime audit前移到`run_stage2_h100.sh::require_runtime`，这样source path/API版本在torchrun和模型加载前验证；将补shell契约测试后重新跑guide与完整静态门禁。
+- wrapper/guide/trainer/loss联合83 passed，`bash -n`通过；与shell相同的isolated runtime probe已实跑并打印当前checkout的v2 PASS/source path。
+- 最终精确范围为3个production文件、3个测试文件和3份Phase 19记录；用户metadata、checkpoints、results、tmp与prepare_stage1保持未暂存，发布后远端commit需与本地HEAD逐位核验。
+
 ## 会话：2026-08-17（Phase 18）
 
 ### 实现 cross-KV FSDP2 修复并发布

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -54,6 +55,96 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+_STAGE2_DMD_RUNTIME_API_VERSION = "longlive_stage2_dmd_runtime/v2"
+_STAGE2_DMD_RUNTIME_METHODS = {
+    "fake_score_flow_dsm_loss_from_model": (
+        "generated_future",
+        "noised_fake_score",
+        "conditional_dict",
+        "timing_callback",
+    ),
+    "generator_distribution_matching_loss_from_models": (
+        "branch",
+        "generated_future",
+        "noised_score",
+        "conditional_dict",
+        "real_unconditional_dict",
+        "timing_callback",
+    ),
+}
+
+
+def _audit_stage2_dmd_runtime_api(model_type: type) -> dict[str, Any]:
+    """Fail before training when trainer and Stage2DMD source are out of sync."""
+
+    if not isinstance(model_type, type):
+        raise TypeError("Stage-2 DMD runtime API audit requires a model type")
+    source_file = inspect.getsourcefile(model_type) or "<unknown>"
+    actual_version = getattr(model_type, "RUNTIME_API_VERSION", None)
+    if actual_version != _STAGE2_DMD_RUNTIME_API_VERSION:
+        raise RuntimeError(
+            "Stage-2 DMD runtime API version mismatch: "
+            f"expected={_STAGE2_DMD_RUNTIME_API_VERSION!r}, "
+            f"actual={actual_version!r}, source={source_file}. "
+            "Use one clean stage-2 checkout; do not mix trainer and model files."
+        )
+
+    methods: dict[str, str] = {}
+    for method_name, expected_names in _STAGE2_DMD_RUNTIME_METHODS.items():
+        method = getattr(model_type, method_name, None)
+        if not callable(method):
+            raise RuntimeError(
+                f"Stage-2 DMD runtime API lacks callable {method_name}; "
+                f"source={source_file}"
+            )
+        signature = inspect.signature(method)
+        parameters = tuple(signature.parameters.values())
+        if not parameters or parameters[0].name != "self":
+            raise RuntimeError(
+                f"Stage-2 DMD runtime API mismatch for {method_name}: "
+                f"missing self parameter; source={source_file}"
+            )
+        exposed = parameters[1:]
+        actual_names = tuple(parameter.name for parameter in exposed)
+        if actual_names != expected_names:
+            missing = [name for name in expected_names if name not in actual_names]
+            unexpected = [name for name in actual_names if name not in expected_names]
+            raise RuntimeError(
+                f"Stage-2 DMD runtime API mismatch for {method_name}: "
+                f"missing={missing}, unexpected={unexpected}, "
+                f"expected_order={list(expected_names)}, "
+                f"actual_order={list(actual_names)}, source={source_file}. "
+                "Use one clean stage-2 checkout; do not mix trainer and model files."
+            )
+        invalid_kinds = [
+            parameter.name
+            for parameter in exposed
+            if parameter.kind is not inspect.Parameter.KEYWORD_ONLY
+        ]
+        invalid_defaults = [
+            parameter.name
+            for parameter in exposed
+            if (parameter.name == "timing_callback" and parameter.default is not None)
+            or (
+                parameter.name != "timing_callback"
+                and parameter.default is not inspect.Parameter.empty
+            )
+        ]
+        if invalid_kinds or invalid_defaults:
+            raise RuntimeError(
+                f"Stage-2 DMD runtime API mismatch for {method_name}: "
+                f"non_keyword_only={invalid_kinds}, "
+                f"invalid_defaults={invalid_defaults}, source={source_file}"
+            )
+        methods[method_name] = str(signature)
+    return {
+        "api_version": actual_version,
+        "model_type": f"{model_type.__module__}.{model_type.__qualname__}",
+        "source_file": str(Path(source_file).expanduser().resolve()),
+        "methods": methods,
+    }
+
+
 class Trainer:
     """Production Stage-2 trainer; construction stays CPU/light until ``train``."""
 
@@ -71,6 +162,9 @@ class Trainer:
             raise ValueError(
                 "Stage-2 Trainer requires the strict Stage2ResolvedConfig."
             )
+        from model.stage2_dmd import Stage2DMD
+
+        self.model_runtime_api_audit = _audit_stage2_dmd_runtime_api(Stage2DMD)
         if not output_dir:
             raise ValueError("Stage-2 requires an explicit --logdir.")
         if smoke_mode not in {None, "C0", "C1", "C2"}:
@@ -514,6 +608,11 @@ class Trainer:
         )
         self.assets = assets
         self.model = initialized.model
+        actual_runtime_api = _audit_stage2_dmd_runtime_api(type(self.model))
+        if actual_runtime_api != self.model_runtime_api_audit:
+            raise RuntimeError(
+                "Stage-2 DMD runtime API changed during role initialization"
+            )
         self.role_audits = initialized.role_audits
         self.lora_schemas = initialized.lora_schemas
 
