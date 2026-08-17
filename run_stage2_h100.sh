@@ -131,31 +131,8 @@ announce() {
 require_runtime() {
   [[ -x "$STAGE2_PYTHON" ]] || fail "Python不可执行：$STAGE2_PYTHON"
   [[ -x "$STAGE2_TORCHRUN" ]] || fail "torchrun不可执行：$STAGE2_TORCHRUN"
-  git -C "$SCRIPT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
-    fail "脚本必须位于Git checkout：$SCRIPT_ROOT"
   [[ -f "$STAGE2_CONFIG" ]] || fail "训练配置不存在：$STAGE2_CONFIG"
   [[ -f "$SCRIPT_ROOT/train.py" ]] || fail "缺少train.py"
-}
-
-require_clean_checkout() {
-  local dirty
-  dirty="$(git -C "$SCRIPT_ROOT" status --porcelain=v1 --untracked-files=all)"
-  [[ -z "$dirty" ]] || fail "Git checkout不干净；请先提交本轮代码，并把运行产物放到仓库外。"
-}
-
-require_external_path() {
-  local label="$1"
-  local path="$2"
-  "$STAGE2_PYTHON" -I -B - "$SCRIPT_ROOT" "$label" "$path" <<'PY'
-from pathlib import Path
-import sys
-
-project = Path(sys.argv[1]).resolve(strict=True)
-label = sys.argv[2]
-target = Path(sys.argv[3]).expanduser().resolve(strict=False)
-if target == project or project in target.parents:
-    raise SystemExit(f"{label}必须位于Git checkout之外：{target}")
-PY
 }
 
 require_distinct_run_paths() {
@@ -533,10 +510,7 @@ run_prepare() {
   fi
   require_runtime
   require_training_arm "$ACTIVE_CONFIG" dmd_dfd
-  require_clean_checkout
   require_distinct_run_paths
-  require_external_path STAGE2_WORK_ROOT "$STAGE2_WORK_ROOT"
-  require_external_path STAGE2_TRAIN_ROOT "$STAGE2_TRAIN_ROOT"
   mkdir -p "$STAGE2_WORK_ROOT/logs" "$STAGE2_TRAIN_ROOT"
   : >"$STAGE2_WORK_ROOT/logs/prepare_release.log"
   run_logged "$STAGE2_WORK_ROOT/logs/prepare_release.log" bash "$SCRIPT_ROOT/prepare_stage2.sh"
@@ -560,9 +534,7 @@ run_smoke() {
   fi
   require_runtime
   require_training_arm "$ACTIVE_CONFIG" dmd_dfd
-  require_clean_checkout
   require_distinct_run_paths
-  require_external_path STAGE2_SMOKE_DIR "$STAGE2_SMOKE_DIR"
   require_prepared
   mkdir -p "$STAGE2_SMOKE_DIR"
   local mode
@@ -592,9 +564,7 @@ run_train_b1() {
   fi
   require_runtime
   require_training_arm "$ACTIVE_CONFIG" dmd_dfd
-  require_clean_checkout
   require_distinct_run_paths
-  require_external_path STAGE2_FORMAL_DIR "$STAGE2_FORMAL_DIR"
   require_prepared
   smoke_complete || fail "smoke尚未完整通过；先运行：bash run_stage2_h100.sh smoke"
   if formal_complete "$STAGE2_FORMAL_DIR" "$ACTIVE_CONFIG" dmd_dfd; then
@@ -645,16 +615,13 @@ run_train_b0() {
     "从B1的同一G240分叉，正式训练纯DMD matched-control B0到G280" \
     "STAGE2_GUIDE_TRAIN_B0=PASS"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  生成仓库外B0配置：$STAGE2_B0_CONFIG"
+    echo "  生成B0配置：$STAGE2_B0_CONFIG"
     echo "  固定变换：init_from_stage1=null, resume_stage2=G240, phase_b_mode=dmd_only, dfd_probability=0"
     torchrun_train_command "$STAGE2_B0_CONFIG" "$STAGE2_B0_DIR"
     return 0
   fi
   require_runtime
-  require_clean_checkout
   require_distinct_run_paths
-  require_external_path STAGE2_B0_DIR "$STAGE2_B0_DIR"
-  require_external_path STAGE2_B0_CONFIG "$STAGE2_B0_CONFIG"
   require_prepared
   formal_complete "$STAGE2_FORMAL_DIR" "$ACTIVE_CONFIG" dmd_dfd || \
     fail "B1尚未完整到G280。"
@@ -689,10 +656,7 @@ run_plot() {
     return 0
   fi
   require_runtime
-  require_clean_checkout
   require_distinct_run_paths
-  require_external_path STAGE2_FORMAL_PLOTS "$STAGE2_FORMAL_DIR/plots"
-  require_external_path STAGE2_B0_PLOTS "$STAGE2_B0_DIR/plots"
   formal_complete "$STAGE2_FORMAL_DIR" "$ACTIVE_CONFIG" dmd_dfd || \
     fail "B1尚未完整训练。"
   formal_complete "$STAGE2_B0_DIR" "$STAGE2_B0_CONFIG" dmd_only || \
@@ -722,10 +686,7 @@ run_infer() {
     return 0
   fi
   require_runtime
-  require_clean_checkout
   require_distinct_run_paths
-  require_external_path STAGE2_INFERENCE_OUTPUT "$STAGE2_INFERENCE_OUTPUT"
-  require_external_path STAGE2_TRAIN_ROOT "$STAGE2_TRAIN_ROOT"
   require_prepared
   formal_complete "$STAGE2_FORMAL_DIR" "$ACTIVE_CONFIG" dmd_dfd || \
     fail "B1尚未完整到G280。"

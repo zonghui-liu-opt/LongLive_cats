@@ -10,7 +10,7 @@ readonly PROJECT_ROOT
 : "${LONG_LIVE_STAGE2_T5_CHECKPOINT:?set the Wan UMT5 encoder checkpoint}"
 : "${LONG_LIVE_STAGE2_TOKENIZER_DIR:?set the Wan UMT5 tokenizer directory}"
 : "${LONG_LIVE_STAGE2_VAE_CHECKPOINT:?set the Wan VAE checkpoint}"
-: "${LONG_LIVE_STAGE2_INFERENCE_OUTPUT:?set an output directory outside the clean checkout}"
+: "${LONG_LIVE_STAGE2_INFERENCE_OUTPUT:?set the Stage-2 inference output directory}"
 
 STAGE2_PYTHON="${STAGE2_PYTHON:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python}"
 STAGE2_TORCHRUN="${STAGE2_TORCHRUN:-$(dirname -- "${STAGE2_PYTHON}")/torchrun}"

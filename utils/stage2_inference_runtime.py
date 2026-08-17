@@ -11,9 +11,7 @@ from __future__ import annotations
 import gc
 import json
 import os
-import re
 import stat
-import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -29,6 +27,7 @@ from utils.inference_utils import save_video
 from utils.stage1_causal_validation import probe_video
 from utils.stage1_i2v_data import load_stage1_input_image
 from utils.stage1_io import atomic_output_path, canonical_json_sha256, sha256_file
+from utils.stage2_code_version import capture_stage2_source_version
 from utils.stage2_inference import (
     STAGE2_INFERENCE_FPS,
     Stage2InferenceResult,
@@ -66,7 +65,6 @@ from utils.stage2_inference_batch import (
 from utils.stage2_inference_config import ResolvedStage2InferenceConfig
 from utils.stage2_inference_loader import load_stage2_ema_generator_for_inference
 
-_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _OUTPUT_ROOT_GUARD_SCHEMA = "longlive_stage2_output_root_guard/v1"
 
 
@@ -244,31 +242,6 @@ def _default_barrier(context: Stage2InferenceDistributedContext) -> None:
         dist.barrier()
 
 
-def _capture_clean_git_code_version() -> dict[str, Any]:
-    root = Path(__file__).resolve().parents[1]
-    try:
-        commit_result = subprocess.run(
-            ["git", "-C", os.fspath(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        status_result = subprocess.run(
-            ["git", "-C", os.fspath(root), "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError("formal Stage-2 inference requires Git metadata") from exc
-    commit = commit_result.stdout.strip().lower()
-    if _GIT_COMMIT_RE.fullmatch(commit) is None:
-        raise RuntimeError("formal Stage-2 inference Git commit is invalid")
-    return {"git_commit": commit, "dirty": bool(status_result.stdout.strip())}
-
-
 @dataclass(frozen=True)
 class Stage2InferenceRuntimeOps:
     """Production operations with injectable heavy/I/O boundaries for CPU tests."""
@@ -310,7 +283,7 @@ class Stage2InferenceRuntimeOps:
     write_manifest: Callable[..., Path] = write_stage2_inference_manifest
     write_review_index: Callable[..., Path] = write_stage2_review_index
     capture_code_version: Callable[[], Mapping[str, Any]] = (
-        _capture_clean_git_code_version
+        capture_stage2_source_version
     )
     all_gather_object: Callable[..., tuple[Any, ...]] = _default_all_gather_object
     barrier: Callable[..., None] = _default_barrier
@@ -446,16 +419,6 @@ def _prepare_output_root(
     if root.is_symlink() or (root.exists() and not root.is_dir()):
         raise RuntimeError(f"Stage-2 output root is not a regular directory: {root}")
     resolved = root.resolve()
-    checkout = Path(__file__).resolve().parents[1]
-    try:
-        resolved.relative_to(checkout)
-    except ValueError:
-        pass
-    else:
-        raise RuntimeError(
-            "Stage-2 inference output root must be outside the Git checkout: "
-            f"{resolved}"
-        )
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir() or root.resolve() != resolved:
         raise RuntimeError(
@@ -1188,12 +1151,15 @@ def run_stage2_inference(
             [sample.to_manifest_source() for sample in samples]
         )
         code_version = dict(runtime_ops.capture_code_version())
-        if set(code_version) != {"git_commit", "dirty"}:
+        if set(code_version) != {"stage2_source_sha256"}:
             raise ValueError("Stage-2 inference code version schema mismatch")
-        if code_version["dirty"] is not False:
-            raise RuntimeError("formal Stage-2 inference requires a clean Git checkout")
-        if _GIT_COMMIT_RE.fullmatch(str(code_version["git_commit"])) is None:
-            raise RuntimeError("formal Stage-2 inference Git commit is invalid")
+        source_sha256 = code_version["stage2_source_sha256"]
+        if (
+            not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in source_sha256)
+        ):
+            raise ValueError("Stage-2 inference source version is invalid")
     except Exception as exc:  # noqa: BLE001 - synchronize every rank before raising
         startup_exception = exc
     startup = _collective_phase_result(
@@ -1245,7 +1211,7 @@ def run_stage2_inference(
         raise RuntimeError("Stage-2 local output root differs from rank consensus")
     versions = [dict(item["code_version"]) for item in startup]
     if any(value != versions[0] for value in versions[1:]):
-        raise RuntimeError("Stage-2 ranks do not share one clean Git commit")
+        raise RuntimeError("Stage-2 ranks do not share one source snapshot")
     code_version = versions[0]
     metadata_values = [dict(item["metadata"]) for item in startup]
     if any(value != metadata_values[0] for value in metadata_values[1:]):
@@ -1507,7 +1473,7 @@ def run_stage2_inference(
             )
             final_code_version = dict(runtime_ops.capture_code_version())
             if final_code_version != code_version:
-                raise RuntimeError("Git state changed during Stage-2 inference")
+                raise RuntimeError("Stage-2 source changed during inference")
             manifest_path, index_path = _finalize_artifacts(
                 root_guard,
                 samples=samples,

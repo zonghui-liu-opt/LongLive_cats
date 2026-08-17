@@ -25,7 +25,7 @@ cd /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
 
 export ACTION_SIDECAR_600=/你的绝对路径/action_labels_600.csv
 export ATTEST_STAGE2_TEACHER=1
-# 必须位于 Git checkout 外；正式推理会拒绝含 untracked 产物的仓库。
+# 推荐使用独立工作目录，便于容量管理、归档和恢复。
 export STAGE2_WORK_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new
 
 bash prepare_stage2.sh

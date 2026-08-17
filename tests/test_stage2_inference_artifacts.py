@@ -605,7 +605,7 @@ def test_complete_56_sample_manifest_and_static_review_index(tmp_path):
         checkpoint=CHECKPOINT,
         inference_config=inference_config,
         metadata=metadata,
-        code_version={"git_commit": "a" * 40, "dirty": False},
+        code_version={"stage2_source_sha256": "a" * 64},
     )
     assert manifest["status"] == "complete"
     assert manifest["inference_config"] == inference_config
@@ -705,7 +705,7 @@ def test_complete_56_sample_manifest_and_static_review_index(tmp_path):
             checkpoint=CHECKPOINT,
             inference_config=inference_config,
             metadata=metadata,
-            code_version={"git_commit": "a" * 40, "dirty": False},
+            code_version={"stage2_source_sha256": "a" * 64},
         )
 
     trace_path = Path(trace_paths[samples[0].sample_key])
@@ -719,7 +719,7 @@ def test_complete_56_sample_manifest_and_static_review_index(tmp_path):
             checkpoint=CHECKPOINT,
             inference_config=inference_config,
             metadata=metadata,
-            code_version={"git_commit": "a" * 40, "dirty": False},
+            code_version={"stage2_source_sha256": "a" * 64},
         )
 
     extra = tmp_path / "videos" / "unexpected.mp4"

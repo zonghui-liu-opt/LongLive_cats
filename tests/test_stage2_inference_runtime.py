@@ -47,13 +47,13 @@ _CHECKPOINT = {
     "contract_hash": "2" * 64,
     "generator_ema_sha256": "3" * 64,
 }
-_CODE_VERSION = {"git_commit": "4" * 40, "dirty": False}
+_CODE_VERSION = {"stage2_source_sha256": "4" * 64}
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_output_root_must_be_outside_the_git_checkout() -> None:
-    with pytest.raises(RuntimeError, match="outside the Git checkout"):
-        _prepare_output_root(_PROJECT_ROOT)
+def test_output_root_may_be_inside_the_project_tree() -> None:
+    guard = _prepare_output_root(_PROJECT_ROOT)
+    assert guard.root == _PROJECT_ROOT
 
 
 def test_regular_parent_creation_is_safe_for_concurrent_ranks(
@@ -428,7 +428,6 @@ def _runtime_ops(
     samples: tuple[Stage2InferenceSample, ...],
     calls: dict[str, Any],
     *,
-    dirty: bool = False,
     probe_fn: Any = _video_probe,
 ) -> Stage2InferenceRuntimeOps:
     calls.update(
@@ -540,7 +539,7 @@ def _runtime_ops(
         generate_two=generate_two,
         save_video=counted_video_writer,
         probe_video=probe_fn,
-        capture_code_version=lambda: {**_CODE_VERSION, "dirty": dirty},
+        capture_code_version=lambda: dict(_CODE_VERSION),
         **_fake_artifact_ops(calls),
     )
 
@@ -966,7 +965,7 @@ def test_video_probe_failure_commits_neither_pair_nor_complete_manifest(
     assert not (root / STAGE2_INFERENCE_MANIFEST_NAME).exists()
 
 
-def test_dirty_checkout_stops_before_loading_any_model(tmp_path: Path) -> None:
+def test_invalid_source_version_stops_before_loading_any_model(tmp_path: Path) -> None:
     config = _config(tmp_path)
     sample = _sample(
         tmp_path,
@@ -977,11 +976,15 @@ def test_dirty_checkout_stops_before_loading_any_model(tmp_path: Path) -> None:
     )
     calls: dict[str, Any] = {}
 
-    with pytest.raises(RuntimeError, match="clean Git checkout"):
+    ops = replace(
+        _runtime_ops((sample,), calls),
+        capture_code_version=lambda: {"stage2_source_sha256": "invalid"},
+    )
+    with pytest.raises(ValueError, match="source version is invalid"):
         run_stage2_inference(
             config,
             context=_context(),
-            ops=_runtime_ops((sample,), calls, dirty=True),
+            ops=ops,
         )
 
     assert calls["text_encoder_builds"] == 0

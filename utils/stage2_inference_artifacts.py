@@ -46,7 +46,7 @@ from utils.stage2_inference_config import (
 )
 
 STAGE2_SAMPLE_TRACE_SCHEMA = "longlive_stage2_sample_trace/v1"
-STAGE2_INFERENCE_MANIFEST_SCHEMA = "longlive_stage2_inference_manifest/v1"
+STAGE2_INFERENCE_MANIFEST_SCHEMA = "longlive_stage2_inference_manifest/v2"
 STAGE2_INFERENCE_CONFIG_IDENTITY_SCHEMA = "longlive_stage2_inference_config_identity/v2"
 STAGE2_INFERENCE_MANIFEST_NAME = "manifest.json"
 STAGE2_REVIEW_INDEX_NAME = "index.html"
@@ -160,16 +160,6 @@ def _sha256(value: Any, label: str) -> str:
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _git_commit(value: Any) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 40
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError("git_commit must be a lowercase 40-character hex digest")
     return value
 
 
@@ -1100,13 +1090,10 @@ def validate_stage2_inference_manifest(
         )
     code_version = manifest.get("code_version")
     if not isinstance(code_version, Mapping) or set(code_version) != {
-        "git_commit",
-        "dirty",
+        "stage2_source_sha256"
     }:
         raise ValueError("Stage-2 inference code_version schema mismatch")
-    _git_commit(code_version["git_commit"])
-    if code_version["dirty"] is not False:
-        raise RuntimeError("formal Stage-2 inference requires one clean Git commit")
+    _sha256(code_version["stage2_source_sha256"], "code_version.stage2_source_sha256")
     _validate_checkpoint_identity(manifest.get("checkpoint"))
     config_identity = validate_stage2_inference_config_identity(
         manifest.get("inference_config")
@@ -1402,11 +1389,9 @@ def build_stage2_inference_manifest(
     if root != Path(config_identity["resolved"]["output_root"]):
         raise RuntimeError("Stage-2 manifest output root differs from its config")
     metadata_identity = _validate_metadata_identity(metadata)
-    if set(code_version) != {"git_commit", "dirty"}:
+    if set(code_version) != {"stage2_source_sha256"}:
         raise ValueError("Stage-2 inference code_version schema mismatch")
-    _git_commit(code_version["git_commit"])
-    if code_version["dirty"] is not False:
-        raise RuntimeError("formal Stage-2 inference requires one clean Git commit")
+    _sha256(code_version["stage2_source_sha256"], "code_version.stage2_source_sha256")
     entries = []
     for sample in samples:
         trace = validate_stage2_sample_trace(

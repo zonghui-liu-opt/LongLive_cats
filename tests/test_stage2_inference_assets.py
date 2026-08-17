@@ -115,11 +115,7 @@ def _fixture(
     provenance = {
         "schema": STAGE2_PROVENANCE_SCHEMA,
         "schema_version": STAGE2_PROVENANCE_SCHEMA_VERSION,
-        "code_version": {
-            "git_commit": None,
-            "git_tracked_dirty": None,
-            "stage2_source_sha256": "a" * 64,
-        },
+        "code_version": {"stage2_source_sha256": "a" * 64},
         "assets": {
             "generator": generator_asset,
             "real_score": {"checkpoint_sha256": "b" * 64},

@@ -7,10 +7,10 @@ C0/C1/C2、正式训练、断点恢复、训练曲线和 baseline 推理。
 正常执行不需要逐段复制本文。直接运行 `bash run_stage2_h100.sh help`，再按脚本显示的
 `prepare → smoke → train → control → plot → infer` 六步操作；本文只保留完整原理和故障排查命令。
 
-所有命令均在同一个 shell 中执行。不要把 prepare、训练、推理或临时配置产物写进 Git
-checkout：正式推理会对 tracked、untracked 文件一起执行 clean-Git 门禁。
+所有命令均在同一个 shell 中执行。该流程不读取版本控制元数据，也不要求代码目录处于提交态。
+建议仍把工作产物放在独立目录，便于容量管理、归档和故障恢复。
 
-## 1. 固定仓库、解释器和仓库外输出
+## 1. 固定代码目录、解释器和输出目录
 
 ```bash
 set -euo pipefail
@@ -30,14 +30,10 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 cd "$STAGE2_PROJECT_ROOT"
 [[ -x "$STAGE2_PYTHON" ]]
 [[ -x "$STAGE2_TORCHRUN" ]]
-case "$STAGE2_WORK_ROOT/" in "$STAGE2_PROJECT_ROOT/"*) exit 1;; esac
-case "$STAGE2_TRAIN_ROOT/" in "$STAGE2_PROJECT_ROOT/"*) exit 1;; esac
 mkdir -p "$STAGE2_WORK_ROOT/logs" "$STAGE2_TRAIN_ROOT"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
 ```
 
-最后一条命令必须没有输出。若旧 prepare 曾在仓库内生成 `checkpoints/`、`results/`、cache
-或临时 YAML，先由操作者确认后将它们归档到仓库外，或使用同一 commit 的全新 clean checkout；
+若旧 prepare 曾生成 `checkpoints/`、`results/`、cache 或临时 YAML，先由操作者确认后归档；
 不要用未经检查的批量删除命令。
 
 ## 2. 绑定内网正式资产并完成 6 项训练前门禁
@@ -178,9 +174,8 @@ mkdir -p "$STAGE2_FORMAL_DIR"
 进程被正常中断或机器重启后，重新导出第 1、2 节变量，并在同一 `STAGE2_FORMAL_DIR` 运行
 完全相同的命令；默认 auto-resume 只选择最新带 `_SUCCESS` 的完整 checkpoint。不要传
 `--no-auto-resume`。如果 checkpoint/数据/config/phase arm 不一致，正确行为是 fail closed，而
-不是跳过校验。checkpoint 会把 Git commit、tracked-dirty 标记和 Stage-2 源码摘要写入 code
-provenance 供审计；当前恢复契约不会把代码升级误判成 checkpoint 损坏，因此操作者必须保留
-每次运行所用的 clean commit，并在恢复前人工核对该 provenance。
+不是跳过校验。checkpoint 会把 Stage-2 源码 SHA-256 写入 code provenance 供审计；恢复前可
+直接核对该摘要，不需要版本控制元数据。
 
 训练完整结束后必须存在：
 
@@ -193,7 +188,7 @@ test -f "$STAGE2_FORMAL_DIR/metrics/stage2_train_metrics.jsonl"
 
 baseline 正式任务是 B1（Phase B 使用 DMD/DFD）。它完成后保留的 G240 是 A24 共同父点；B0
 必须从这个 checkpoint 继续跑 4 个纯 DMD epoch，不能拿 A24 终点直接与 B1 的 A24+B4 比较。
-在仓库外复制本轮实际通过门禁的 `ACTIVE_CONFIG`，只做以下四项字段变换：
+复制本轮实际通过门禁的 `ACTIVE_CONFIG`，只做以下四项字段变换：
 
 ```bash
 export STAGE2_A24_ANCHOR="$STAGE2_FORMAL_DIR/checkpoint_stage2_g000240"
@@ -252,13 +247,12 @@ lineage。
 
 ## 8. B1 G280 Generator-EMA baseline 推理
 
-推理前再次确认 Git checkout 完全干净，且输出目录在仓库外。runner 每个 rank 只加载一次
-T5、Generator EMA 和 VAE，使用 seeds 1–4；同一 `(样本, seed)` 的 A/B noise 来自一条连续
+推理不读取版本控制状态。runner 会校验各 rank 的 Stage-2 源码 SHA-256 一致，并在结束前再次
+确认源码快照未变化；每个 rank 只加载一次 T5、Generator EMA 和 VAE，使用 seeds 1–4；同一 `(样本, seed)` 的 A/B noise 来自一条连续
 48-frame RNG 流：A 取前 24、B 取后 24，不在 B 前重置 seed。
 
 ```bash
 cd "$STAGE2_PROJECT_ROOT"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
 export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$STAGE2_FORMAL_DIR/checkpoint_stage2_g000280"
 export LONG_LIVE_STAGE2_ARCHITECTURE_ROOT="$ARCH_ROOT"
@@ -266,7 +260,6 @@ export LONG_LIVE_STAGE2_T5_CHECKPOINT="$ARCH_ROOT/models_t5_umt5-xxl-enc-bf16.pt
 export LONG_LIVE_STAGE2_TOKENIZER_DIR="$ARCH_ROOT/google/umt5-xxl"
 export LONG_LIVE_STAGE2_VAE_CHECKPOINT="$ARCH_ROOT/Wan2.2_VAE.pth"
 export LONG_LIVE_STAGE2_INFERENCE_OUTPUT="$STAGE2_TRAIN_ROOT/inference_g280_baseline"
-case "$LONG_LIVE_STAGE2_INFERENCE_OUTPUT/" in "$STAGE2_PROJECT_ROOT/"*) exit 1;; esac
 
 bash infer_stage2_baseline.sh \
   2>&1 | tee "$STAGE2_TRAIN_ROOT/inference_g280_baseline.log"

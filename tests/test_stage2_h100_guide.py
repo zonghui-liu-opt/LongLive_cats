@@ -163,7 +163,9 @@ def test_stage2_h100_guide_rejects_overlapping_run_directories(tmp_path):
 def test_stage2_h100_guide_keeps_release_safety_and_validation_order():
     text = GUIDE.read_text(encoding="utf-8")
     assert "set -Eeuo pipefail" in text
-    assert 'git -C "$SCRIPT_ROOT" status --porcelain=v1 --untracked-files=all' in text
+    assert "require_clean_checkout" not in text
+    assert "git -C" not in text
+    assert "require_external_path" not in text
     assert "checkpoint_model_003075" in text
     assert "stage1_step3075_ema_merged.pt" in text
     assert "STAGE2_FSDP2_ACCUMULATION_GATE=PASS mode=H100-world8" in text

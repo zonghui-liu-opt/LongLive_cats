@@ -71,7 +71,7 @@ def test_full_stage2_runbook_covers_exact_release_lifecycle():
         "--require-complete",
         "infer_stage2_baseline.sh",
         "STAGE2_BASELINE_INFERENCE_ARTIFACTS=PASS",
-        "git status --porcelain=v1 --untracked-files=all",
+        "Stage-2 源码 SHA-256",
         "abs(error_seconds) <= max(0.1, 0.05 * step_seconds_max)",
         "SIGKILL",
         "run_stage2_h100.sh help",
@@ -80,9 +80,7 @@ def test_full_stage2_runbook_covers_exact_release_lifecycle():
     assert text.count("```") % 2 == 0
     assert "200/200/200" not in text
     assert "checkpoint_model_003750" not in text
-    assert (
-        text.count('test -z "$(git status --porcelain=v1 --untracked-files=all)"') >= 2
-    )
+    assert "git status" not in text
 
 
 def test_documented_b0_transform_is_a_resolvable_same_contract_resume(tmp_path):

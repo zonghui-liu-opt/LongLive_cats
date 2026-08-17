@@ -51,12 +51,6 @@ TOKENIZER_DIR="$ARCH_ROOT/google/umt5-xxl"
 STAGE2_WORK_ROOT_REAL="$("$STAGE2_PYTHON" -I -B -c \
   'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' \
   "$STAGE2_WORK_ROOT")"
-case "$STAGE2_WORK_ROOT_REAL/" in
-  "$SOURCE_REPO/"*)
-    echo "STAGE2_WORK_ROOT 必须位于 Git checkout 外：$STAGE2_WORK_ROOT_REAL" >&2
-    exit 1
-    ;;
-esac
 mkdir -p "$ASSET_DIR" "$LOG_DIR" "$RUN_DIR"
 cd -- "$SOURCE_REPO"
 

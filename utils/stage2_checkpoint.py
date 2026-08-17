@@ -22,7 +22,6 @@ import os
 import random
 import re
 import shutil
-import subprocess
 import tempfile
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -34,6 +33,7 @@ import numpy as np
 import torch
 
 from utils.lora_utils import LocalLoraShard, LoraTensorSpec
+from utils.stage2_code_version import capture_stage2_source_version
 from utils.stage1_checkpoint import capture_rng_state, restore_rng_state
 from utils.stage1_io import (
     atomic_output_path,
@@ -79,7 +79,7 @@ STAGE2_PENDING_STATE_KEYS = frozenset(
 )
 STAGE2_ROLE_NAMES = ("fake_score", "generator")
 STAGE2_PROVENANCE_SCHEMA = "longlive_stage2_checkpoint_provenance"
-STAGE2_PROVENANCE_SCHEMA_VERSION = 1
+STAGE2_PROVENANCE_SCHEMA_VERSION = 2
 
 _STAGE2_OPTIMIZER_CONTRACT = {
     "generator": {
@@ -97,7 +97,6 @@ _STAGE2_OPTIMIZER_CONTRACT = {
 }
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _T = TypeVar("_T")
 
 
@@ -127,62 +126,6 @@ def _exact_mapping(
     return result
 
 
-def _capture_stage2_code_version() -> dict[str, Any]:
-    """Return a portable commit hint plus an exact digest of Stage-2 sources."""
-
-    root = Path(__file__).resolve().parents[1]
-    source_paths: set[Path] = {root / "utils" / "distributed.py"}
-    for pattern in (
-        "trainer/stage2_*.py",
-        "model/stage2_*.py",
-        "pipeline/stage2_*.py",
-        "utils/stage2_*.py",
-        "scripts/*stage2*.py",
-    ):
-        source_paths.update(path for path in root.glob(pattern) if path.is_file())
-    digest = hashlib.sha256()
-    for path in sorted(
-        source_paths, key=lambda item: item.relative_to(root).as_posix()
-    ):
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        digest.update(len(relative).to_bytes(4, "big"))
-        digest.update(relative)
-        payload = path.read_bytes()
-        digest.update(len(payload).to_bytes(8, "big"))
-        digest.update(payload)
-
-    commit: str | None = None
-    dirty: bool | None = None
-    try:
-        commit_result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        candidate = commit_result.stdout.strip().lower()
-        if _GIT_COMMIT_RE.fullmatch(candidate) is not None:
-            commit = candidate
-        status_result = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        dirty = bool(status_result.stdout.strip())
-    except (OSError, subprocess.SubprocessError):
-        # The exact source digest remains a usable code version in source-only
-        # deployments that intentionally omit .git metadata.
-        pass
-    return {
-        "git_commit": commit,
-        "git_tracked_dirty": dirty,
-        "stage2_source_sha256": digest.hexdigest(),
-    }
-
-
 def validate_stage2_provenance(
     provenance: Mapping[str, Any],
     *,
@@ -206,7 +149,7 @@ def validate_stage2_provenance(
         value = {
             "schema": STAGE2_PROVENANCE_SCHEMA,
             "schema_version": STAGE2_PROVENANCE_SCHEMA_VERSION,
-            "code_version": _capture_stage2_code_version(),
+            "code_version": capture_stage2_source_version(),
             **value,
         }
     value = _exact_mapping(
@@ -223,18 +166,8 @@ def validate_stage2_provenance(
     code = _exact_mapping(
         value["code_version"],
         label="Stage-2 code_version",
-        expected_keys={"git_commit", "git_tracked_dirty", "stage2_source_sha256"},
+        expected_keys={"stage2_source_sha256"},
     )
-    if code["git_commit"] is not None and (
-        not isinstance(code["git_commit"], str)
-        or _GIT_COMMIT_RE.fullmatch(code["git_commit"]) is None
-    ):
-        raise ValueError("Stage-2 code_version.git_commit is invalid")
-    if (
-        code["git_tracked_dirty"] is not None
-        and type(code["git_tracked_dirty"]) is not bool
-    ):
-        raise TypeError("Stage-2 code_version.git_tracked_dirty must be bool/None")
     _sha256(code["stage2_source_sha256"], "code_version.stage2_source_sha256")
 
     assets = _exact_mapping(

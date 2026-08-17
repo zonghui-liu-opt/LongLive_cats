@@ -483,11 +483,7 @@ def test_generator_ema_inference_gate_never_deserializes_training_pickles(
     assert payload.manifest["ema"]["initialized"] is True
     assert payload.resolved_config == {"contract": "fixture", "g": 40}
     assert payload.provenance["schema"] == "longlive_stage2_checkpoint_provenance"
-    assert set(payload.provenance["code_version"]) == {
-        "git_commit",
-        "git_tracked_dirty",
-        "stage2_source_sha256",
-    }
+    assert set(payload.provenance["code_version"]) == {"stage2_source_sha256"}
     assert torch.equal(
         payload.generator_ema["generator.lora_A.weight"],
         torch.full((2, 3), 42.0),
