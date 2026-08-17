@@ -1,5 +1,14 @@
 # 发现与决策
 
+## 2026-08-17 Phase 21：timing closure 首始证据
+
+- `step_seconds_max≈55.196s`，closure差值约3.713s，占6.73%，仅略过5%门槛；异常发生在训练更新已成功、JSONL append前，不是模型数值或optimizer失败。
+- 必须先确认`step_seconds`的起止点是否包含跨rank barrier/all-gather、指标构造和CUDA event之外的CPU调度，而phase合计是否只覆盖rollout/score/backward/optimizer；若定义边界不同，固定5%相对阈值会把合法的FSDP/NCCL/CPU框架开销误判成漏计时。
+- 生产代码证实wall计时从data materialize前持续到state commit/consensus后，但详细phase只计data、H2D、模型CUDA段、backward、clip/optimizer和EMA。未计入的明确工作包括exit/branch广播、micro间Python/diagnostic、全参数梯度finite审计、跨角色gradient审计、post-step参数finite审计、LoRA optimizer state审计、loss/diagnostic归约、state commit与consensus；5B×8卡上这些合法工作足以产生3.71秒差值。
+- 正确修复不是把5%提高到7%或删除closure门禁，而是新增`orchestration_seconds_max`：用完整attempt wall减去其互斥的模型/backward/optimizer阶段得到attempt orchestration，再加caller显式测量的pre/post control段。closure仍独立比较完整step wall与所有互斥类别，继续保持0.1秒/5%严格门禁。
+- metrics validator和plotter共享`STAGE2_TIMING_FIELDS`，因此新字段需同时进入schema契约；内网无Git热修器必须累计更新trainer与`utils/stage2_metrics.py`，不能只改producer，否则旧validator会因求和不包含新字段再次拒绝JSONL。
+- 为防再次手工混版，现有启动期`_audit_stage2_dmd_runtime_api`应同时握手完整timing字段顺序；H100 wrapper本来就在torchrun前调用该审计，因此无需新增第二套入口即可在模型加载前拒绝“新trainer+旧metrics”。无Git脚本的隔离probe也复用同一审计。
+
 ## 2026-08-17 Phase 20：无Git内网部署事实
 
 - 内网报错中的model source path是当前checkout，但方法实际参数仍为旧三参数；结合v2常量已存在，说明操作者应用的是“最新commit相对新基线的增量”，而不是完整文件。最新commit只触碰常量，Git历史中的callback实现不会随单个增量自动补入。

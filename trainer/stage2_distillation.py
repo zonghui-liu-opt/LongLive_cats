@@ -60,6 +60,19 @@ _STAGE2_DMD_RUNTIME_REPAIR = (
     "Run scripts/apply_stage2_innernet_hotfix.py from the project root, or "
     "deploy one complete stage-2 source snapshot; do not mix trainer and model files."
 )
+_STAGE2_TIMING_RUNTIME_FIELDS = (
+    "data_seconds_max",
+    "h2d_seconds_max",
+    "rollout_seconds_max",
+    "fake_score_seconds_max",
+    "real_cond_seconds_max",
+    "real_uncond_seconds_max",
+    "loss_build_seconds_max",
+    "backward_seconds_max",
+    "clip_optimizer_seconds_max",
+    "orchestration_seconds_max",
+    "ema_seconds_max",
+)
 _STAGE2_DMD_RUNTIME_METHODS = {
     "fake_score_flow_dsm_loss_from_model": (
         "generated_future",
@@ -141,11 +154,21 @@ def _audit_stage2_dmd_runtime_api(model_type: type) -> dict[str, Any]:
                 f"invalid_defaults={invalid_defaults}, source={source_file}"
             )
         methods[method_name] = str(signature)
+    from utils.stage2_metrics import STAGE2_TIMING_FIELDS
+
+    actual_timing_fields = tuple(STAGE2_TIMING_FIELDS)
+    if actual_timing_fields != _STAGE2_TIMING_RUNTIME_FIELDS:
+        raise RuntimeError(
+            "Stage-2 timing runtime API mismatch: "
+            f"expected={list(_STAGE2_TIMING_RUNTIME_FIELDS)}, "
+            f"actual={list(actual_timing_fields)}. {_STAGE2_DMD_RUNTIME_REPAIR}"
+        )
     return {
         "api_version": actual_version,
         "model_type": f"{model_type.__module__}.{model_type.__qualname__}",
         "source_file": str(Path(source_file).expanduser().resolve()),
         "methods": methods,
+        "timing_fields": actual_timing_fields,
     }
 
 
@@ -1310,6 +1333,7 @@ class Trainer:
             "loss_build",
             "backward",
             "clip_optimizer",
+            "orchestration",
             "ema",
         )
         # Keep the old coarse seam usable by tiny CPU tests while production
@@ -1367,6 +1391,7 @@ class Trainer:
             "loss_build_seconds_max": selected["loss_build"],
             "backward_seconds_max": selected["backward"],
             "clip_optimizer_seconds_max": selected["clip_optimizer"],
+            "orchestration_seconds_max": selected["orchestration"],
             "compute_seconds_max": compute,
             "optimizer_seconds_max": selected["clip_optimizer"],
             "ema_seconds_max": selected["ema"],
@@ -1532,6 +1557,7 @@ class Trainer:
     ) -> dict[str, Any]:
         from utils.distributed import fsdp2_accumulation
 
+        attempt_started = time.perf_counter()
         module = getattr(self.model, role)
         optimizer = self.optimizers[role]
         optimizer.zero_grad(set_to_none=True)
@@ -1723,6 +1749,12 @@ class Trainer:
 
         numerator, count = self._reduce_loss(local_numerator, local_count)
         merged = self._reduce_diagnostics(diagnostics)
+        torch.cuda.synchronize(self.device)
+        attempt_seconds = time.perf_counter() - attempt_started
+        classified_attempt_seconds = sum(phase_timings.values()) + optimizer_seconds
+        attempt_orchestration_seconds = max(
+            0.0, attempt_seconds - classified_attempt_seconds
+        )
         return {
             "success": True,
             "loss_numerator": numerator,
@@ -1742,6 +1774,8 @@ class Trainer:
             "timestep_values": timestep_values,
             "compute_seconds": compute_seconds,
             "optimizer_seconds": optimizer_seconds,
+            "attempt_seconds": attempt_seconds,
+            "attempt_orchestration_seconds": attempt_orchestration_seconds,
             "phase_timings": phase_timings,
         }
 
@@ -1943,6 +1977,7 @@ class Trainer:
             batches = [self._to_device(batch) for batch in batches]
             torch.cuda.synchronize(self.device)
             h2d_seconds = time.perf_counter() - h2d_started
+            control_started = time.perf_counter()
             exits = self.exit_rng.draw(
                 role,
                 accumulation_steps=self.resolved.gradient_accumulation_steps,
@@ -1954,9 +1989,11 @@ class Trainer:
             branch = (
                 self._draw_branch(probability) if role == "generator" else "flow_dsm"
             )
+            control_seconds = time.perf_counter() - control_started
             result = self._run_update_attempt(
                 role=role, batches=batches, exits=exits, branch=branch
             )
+            post_attempt_control_started = time.perf_counter()
             torch.cuda.synchronize(self.device)
             elapsed = time.perf_counter() - started
             if not result["success"]:
@@ -1994,6 +2031,7 @@ class Trainer:
             if role == "generator":
                 next_completed_g = self.state.completed_g + 1
                 ema_started = time.perf_counter()
+                control_seconds += ema_started - post_attempt_control_started
                 ema_action = self._runtime_world_checked(
                     "generator EMA update",
                     lambda: self.generator_ema.update_after_step(
@@ -2001,6 +2039,7 @@ class Trainer:
                     ),
                 )
                 ema_seconds = time.perf_counter() - ema_started
+                post_attempt_control_started = time.perf_counter()
                 self._runtime_world_checked(
                     "commit generator clock",
                     lambda: self.state.commit_successful_generator_update(
@@ -2016,6 +2055,7 @@ class Trainer:
                 )
             self._assert_state_consensus()
             torch.cuda.synchronize(self.device)
+            control_seconds += time.perf_counter() - post_attempt_control_started
             elapsed = time.perf_counter() - started
             timing = self._timing_summary(
                 elapsed,
@@ -2026,6 +2066,8 @@ class Trainer:
                         "phase_timings", {"rollout": result["compute_seconds"]}
                     ),
                     "clip_optimizer": result["optimizer_seconds"],
+                    "orchestration": result.get("attempt_orchestration_seconds", 0.0)
+                    + control_seconds,
                     "ema": ema_seconds,
                 },
             )

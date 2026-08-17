@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Apply the cumulative Stage-2 DMD timing API fix without requiring Git.
+"""Apply cumulative Stage-2 runtime fixes without requiring Git.
 
 The transformer recognizes exact legacy/current source fragments, prepares the
-entire result in memory, compiles and audits it, creates a content-addressed
-backup, and only then atomically replaces ``model/stage2_dmd.py``.
+entire multi-file result in memory, compiles and audits it, creates
+content-addressed backups, and only then atomically replaces runtime sources.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,9 @@ class HotfixResult:
     target_path: Path
     backup_path: Path | None
     changed_units: tuple[str, ...]
+    target_paths: tuple[Path, ...]
+    backup_paths: tuple[Path, ...]
+    changed_files: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -194,6 +198,256 @@ _PATCH_UNITS = (
 )
 
 
+_TRAINER_PATCH_UNITS = (
+    _PatchUnit(
+        "timing_runtime_fields",
+        """_STAGE2_DMD_RUNTIME_REPAIR = (
+    "Run scripts/apply_stage2_innernet_hotfix.py from the project root, or "
+    "deploy one complete stage-2 source snapshot; do not mix trainer and model files."
+)
+_STAGE2_DMD_RUNTIME_METHODS = {
+""",
+        """_STAGE2_DMD_RUNTIME_REPAIR = (
+    "Run scripts/apply_stage2_innernet_hotfix.py from the project root, or "
+    "deploy one complete stage-2 source snapshot; do not mix trainer and model files."
+)
+_STAGE2_TIMING_RUNTIME_FIELDS = (
+    "data_seconds_max",
+    "h2d_seconds_max",
+    "rollout_seconds_max",
+    "fake_score_seconds_max",
+    "real_cond_seconds_max",
+    "real_uncond_seconds_max",
+    "loss_build_seconds_max",
+    "backward_seconds_max",
+    "clip_optimizer_seconds_max",
+    "orchestration_seconds_max",
+    "ema_seconds_max",
+)
+_STAGE2_DMD_RUNTIME_METHODS = {
+""",
+    ),
+    _PatchUnit(
+        "timing_runtime_audit",
+        """        methods[method_name] = str(signature)
+    return {
+        "api_version": actual_version,
+        "model_type": f"{model_type.__module__}.{model_type.__qualname__}",
+        "source_file": str(Path(source_file).expanduser().resolve()),
+        "methods": methods,
+    }
+""",
+        """        methods[method_name] = str(signature)
+    from utils.stage2_metrics import STAGE2_TIMING_FIELDS
+
+    actual_timing_fields = tuple(STAGE2_TIMING_FIELDS)
+    if actual_timing_fields != _STAGE2_TIMING_RUNTIME_FIELDS:
+        raise RuntimeError(
+            "Stage-2 timing runtime API mismatch: "
+            f"expected={list(_STAGE2_TIMING_RUNTIME_FIELDS)}, "
+            f"actual={list(actual_timing_fields)}. {_STAGE2_DMD_RUNTIME_REPAIR}"
+        )
+    return {
+        "api_version": actual_version,
+        "model_type": f"{model_type.__module__}.{model_type.__qualname__}",
+        "source_file": str(Path(source_file).expanduser().resolve()),
+        "methods": methods,
+        "timing_fields": actual_timing_fields,
+    }
+""",
+    ),
+    _PatchUnit(
+        "timing_summary_category",
+        """            "backward",
+            "clip_optimizer",
+            "ema",
+""",
+        """            "backward",
+            "clip_optimizer",
+            "orchestration",
+            "ema",
+""",
+    ),
+    _PatchUnit(
+        "timing_summary_field",
+        """            "backward_seconds_max": selected["backward"],
+            "clip_optimizer_seconds_max": selected["clip_optimizer"],
+            "compute_seconds_max": compute,
+""",
+        """            "backward_seconds_max": selected["backward"],
+            "clip_optimizer_seconds_max": selected["clip_optimizer"],
+            "orchestration_seconds_max": selected["orchestration"],
+            "compute_seconds_max": compute,
+""",
+    ),
+    _PatchUnit(
+        "attempt_wall_start",
+        """        from utils.distributed import fsdp2_accumulation
+
+        module = getattr(self.model, role)
+""",
+        """        from utils.distributed import fsdp2_accumulation
+
+        attempt_started = time.perf_counter()
+        module = getattr(self.model, role)
+""",
+    ),
+    _PatchUnit(
+        "attempt_orchestration_measurement",
+        """        numerator, count = self._reduce_loss(local_numerator, local_count)
+        merged = self._reduce_diagnostics(diagnostics)
+        return {
+""",
+        """        numerator, count = self._reduce_loss(local_numerator, local_count)
+        merged = self._reduce_diagnostics(diagnostics)
+        torch.cuda.synchronize(self.device)
+        attempt_seconds = time.perf_counter() - attempt_started
+        classified_attempt_seconds = sum(phase_timings.values()) + optimizer_seconds
+        attempt_orchestration_seconds = max(
+            0.0, attempt_seconds - classified_attempt_seconds
+        )
+        return {
+""",
+    ),
+    _PatchUnit(
+        "attempt_orchestration_result",
+        """            "compute_seconds": compute_seconds,
+            "optimizer_seconds": optimizer_seconds,
+            "phase_timings": phase_timings,
+""",
+        """            "compute_seconds": compute_seconds,
+            "optimizer_seconds": optimizer_seconds,
+            "attempt_seconds": attempt_seconds,
+            "attempt_orchestration_seconds": attempt_orchestration_seconds,
+            "phase_timings": phase_timings,
+""",
+    ),
+    _PatchUnit(
+        "pre_attempt_control_start",
+        """            h2d_seconds = time.perf_counter() - h2d_started
+            exits = self.exit_rng.draw(
+""",
+        """            h2d_seconds = time.perf_counter() - h2d_started
+            control_started = time.perf_counter()
+            exits = self.exit_rng.draw(
+""",
+    ),
+    _PatchUnit(
+        "pre_attempt_control_elapsed",
+        """            branch = (
+                self._draw_branch(probability) if role == "generator" else "flow_dsm"
+            )
+            result = self._run_update_attempt(
+""",
+        """            branch = (
+                self._draw_branch(probability) if role == "generator" else "flow_dsm"
+            )
+            control_seconds = time.perf_counter() - control_started
+            result = self._run_update_attempt(
+""",
+    ),
+    _PatchUnit(
+        "post_attempt_control_start",
+        """            result = self._run_update_attempt(
+                role=role, batches=batches, exits=exits, branch=branch
+            )
+            torch.cuda.synchronize(self.device)
+""",
+        """            result = self._run_update_attempt(
+                role=role, batches=batches, exits=exits, branch=branch
+            )
+            post_attempt_control_started = time.perf_counter()
+            torch.cuda.synchronize(self.device)
+""",
+    ),
+    _PatchUnit(
+        "ema_control_split",
+        """            if role == "generator":
+                next_completed_g = self.state.completed_g + 1
+                ema_started = time.perf_counter()
+                ema_action = self._runtime_world_checked(
+""",
+        """            if role == "generator":
+                next_completed_g = self.state.completed_g + 1
+                ema_started = time.perf_counter()
+                control_seconds += ema_started - post_attempt_control_started
+                ema_action = self._runtime_world_checked(
+""",
+    ),
+    _PatchUnit(
+        "post_ema_control_restart",
+        """                )
+                ema_seconds = time.perf_counter() - ema_started
+                self._runtime_world_checked(
+                    "commit generator clock",
+""",
+        """                )
+                ema_seconds = time.perf_counter() - ema_started
+                post_attempt_control_started = time.perf_counter()
+                self._runtime_world_checked(
+                    "commit generator clock",
+""",
+    ),
+    _PatchUnit(
+        "post_attempt_control_elapsed",
+        """            self._assert_state_consensus()
+            torch.cuda.synchronize(self.device)
+            elapsed = time.perf_counter() - started
+""",
+        """            self._assert_state_consensus()
+            torch.cuda.synchronize(self.device)
+            control_seconds += time.perf_counter() - post_attempt_control_started
+            elapsed = time.perf_counter() - started
+""",
+    ),
+    _PatchUnit(
+        "logical_substep_orchestration_category",
+        """                    ),
+                    "clip_optimizer": result["optimizer_seconds"],
+                    "ema": ema_seconds,
+""",
+        """                    ),
+                    "clip_optimizer": result["optimizer_seconds"],
+                    "orchestration": result.get("attempt_orchestration_seconds", 0.0)
+                    + control_seconds,
+                    "ema": ema_seconds,
+""",
+    ),
+)
+
+
+_METRICS_PATCH_UNITS = (
+    _PatchUnit(
+        "orchestration_timing_field",
+        """    "backward_seconds_max",
+    "clip_optimizer_seconds_max",
+    "ema_seconds_max",
+""",
+        """    "backward_seconds_max",
+    "clip_optimizer_seconds_max",
+    "orchestration_seconds_max",
+    "ema_seconds_max",
+""",
+    ),
+)
+
+
+_PLOT_PATCH_UNITS = (
+    _PatchUnit(
+        "orchestration_plot_label",
+        """        "backward_seconds_max": "Backward",
+        "clip_optimizer_seconds_max": "Clip + optimizer",
+        "ema_seconds_max": "EMA",
+""",
+        """        "backward_seconds_max": "Backward",
+        "clip_optimizer_seconds_max": "Clip + optimizer",
+        "orchestration_seconds_max": "Runtime orchestration + audits",
+        "ema_seconds_max": "EMA",
+""",
+    ),
+)
+
+
 _EXPECTED_METHODS = {
     "fake_score_flow_dsm_loss_from_model": (
         "generated_future",
@@ -303,6 +557,72 @@ def transform_stage2_dmd_source(source: str) -> TransformResult:
     )
 
 
+def _transform_runtime_source(
+    relative_path: str,
+    source: str,
+    patch_units: tuple[_PatchUnit, ...],
+) -> TransformResult:
+    if not isinstance(source, str) or not source:
+        raise HotfixError(f"{relative_path} is empty or unreadable")
+    transformed = source
+    changed_units: list[str] = []
+    for unit in patch_units:
+        transformed, changed = _apply_exact_unit(transformed, unit)
+        if changed:
+            changed_units.append(f"{relative_path}:{unit.name}")
+    try:
+        ast.parse(transformed, filename=relative_path)
+        compile(transformed, relative_path, "exec")
+    except (SyntaxError, ValueError) as error:
+        raise HotfixError(
+            f"transformed {relative_path} does not compile: {error}"
+        ) from error
+    return TransformResult(
+        source=transformed,
+        changed=bool(changed_units),
+        changed_units=tuple(changed_units),
+    )
+
+
+def transform_stage2_runtime_sources(
+    sources: Mapping[str, str],
+) -> dict[str, TransformResult]:
+    """Validate and transform every cumulative Stage-2 runtime target in memory."""
+
+    required = {
+        "model/stage2_dmd.py",
+        "trainer/stage2_distillation.py",
+        "utils/stage2_metrics.py",
+        "scripts/plot_stage2_training.py",
+    }
+    missing = sorted(required - set(sources))
+    unexpected = sorted(set(sources) - required)
+    if missing or unexpected:
+        raise HotfixError(
+            f"runtime source set mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    return {
+        "model/stage2_dmd.py": transform_stage2_dmd_source(
+            sources["model/stage2_dmd.py"]
+        ),
+        "trainer/stage2_distillation.py": _transform_runtime_source(
+            "trainer/stage2_distillation.py",
+            sources["trainer/stage2_distillation.py"],
+            _TRAINER_PATCH_UNITS,
+        ),
+        "utils/stage2_metrics.py": _transform_runtime_source(
+            "utils/stage2_metrics.py",
+            sources["utils/stage2_metrics.py"],
+            _METRICS_PATCH_UNITS,
+        ),
+        "scripts/plot_stage2_training.py": _transform_runtime_source(
+            "scripts/plot_stage2_training.py",
+            sources["scripts/plot_stage2_training.py"],
+            _PLOT_PATCH_UNITS,
+        ),
+    }
+
+
 def _write_backup(target: Path, original: bytes) -> Path:
     digest = hashlib.sha256(original).hexdigest()[:16]
     backup = target.with_name(f"{target.name}.pre_hotfix_{digest}.bak")
@@ -408,46 +728,109 @@ def apply_stage2_innernet_hotfix(
     verify_runtime: bool = True,
 ) -> HotfixResult:
     root = Path(project_root).expanduser().resolve()
-    target = root / "model" / "stage2_dmd.py"
-    if not target.is_file():
-        raise HotfixError(f"Stage-2 model source does not exist: {target}")
-    original_bytes = target.read_bytes()
-    try:
-        original_source = original_bytes.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise HotfixError(f"Stage-2 model source is not UTF-8: {target}") from error
-    transformed = transform_stage2_dmd_source(original_source)
+    relative_paths = (
+        "model/stage2_dmd.py",
+        "trainer/stage2_distillation.py",
+        "utils/stage2_metrics.py",
+        "scripts/plot_stage2_training.py",
+    )
+    targets = {relative: root / relative for relative in relative_paths}
+    originals: dict[str, bytes] = {}
+    sources: dict[str, str] = {}
+    modes: dict[str, int] = {}
+    for relative, target in targets.items():
+        if not target.is_file():
+            raise HotfixError(f"Stage-2 runtime source does not exist: {target}")
+        original = target.read_bytes()
+        try:
+            source = original.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise HotfixError(
+                f"Stage-2 runtime source is not UTF-8: {target}"
+            ) from error
+        originals[relative] = original
+        sources[relative] = source
+        modes[relative] = target.stat().st_mode & 0o7777
 
-    if transformed.changed and check_only:
+    transformed = transform_stage2_runtime_sources(sources)
+    changed_files = tuple(
+        relative for relative in relative_paths if transformed[relative].changed
+    )
+    changed_units = tuple(
+        unit
+        for relative in relative_paths
+        for unit in transformed[relative].changed_units
+    )
+    primary_target = targets["model/stage2_dmd.py"]
+
+    if changed_files and check_only:
         return HotfixResult(
             status="NEEDS_PATCH",
-            target_path=target,
+            target_path=primary_target,
             backup_path=None,
-            changed_units=transformed.changed_units,
+            changed_units=changed_units,
+            target_paths=tuple(targets.values()),
+            backup_paths=(),
+            changed_files=changed_files,
         )
 
-    backup: Path | None = None
+    backup_by_file: dict[str, Path] = {}
     status = "ALREADY_APPLIED"
-    if transformed.changed:
-        backup = _write_backup(target, original_bytes)
-        replacement = transformed.source.encode("utf-8")
-        _atomic_replace(target, replacement, target.stat().st_mode & 0o7777)
+    written: list[str] = []
+    if changed_files:
+        for relative in changed_files:
+            backup_by_file[relative] = _write_backup(
+                targets[relative], originals[relative]
+            )
+        try:
+            for relative in changed_files:
+                _atomic_replace(
+                    targets[relative],
+                    transformed[relative].source.encode("utf-8"),
+                    modes[relative],
+                )
+                written.append(relative)
+            runtime_message = (
+                _verify_runtime(root, primary_target) if verify_runtime else ""
+            )
+        except Exception as error:
+            rollback_failures = []
+            for relative in reversed(written):
+                try:
+                    _atomic_replace(
+                        targets[relative], originals[relative], modes[relative]
+                    )
+                except OSError as rollback_error:
+                    rollback_failures.append(f"{relative}: {rollback_error}")
+            details = (
+                f"; rollback_failures={rollback_failures}"
+                if rollback_failures
+                else "; all written files rolled back"
+            )
+            raise HotfixError(
+                f"cumulative Stage-2 hotfix failed: {error}{details}"
+            ) from error
         status = "PATCHED"
-
-    runtime_message = _verify_runtime(root, target) if verify_runtime else ""
+    else:
+        runtime_message = (
+            _verify_runtime(root, primary_target) if verify_runtime else ""
+        )
     if runtime_message:
         print(runtime_message)
     return HotfixResult(
         status=status,
-        target_path=target,
-        backup_path=backup,
-        changed_units=transformed.changed_units,
+        target_path=primary_target,
+        backup_path=backup_by_file.get("model/stage2_dmd.py"),
+        changed_units=changed_units,
+        target_paths=tuple(targets.values()),
+        backup_paths=tuple(backup_by_file.values()),
+        changed_files=changed_files,
     )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Safely apply the cumulative no-Git Stage-2 DMD runtime hotfix."
+        description="Safely apply cumulative no-Git Stage-2 runtime hotfixes."
     )
     parser.add_argument(
         "--project-root",
@@ -476,10 +859,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     units = ",".join(result.changed_units) or "none"
-    backup = str(result.backup_path) if result.backup_path is not None else "none"
+    backups = ",".join(str(path) for path in result.backup_paths) or "none"
+    files = ",".join(result.changed_files) or "none"
     print(
         f"STAGE2_INNERNET_HOTFIX={result.status} "
-        f"target={result.target_path} backup={backup} units={units}"
+        f"targets={len(result.target_paths)} changed_files={files} "
+        f"backups={backups} units={units}"
     )
     return 2 if result.status == "NEEDS_PATCH" else 0
 

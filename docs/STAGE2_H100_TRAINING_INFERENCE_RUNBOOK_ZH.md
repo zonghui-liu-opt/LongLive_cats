@@ -33,15 +33,17 @@ cd "$STAGE2_PROJECT_ROOT"
 mkdir -p "$STAGE2_WORK_ROOT/logs" "$STAGE2_TRAIN_ROOT"
 ```
 
-若代码通过手工拷贝部署，且出现 `Stage-2 DMD runtime API mismatch`，先只同步单文件
+若代码通过手工拷贝部署，且出现 `Stage-2 DMD runtime API mismatch` 或
+`timing closure error exceeds`，先只同步单文件
 `scripts/apply_stage2_innernet_hotfix.py`，再执行：
 
 ```bash
 "$STAGE2_PYTHON" scripts/apply_stage2_innernet_hotfix.py --project-root "$STAGE2_PROJECT_ROOT"
 ```
 
-该脚本不读取 Git：它识别旧版、当前版及“新 trainer + 旧 model”混合版，写前备份，完整
-变换通过 compile/AST 后才原子替换，并用隔离 Python 重新执行 runtime API audit。必须看到
+该脚本不读取 Git：它累计修复 model callback API 和 trainer/metrics timing orchestration，识别
+旧版、当前版及混合版；全部源码先通过 compile/AST，全部备份完成后才事务替换，失败自动回滚，
+并用隔离 Python 重新执行 model/timing runtime API audit。必须看到
 `STAGE2_DMD_RUNTIME_API=PASS` 和 `STAGE2_INNERNET_HOTFIX=PATCHED`（重复执行则为
 `ALREADY_APPLIED`）；若报告 `FAIL`，目标文件不会被猜测性改写，应保留错误和备份路径排查。
 
@@ -256,6 +258,8 @@ lineage。
 `--require-complete` 会重新校验完整 `F1…F5→G` lineage、phase/terminal、配置 hash 与时间闭合；
 闭合条件固定为
 `abs(error_seconds) <= max(0.1, 0.05 * step_seconds_max)`，不满足时不会生成“看似成功”的图。
+`orchestration_seconds_max`单列梯度/参数finite审计、optimizer state审计、分布式状态一致性和
+控制流开销；这些真实耗时不再误算为closure error，原5%门禁没有放宽。
 
 ## 8. B1 G280 Generator-EMA baseline 推理
 

@@ -35,9 +35,10 @@ from utils.stage2_train_state import Stage2TrainingSchedule, Stage2TrainingState
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "train_i2v_stage2_600cats.yaml"
 
 
-def test_stage2_dmd_runtime_api_rejects_stale_loss_signatures():
+def test_stage2_dmd_runtime_api_rejects_stale_loss_signatures(monkeypatch):
     audit = _audit_stage2_dmd_runtime_api(Stage2DMD)
     assert audit["api_version"] == Stage2DMD.RUNTIME_API_VERSION
+    assert audit["timing_fields"] == stage2_metrics.STAGE2_TIMING_FIELDS
     assert set(audit["methods"]) == {
         "fake_score_flow_dsm_loss_from_model",
         "generator_distribution_matching_loss_from_models",
@@ -82,6 +83,18 @@ def test_stage2_dmd_runtime_api_rejects_stale_loss_signatures():
 
     with pytest.raises(RuntimeError, match=r"fake_score.*timing_callback"):
         _audit_stage2_dmd_runtime_api(_StaleStage2DMD)
+
+    monkeypatch.setattr(
+        stage2_metrics,
+        "STAGE2_TIMING_FIELDS",
+        tuple(
+            field
+            for field in stage2_metrics.STAGE2_TIMING_FIELDS
+            if field != "orchestration_seconds_max"
+        ),
+    )
+    with pytest.raises(RuntimeError, match=r"timing runtime API mismatch"):
+        _audit_stage2_dmd_runtime_api(Stage2DMD)
 
 
 def test_trainer_micro_loss_call_keywords_match_audited_runtime_api():
@@ -1528,6 +1541,12 @@ def test_update_attempt_scales_global_loss_and_generator_tokens_by_microbatch(
     assert scaling_calls == [(768, 8)]
     assert result["loss_count"] == 12 * sample_count
     assert result["rollout_tokens"] == 100 * sample_count
+    assert result["attempt_orchestration_seconds"] >= 0.0
+    assert result["attempt_seconds"] == pytest.approx(
+        sum(result["phase_timings"].values())
+        + result["optimizer_seconds"]
+        + result["attempt_orchestration_seconds"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -2031,6 +2050,7 @@ def test_resume_smoke_forces_its_generator_branch(
 
     captured_branches = []
     captured_probabilities = []
+    captured_timing_categories = []
     timing = {
         "step_seconds_max": 1.0,
         "step_seconds_mean": 1.0,
@@ -2060,6 +2080,7 @@ def test_resume_smoke_forces_its_generator_branch(
             "timestep_values": [100.0],
             "compute_seconds": 0.2,
             "optimizer_seconds": 0.1,
+            "attempt_orchestration_seconds": 0.3,
         }
 
     def draw_branch(probability):
@@ -2088,7 +2109,10 @@ def test_resume_smoke_forces_its_generator_branch(
         _to_device=lambda batch: batch,
         _draw_branch=draw_branch,
         _run_update_attempt=run_update_attempt,
-        _timing_summary=lambda *_args, **_kwargs: timing,
+        _timing_summary=lambda _elapsed, categories: captured_timing_categories.append(
+            dict(categories)
+        )
+        or timing,
         _memory_fields=lambda: {
             "gpu_memory_allocated_gib_max": 1.0,
             "gpu_memory_reserved_gib_max": 2.0,
@@ -2106,6 +2130,7 @@ def test_resume_smoke_forces_its_generator_branch(
     assert captured_probabilities == [1.0 if smoke_mode == "C2" else 0.0]
     assert result["fields"]["branch"] == expected_branch
     assert result["fields"]["branch_is_dfd"] == int(expected_branch == "dfd")
+    assert captured_timing_categories[0]["orchestration"] >= 0.3
 
 
 def test_timing_summary_reports_positive_slowest_rank_fields_and_closure(monkeypatch):
@@ -2126,6 +2151,7 @@ def test_timing_summary_reports_positive_slowest_rank_fields_and_closure(monkeyp
                     0.1,
                     0.2,
                     0.1,
+                    0.15,
                     0.05,
                 ],
                 dtype=local.dtype,
@@ -2151,6 +2177,7 @@ def test_timing_summary_reports_positive_slowest_rank_fields_and_closure(monkeyp
         "loss_build_seconds_max",
         "backward_seconds_max",
         "clip_optimizer_seconds_max",
+        "orchestration_seconds_max",
         "compute_seconds_max",
         "optimizer_seconds_max",
         "ema_seconds_max",

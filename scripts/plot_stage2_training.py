@@ -526,6 +526,7 @@ def _plot_time_breakdown(
         "loss_build_seconds_max": "Loss build",
         "backward_seconds_max": "Backward",
         "clip_optimizer_seconds_max": "Clip + optimizer",
+        "orchestration_seconds_max": "Runtime orchestration + audits",
         "ema_seconds_max": "EMA",
     }
     for field in STAGE2_TIMING_FIELDS:

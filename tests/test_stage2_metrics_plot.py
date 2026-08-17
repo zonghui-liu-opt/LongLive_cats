@@ -123,13 +123,14 @@ def _timing_fields(*, role):
     values = {
         "data_seconds_max": 0.10,
         "h2d_seconds_max": 0.05,
-        "rollout_seconds_max": 0.60,
+        "rollout_seconds_max": 0.55,
         "fake_score_seconds_max": 0.30,
         "real_cond_seconds_max": 0.20 if role == "generator" else 0.0,
         "real_uncond_seconds_max": 0.20 if role == "generator" else 0.0,
         "loss_build_seconds_max": 0.05 if role == "generator" else 0.50,
         "backward_seconds_max": 0.25,
         "clip_optimizer_seconds_max": 0.15,
+        "orchestration_seconds_max": 0.05,
         "ema_seconds_max": 0.05 if role == "generator" else 0.0,
     }
     values["timing_closure_error_seconds"] = 2.0 - sum(values.values())
@@ -1246,6 +1247,18 @@ def test_stage2_writer_enforces_authoritative_timing_closure_threshold(tmp_path)
     ) as logger:
         with pytest.raises(ValueError, match=r"timing closure.*max\(0.1"):
             logger.append("train_step", rejected)
+
+
+def test_stage2_timing_contract_classifies_runtime_orchestration():
+    assert "orchestration_seconds_max" in STAGE2_TIMING_FIELDS
+
+    fields = _train_fields(
+        role="fake_score", fake=1, generator=0, substep="F1", loss=1.0
+    )
+    assert fields["orchestration_seconds_max"] > 0.0
+    assert sum(fields[key] for key in STAGE2_TIMING_FIELDS) + fields[
+        "timing_closure_error_seconds"
+    ] == pytest.approx(fields["step_seconds_max"])
 
 
 def test_plotter_defensively_rejects_excessive_timing_closure_in_jsonl(tmp_path):

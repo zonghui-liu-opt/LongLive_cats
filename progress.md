@@ -1,5 +1,26 @@
 # 进度日志
 
+## 会话：2026-08-17（Phase 21）
+
+### H100 timing closure 故障闭环
+- **状态：** in_progress
+- 内网smoke已完成rollout、fake/real score、backward/optimizer并进入`_append_metric("train_step")`；rank-0指标校验因`abs(timing_closure_error)=3.712756s`超过`max(0.1, 5%*step_seconds_max)=2.759816s`而拒绝。
+- 本轮先核对计时边界和8 rank聚合，不直接提高5%阈值；修复完成后继续通过同一个无Git脚本交付，保护用户metadata/checkpoints/results/tmp/prepare_stage1等现有资产。
+- 已完成计时边界审计：慢rank选取逻辑正确，失败源于多个真实runtime/audit/control阶段未分类，而不是跨rank把不同rank字段错误相加。方案锁定为新增互斥orchestration类别并保持原closure阈值。
+- 红测设计锁定三层：`_run_update_attempt`必须输出非负attempt orchestration，`_run_one_logical_substep`必须把attempt与pre/post control合并传给timing summary，metrics/plotter必须把新字段纳入求和与图例；另扩展无Gitfixture验证trainer+metrics累计改写及多文件备份/幂等/失败不部分写。
+- 6个聚焦红测按预期失败：当前attempt结果、logical-substep timing categories、slowest-rank summary与metrics字段均缺orchestration；失败位置与预期完全一致，开始实现互斥分段计时。
+- 已实现attempt完整wall与内部分类差值、caller pre/post control显式计时、slowest-rank orchestration聚合、metrics字段及plot图例；原6项红测全部转绿。下一步增加启动期trainer/metrics握手并把多文件累计变换纳入无Git热修器。
+- 启动审计已扩展为精确timing字段握手；当前wrapper与hotfix隔离probe会在torchrun前同时验证model callback API和metrics orchestration契约。
+- 首轮联合106项有104通过、2个既有closure边界测试失败；原因是fixture新增0.1秒orchestration时没有从原有分类重分配，导致总phase凭空增加0.1秒，并非production公式错误。修正fixture为从rollout重分类0.05秒到orchestration后复验。
+- 修正后3项closure边界转绿，hotfix/trainer/metrics/plot/H100 wrapper/runbook联合106 passed；包含启动期旧metrics拒绝、多文件累计升级与rollback反例。
+- 静态首轮py_compile通过；Black仅要求机械格式化hotfix/trainer。Ruff新脚本指出rollback捕获`BaseException`过宽；plot/metrics/既有测试的其余诊断均为HEAD全文件债务，保持不扩大。将捕获收窄为`Exception`并只格式化本轮两个文件。
+- Black把trainer的orchestration `result.get`压成单行，首次热修器current-source自检因仍持有格式化前精确片段而fail-closed；已同步热修器的current指纹，不放宽为正则匹配。
+- 格式化后current-source probe通过；Ruff继续指出rollback通配`Exception`，已按真实`_atomic_replace`异常域收窄为`OSError`。新脚本Ruff、任务文件Black/py_compile及11项关键复验全部通过。
+- 完整`python -m pytest -q tests/test_stage2_*.py`为675 passed、14条既有TorchScript弃用warning，用时152.65秒；loss/optimizer/EMA/checkpoint/rollout/metrics/guide全链未发现第二个回归。
+- 最终静态门禁：新hotfix Ruff、任务文件Black/py_compile、shell语法、精确路径diff-check和isolated current-source probe全部通过；最终diff复核确认生产语义只新增orchestration计时/握手/图例，5%阈值、loss、optimizer与状态机未改。21.1–21.4完成，剩精确发布与远端核验。
+- 追加真实`ab67824`四文件fixture验证时，首个临时目录命令因包含自动`rm -rf`清理被安全策略拒绝，未执行任何测试或删除；改为无删除命令的隔离临时目录验证，不重试被拒绝形式。
+- 直接从发布提交`ab67824`归档真实model/trainer/metrics/plot四文件后执行当前热修器，结果精确为trainer/metrics/plot三文件`PATCHED`，逐字节等于当前源码；证明用户现有Phase 20内网状态可由同一单文件累计升级。
+
 ## 会话：2026-08-17（Phase 20）
 
 ### 无Git内网累计热修闭环

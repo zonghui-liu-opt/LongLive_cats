@@ -44,6 +44,7 @@ STAGE2_TIMING_FIELDS = (
     "loss_build_seconds_max",
     "backward_seconds_max",
     "clip_optimizer_seconds_max",
+    "orchestration_seconds_max",
     "ema_seconds_max",
 )
 STAGE2_MEMORY_FIELDS = (
