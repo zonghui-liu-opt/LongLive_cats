@@ -3,7 +3,7 @@
 ## 会话：2026-08-17（Phase 21）
 
 ### H100 timing closure 故障闭环
-- **状态：** in_progress
+- **状态：** complete（代码与无Git累计热修已发布；真实8×H100 smoke待内网复验）
 - 内网smoke已完成rollout、fake/real score、backward/optimizer并进入`_append_metric("train_step")`；rank-0指标校验因`abs(timing_closure_error)=3.712756s`超过`max(0.1, 5%*step_seconds_max)=2.759816s`而拒绝。
 - 本轮先核对计时边界和8 rank聚合，不直接提高5%阈值；修复完成后继续通过同一个无Git脚本交付，保护用户metadata/checkpoints/results/tmp/prepare_stage1等现有资产。
 - 已完成计时边界审计：慢rank选取逻辑正确，失败源于多个真实runtime/audit/control阶段未分类，而不是跨rank把不同rank字段错误相加。方案锁定为新增互斥orchestration类别并保持原closure阈值。
@@ -20,6 +20,7 @@
 - 最终静态门禁：新hotfix Ruff、任务文件Black/py_compile、shell语法、精确路径diff-check和isolated current-source probe全部通过；最终diff复核确认生产语义只新增orchestration计时/握手/图例，5%阈值、loss、optimizer与状态机未改。21.1–21.4完成，剩精确发布与远端核验。
 - 追加真实`ab67824`四文件fixture验证时，首个临时目录命令因包含自动`rm -rf`清理被安全策略拒绝，未执行任何测试或删除；改为无删除命令的隔离临时目录验证，不重试被拒绝形式。
 - 直接从发布提交`ab67824`归档真实model/trainer/metrics/plot四文件后执行当前热修器，结果精确为trainer/metrics/plot三文件`PATCHED`，逐字节等于当前源码；证明用户现有Phase 20内网状态可由同一单文件累计升级。
+- 精确12文件提交`79747d3`已推送`longlive-cats/stage-2`；用户metadata/checkpoints/results/tmp/prepare_stage1及动作CSV均未暂存。下一步仅需重新传入同名热修脚本并重跑原smoke。
 
 ## 会话：2026-08-17（Phase 20）
 

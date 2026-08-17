@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 21 进行中：真实8×H100 smoke已越过模型调用、loss和更新，在rank-0 JSONL写入前触发timing closure误差；审计计时定义、跨rank聚合和同步开销，修复而不掩盖真实漏计时，并扩展同一无Git热修入口。
+Phase 21 已完成：H100的3.71秒合法runtime/audit开销已单列为orchestration，原5% closure门禁保持；无Git热修器可从`ab67824`累计升级，675项回归通过并发布`stage-2`。
 
 ## 各阶段
 
@@ -184,8 +184,8 @@ Phase 21 进行中：真实8×H100 smoke已越过模型调用、loss和更新，
 - [x] 21.2 建立跨rank与同步开销红测，区分真实漏计时和合法框架开销
 - [x] 21.3 最小修复计时闭合定义及指标契约，保留严格异常检测
 - [x] 21.4 扩展无Git累计热修器，覆盖Phase 19–21混合部署
-- [ ] 21.5 运行聚焦/完整Stage‑2/静态回归，精确commit并push `stage-2`
-- **Status:** in_progress
+- [x] 21.5 运行聚焦/完整Stage‑2/静态回归，精确commit并push `stage-2`
+- **Status:** complete（联合106 passed；完整Stage‑2 675 passed；真实`ab67824`升级fixture逐字节PASS；GitHub提交`79747d3`；真实8×H100 smoke待内网复验）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
