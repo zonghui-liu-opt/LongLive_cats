@@ -22,6 +22,7 @@ from pipeline.stage2_rollout_profile import (
     Stage2RolloutSpec,
     resolve_stage2_rollout_profile,
 )
+from utils.stage2_cross_kv import Stage2CrossKVInitState
 
 STAGE2_K2_SHIFT5_TIMESTEPS = (999, 833)
 STAGE2_K4_SHIFT5_TIMESTEPS = (999, 937, 833, 624)
@@ -642,7 +643,7 @@ class Stage2RolloutPipeline:
                     dtype=dtype,
                     device=device,
                 ),
-                "is_init": False,
+                "stage2_state": Stage2CrossKVInitState(),
                 "stage2_enabled": True,
             }
             for _ in range(num_layers)
@@ -743,9 +744,14 @@ class Stage2RolloutPipeline:
         for layer_index, cache in enumerate(state.cross_kv):
             k = cache.get("k")
             v = cache.get("v")
+            init_state = cache.get("stage2_state")
             if cache.get("stage2_enabled") is not True:
                 raise RuntimeError(
                     f"Stage-2 layer {layer_index} cross-KV branch is not enabled"
+                )
+            if not isinstance(init_state, Stage2CrossKVInitState):
+                raise RuntimeError(
+                    f"Stage-2 layer {layer_index} has invalid cross-KV state"
                 )
             if (
                 not torch.is_tensor(k)
@@ -759,7 +765,7 @@ class Stage2RolloutPipeline:
                 raise RuntimeError(
                     f"Stage-2 layer {layer_index} has invalid persistent cross K/V"
                 )
-            if bool(cache.get("is_init", False)) is not expected_cross_initialized:
+            if init_state.initialized is not expected_cross_initialized:
                 raise RuntimeError(
                     f"Stage-2 layer {layer_index} cross-KV init state mismatch"
                 )
@@ -880,12 +886,17 @@ class Stage2RolloutPipeline:
     @staticmethod
     def _clear_cross_kv(state: Stage2RolloutState) -> None:
         with torch.no_grad():
-            for cache in state.cross_kv:
+            for layer_index, cache in enumerate(state.cross_kv):
+                init_state = cache.get("stage2_state")
+                if not isinstance(init_state, Stage2CrossKVInitState):
+                    raise RuntimeError(
+                        f"Stage-2 layer {layer_index} has invalid cross-KV state"
+                    )
                 cache["k"].zero_()
                 cache["v"].zero_()
                 cache["k"].detach_()
                 cache["v"].detach_()
-                cache["is_init"] = False
+                init_state.clear()
 
     def _validate_prefix_snapshot(
         self,
@@ -1004,9 +1015,11 @@ class Stage2RolloutPipeline:
         for layer_index, cache in enumerate(state.cross_kv):
             k = cache.get("k")
             v = cache.get("v")
+            init_state = cache.get("stage2_state")
             if (
                 cache.get("stage2_enabled") is not True
-                or cache.get("is_init") is not True
+                or not isinstance(init_state, Stage2CrossKVInitState)
+                or init_state.initialized is not True
                 or not torch.is_tensor(k)
                 or not torch.is_tensor(v)
                 or k.shape != v.shape

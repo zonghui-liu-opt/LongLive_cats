@@ -252,7 +252,7 @@ def test_true_peft_causal_wan_unipc_rollout_commits_only_detached_clean_kv(
         assert cross_k_calls == [torch.Size([1, 2, 12])]
         cross_cache = state.cross_kv[0]
         assert cross_cache["stage2_enabled"] is True
-        assert cross_cache["is_init"] is True
+        assert cross_cache["stage2_state"].initialized is True
         assert torch.count_nonzero(cross_cache["k"]).item() > 0
         assert cross_cache["k"].grad_fn is None
         assert cross_cache["v"].grad_fn is None

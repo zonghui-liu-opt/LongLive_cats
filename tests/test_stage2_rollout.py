@@ -17,6 +17,7 @@ from pipeline.stage2_rollout import (
     Stage2SinkPrefixSnapshot,
     draw_stage2_exit_schedule,
 )
+from utils.stage2_cross_kv import Stage2CrossKVInitState
 from utils.stage2_config import load_stage2_config
 from utils.stage2_inference import tensor_identity_sha256
 from wan_5b.modules.causal_model import (
@@ -26,6 +27,38 @@ from wan_5b.modules.causal_model import (
 )
 
 FRAME_TOKENS = 390
+
+
+def test_stage2_cross_kv_state_survives_fsdp2_container_rebuilds():
+    from torch.distributed.utils import _apply_to_tensors, _to_kwargs
+
+    state = Stage2CrossKVInitState()
+    original = {
+        "crossattn_cache": [
+            {
+                "k": torch.zeros(1, dtype=torch.bfloat16),
+                "v": torch.zeros(1, dtype=torch.bfloat16),
+                "stage2_state": state,
+            }
+        ]
+    }
+
+    _, moved_kwargs = _to_kwargs((), original, torch.device("cpu"), False)
+    root_kwargs = moved_kwargs[0]
+
+    def cast_forward_input(tensor):
+        if torch.is_floating_point(tensor) and tensor.dtype != torch.bfloat16:
+            return tensor.to(torch.bfloat16)
+        return tensor
+
+    block_kwargs = _apply_to_tensors(cast_forward_input, root_kwargs)
+
+    assert root_kwargs is not original
+    assert block_kwargs is not root_kwargs
+    forwarded_state = block_kwargs["crossattn_cache"][0]["stage2_state"]
+    assert forwarded_state is state
+    forwarded_state.mark_initialized()
+    assert original["crossattn_cache"][0]["stage2_state"].initialized is True
 
 
 class _FakeScheduler:
@@ -149,7 +182,7 @@ class _FakeGenerator(nn.Module):
             for cache in crossattn_cache:
                 cache["k"].fill_(float(conditional_dict["prompt_embeds"].flatten()[0]))
                 cache["v"].fill_(2)
-                cache["is_init"] = True
+                cache["stage2_state"].mark_initialized()
         return flow, x0
 
 
@@ -669,7 +702,7 @@ def test_episode1_prefix_snapshot_restores_detached_s4_s8_episode2(
         assert torch.count_nonzero(cache["v"][:, target.sink_tokens :]) == 0
         assert int(cache["global_end_index"].item()) == target.sink_tokens
         assert int(cache["local_end_index"].item()) == target.sink_tokens
-    assert all(cache["is_init"] is False for cache in state_b.cross_kv)
+    assert all(cache["stage2_state"].initialized is False for cache in state_b.cross_kv)
     assert all(torch.count_nonzero(cache["k"]) == 0 for cache in state_b.cross_kv)
 
     calls_before_b = len(generator.calls)
@@ -801,7 +834,7 @@ def test_episode_reset_keeps_sink_clears_local_and_cross_and_restarts_rope():
         assert int(cache["local_end_index"].item()) == FRAME_TOKENS
         assert int(cache["pinned_start"].item()) == -1
         assert int(cache["pinned_len"].item()) == 0
-    assert all(cache["is_init"] is False for cache in state.cross_kv)
+    assert all(cache["stage2_state"].initialized is False for cache in state.cross_kv)
     assert all(torch.count_nonzero(cache["k"]) == 0 for cache in state.cross_kv)
 
     conditioning_b = {"prompt_embeds": torch.full((1, 2, 3), 9.0, dtype=torch.bfloat16)}
@@ -1128,12 +1161,12 @@ def test_stage2_cross_attention_cache_is_real_and_legacy_bypass_is_unchanged(
     cache = {
         "k": torch.zeros(1, 3, 1, 4),
         "v": torch.zeros(1, 3, 1, 4),
-        "is_init": False,
+        "stage2_state": Stage2CrossKVInitState(),
         "stage2_enabled": True,
     }
 
     attention(query, first_context, None, crossattn_cache=cache)
-    assert cache["is_init"] is True
+    assert cache["stage2_state"].initialized is True
     first_cached = cache["k"].clone()
     attention(query, changed_context, None, crossattn_cache=cache)
     assert torch.equal(cache["k"], first_cached)
@@ -1142,9 +1175,9 @@ def test_stage2_cross_attention_cache_is_real_and_legacy_bypass_is_unchanged(
 
     cache["k"].zero_()
     cache["v"].zero_()
-    cache["is_init"] = False
+    cache["stage2_state"].clear()
     attention(query, changed_context, None, crossattn_cache=cache)
-    assert cache["is_init"] is True
+    assert cache["stage2_state"].initialized is True
     assert not torch.equal(cache["k"], first_cached)
 
     legacy_cache = {
@@ -1154,6 +1187,19 @@ def test_stage2_cross_attention_cache_is_real_and_legacy_bypass_is_unchanged(
     }
     attention(query, first_context, None, crossattn_cache=legacy_cache)
     assert legacy_cache["is_init"] is False
+
+    invalid_stage2_cache = {
+        "k": torch.zeros_like(cache["k"]),
+        "v": torch.zeros_like(cache["v"]),
+        "stage2_enabled": True,
+    }
+    with pytest.raises(RuntimeError, match="cache state is invalid"):
+        attention(
+            query,
+            first_context,
+            None,
+            crossattn_cache=invalid_stage2_cache,
+        )
 
 
 def test_exit_rng_state_rejects_missing_or_malformed_roles():

@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+from utils.stage2_cross_kv import Stage2CrossKVInitState
 
 # wan 5b model compilation for flexattention
 flex_attention = torch.compile(
@@ -234,7 +235,12 @@ class MultiShotT2VCrossAttention(WanCrossAttention):
                 isinstance(crossattn_cache, dict)
                 and crossattn_cache.get("stage2_enabled", False) is True
             )
-            if use_stage2_cache and bool(crossattn_cache.get("is_init", False)):
+            stage2_state = None
+            if use_stage2_cache:
+                stage2_state = crossattn_cache.get("stage2_state")
+                if not isinstance(stage2_state, Stage2CrossKVInitState):
+                    raise RuntimeError("Stage-2 cross-attention cache state is invalid")
+            if use_stage2_cache and stage2_state.initialized:
                 k = crossattn_cache.get("k")
                 v = crossattn_cache.get("v")
                 expected = (b_eff, context.shape[1], n, d)
@@ -273,7 +279,7 @@ class MultiShotT2VCrossAttention(WanCrossAttention):
                     with torch.no_grad():
                         cache_k.copy_(k.detach())
                         cache_v.copy_(v.detach())
-                    crossattn_cache["is_init"] = True
+                    stage2_state.mark_initialized()
                     k = cache_k
                     v = cache_v
 

@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 16 已完成：复杂H100手册已收敛为单一顶层 `run_stage2_h100.sh`，操作者只需依次选择prepare、smoke、train、control、plot和infer并核对明确PASS标志；底层step3075、动作分布198/202/200、训练、恢复、可视化和推理契约保持不变。
+Phase 18 已完成：FSDP2-safe cross-KV可变leaf state、严格审计/reset与root/block双重容器重建回归已落地并完成663项Stage‑2验证；本轮精确提交发布到GitHub `stage-2`分支，真实8×H100 smoke待内网复验。
 
 ## 各阶段
 
@@ -147,6 +147,22 @@ Phase 16 已完成：复杂H100手册已收敛为单一顶层 `run_stage2_h100.s
 - [x] 16.5 运行shell、CLI、目标回归和diff门禁，交付只需复制执行的内网步骤
 - **Status:** complete（目标回归27 passed；完整Stage‑2 662 passed；独立终审P0=0/P1=0；真实8×H100执行待内网）
 
+### Phase 17：Stage‑2 H100 cross-KV smoke 故障定位
+- [x] 记录异常栈、dirty worktree与真正中止点
+- [x] 逐段核对`_preload_sink`、`_audit_cache`和cross-attention cache写入契约
+- [x] 核对smoke配置、FSDP/BF16运行时与本地测试覆盖缺口
+- [x] 用最小反例证明根因并评估修复风险
+- [x] 给出修复方案、补丁建议与内网复验命令
+- **Status:** complete（根因已用PyTorch FSDP2官方v2.8源码和本地最小反例双重证明；本轮按诊断请求未改production代码）
+
+### Phase 18：实现 cross-KV FSDP2 修复并发布
+- [x] 复核Git/GitHub分支、远程、认证和dirty worktree的精确提交边界
+- [x] 先增加FSDP2双重容器重建反例测试
+- [x] 实现轻量可变leaf state、严格验证与reset/audit语义
+- [x] 运行聚焦、Stage-2全量与静态回归
+- [x] 只暂存本轮文件，commit并push到GitHub `stage-2`
+- **Status:** complete（聚焦55 passed；完整Stage‑2 663 passed；本轮文件精确发布；真实8×H100 smoke待内网复验）
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -201,6 +217,9 @@ Phase 16 已完成：复杂H100手册已收敛为单一顶层 `run_stage2_h100.s
 | prepare脚本首次补丁给`$STAGE2_PYTHON`命令名误加了单引号，形成字面量命令 | 1 | 静态复核后立即改为双引号变量展开，随后用`bash -n`和stub集成测试验证 |
 | 新runbook测试首次运行因手册在“不要锁死历史计数”的反例句中仍出现`329 passed`而失败 | 1 | 删除具体历史数字、保留原则性说明；产品命令与流程未失败 |
 | 新增runbook测试首次Black check要求格式化 | 1 | 仅对新增测试运行Black机械格式化，再复跑静态和目标测试 |
+| Phase 18红测首次收集因`utils.stage2_cross_kv`尚不存在而失败 | 1 | 确认测试锁定缺失契约后新增非dataclass leaf state并复跑，聚焦测试通过 |
+| Phase 18全文件Black/Ruff检查命中`causal_model.py`既有格式与7项lint债务 | 1 | 不扩大提交；修正本轮测试格式，严格检查其余文件，并对比HEAD证明causal_model当前仍是相同7项、无新增lint |
+| planning完成检查脚本没有可执行位，直接调用被拒绝 | 1 | 保留脚本不改权限，改由`bash`显式执行同一只读检查 |
 
 ## 备注
 - 重大决策前重新读取本计划。

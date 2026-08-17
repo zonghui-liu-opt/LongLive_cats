@@ -1,5 +1,25 @@
 # 发现与决策
 
+## 2026-08-17 Phase 18：cross-KV FSDP2 修复实现
+
+- 新增`Stage2CrossKVInitState`作为普通Python leaf，不使用dataclass/container，确保PyTorch FSDP2 root `_to_kwargs`和block `_apply_to_tensors`重建kwargs时保持同一对象identity。
+- Stage‑2 allocation、Wan cross-attention写入、rollout audit/reset/prefix validation统一读写该state；缺失或类型错误会fail closed。legacy非Stage‑2 cache仍保留原`is_init`旁路行为。
+- 回归测试直接执行PyTorch私有helper模拟两层真实容器重建，证明外层dict均被复制、leaf state仍共享且内层更新可被原rollout cache观察；没有关闭block `cast_forward_inputs=True`，也没有引入CUDA标量同步。
+- 修改前红测因新模块不存在而按预期失败；实现后FSDP2反例、cross-cache行为、true-Wan rollout与init-only聚焦集合55项通过，完整Stage‑2回归663项通过。
+- 新增/正常格式文件通过Black，任务文件Ruff/py_compile/diff-check通过；`causal_model.py`的全文件Black及7项Ruff债务均存在于HEAD，本轮对比未增加诊断，避免无关大规模格式化。
+
+## 2026-08-17 Phase 17：Stage‑2 H100 cross-KV smoke 故障
+
+- 用户内网`bash run_stage2_h100.sh smoke`已通过三角色LoRA构建，在C0的首个logical substep、首个rollout sink preload中止；异常是rank1的`Stage-2 layer 0 cross-KV init state mismatch`。
+- `torch 2.8.0+cu128`与某可选C++ extension的`torch>=2.11`警告发生在模型初始化期，当前证据不支持它是此cross-KV契约异常的直接根因；不应先盲升Torch。
+- 当前本地worktree有用户侧metadata/checkpoint/result/tmp等改动；本轮默认只读诊断，不触碰这些资产。
+- 根因链路：PyTorch 2.8 FSDP2 root pre-forward在CUDA上先用`_to_kwargs`递归重建device kwargs，每个block又因`cast_forward_inputs=True`用`_apply_to_tensors`重建mixed-precision kwargs；两个helper都对dict/list创建新容器。BF16 K/V tensor已在目标device/dtype而仍共享对象，但Python `is_init=False`只被按值复制。cross attention的`crossattn_cache["is_init"] = True`只修改最内层FSDP副本，rollout原始state仍False，首层审计精确报错。因root device-move本身也会重建容器，仅将block `cast_forward_inputs=False`不是完整修复。
+- 本地最小反例复现：FSDP式recursive move/cast后dict均不同一，K/V tensor仍共享；在forward dict内写K/V能反映到原dict，但赋值`is_init=True`后原dict仍False。轻量非dataclass可变Python flag对象在两次容器重建后仍保持同一identity，其`initialized`field可正确回写。
+- 当前测试缺口：true-Wan rollout测试未经FSDP2 block wrapper；init-only测试反而锁定了block `cast_forward_inputs=True`，但不检查nested mutable kwargs的容器副本语义；H100 accumulation gate是toy Linear，因此prepare通过而首个真实Wan+FSDP forward失败。
+- 推荐修复：新增一个非dataclass、非container的轻量`Stage2CrossKVInitState`叶子对象，内部只有`initialized: bool`；allocation将该对象放入每层cache；attention中严格验证类型并更新field；reset/audit/prefix validation通过field写/读。FSDP 2.8对未知Python对象按leaf保留identity，无CUDA `.item()`同步；保留`cast_forward_inputs=True`和现有BF16契约。0维device bool tensor可作正确性热修，但正式方案不建议承受每层标量读取的host/device同步。
+- 禁止型“修复”：不要删除`_audit_cache`、不要将`expected_cross_initialized=False`、不要在forward返回后无条件手工将每层flag设True，不要只关掉block input cast，不要为该错盲升PyTorch。
+- 环境警告是第二个独立问题：官方兼容表明PyTorch 2.8.0的C++ extension对应torchao 0.13.0，仓库`requirements.txt`也锁定0.13.0。内网应核对实际torchao版本并降/固定到0.13.0，而不是把已验证的Torch 2.8盲升到2.11。
+
 ## 2026-08-16 Phase 16：Stage‑2 H100 单一指导脚本
 
 - 用户不需要再从完整runbook中人工拼接命令；唯一推荐入口是仓库根目录的`run_stage2_h100.sh`。运行顺序固定为`prepare`→`smoke`→`train`→`control`→`plot`→`infer`，`status`只读查看进度。

@@ -1,5 +1,30 @@
 # 进度日志
 
+## 会话：2026-08-17（Phase 18）
+
+### 实现 cross-KV FSDP2 修复并发布
+- **状态：** complete（本地修复与GitHub `stage-2`发布完成；真实8×H100 smoke待内网复验）
+- 用户已明确授权修改代码并上传GitHub `stage-2`分支。
+- 发布边界锁定为本轮cross-KV production代码、相关测试和Phase 17/18诊断记录；用户现有metadata、checkpoints、results、tmp和prepare_stage1不暂存。
+- 已确认当前`stage-2`跟踪`longlive-cats/stage-2`且GitHub认证为`zonghui-liu-opt`；不新建分支或PR。
+- 先加入FSDP2 root/block双容器重建回归；首次收集按预期因`utils.stage2_cross_kv`不存在失败，随后实现普通Python leaf state。
+- allocation、attention、audit、reset和prefix validation已统一为严格state契约；legacy非Stage‑2 cache旁路未改，FSDP mixed-precision策略未改。
+- 首轮聚焦回归55 passed；完整`tests/test_stage2_*.py`为663 passed、14条既有TorchScript弃用warning。
+- 新增/正常格式任务文件通过Black、Ruff、py_compile和精确diff-check；`causal_model.py`当前7项Ruff与HEAD基线完全相同，未借本轮修复扩大历史格式/lint改动。
+- 仅暂存本轮7个tracked文件与新增state模块并审阅staged diff；用户的metadata、checkpoints、results、tmp和prepare_stage1保持未暂存。
+- planning完成检查脚本未设置可执行位；不修改技能文件权限，改用`bash`执行同一只读检查。
+
+## 会话：2026-08-17（Phase 17）
+
+### Stage‑2 H100 cross-KV smoke 故障定位
+- **状态：** complete（诊断与解决方案完成；未改production代码）
+- 已恢复现有planning文件并记录本轮目标；本轮是诊断与解决方案，未获授权修改production代码。
+- 已确认异常位于`pipeline/stage2_rollout.py::_preload_sink`后的首次`_audit_cache`，而不是LoRA target选择或可选C++ extension导入警告。
+- 已保护dirty worktree中的用户文件；下一步逐行比较preload期望状态与底层cross-attention实际状态更新。
+- 已用PyTorch v2.8官方源码确认FSDP2 root device-move和block `cast_forward_inputs=True`会先后递归重建kwargs dict/list，并用本地最小反例复现“K/V tensor写入保留、Python bool状态丢失”。
+- 已形成最小正式修复设计：FSDP共享轻量可变Python leaf flag + strict audit + root/block双容器重建回归；不改block mixed precision policy，不引入CUDA scalar sync。
+- 复验建议：先运行新增单测/相关回归，再使用全新仓库外`STAGE2_SMOKE_DIR`重跑C0→C1→C2，保留旧失败目录作为证据。
+
 ## 会话：2026-08-16（Phase 16）
 
 ### Stage‑2 H100 单一指导脚本
