@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 20 进行中：用户内网无法使用Git，最新增量补丁落在旧Stage2DMD基线上后仍缺callback实现；改为交付幂等、自动备份、独立自检的单文件无Git热修器，并验证旧版/新版/二次执行三种路径。
+Phase 20 已完成：无Git累计热修器可安全修复旧版及“v2常量+旧方法”混合版，当前版/二次执行幂等，未知源码拒绝；672项Stage‑2回归通过并发布`stage-2`。
 
 ## 各阶段
 
@@ -176,8 +176,8 @@ Phase 20 进行中：用户内网无法使用Git，最新增量补丁落在旧St
 - [x] 20.2 先补旧版fixture红测，覆盖备份、原子写、幂等与拒绝未知源码
 - [x] 20.3 实现单文件无Git热修器及一条命令式自检/运行入口
 - [x] 20.4 在旧版、新版和重复执行fixture上验证，并重跑相关/完整Stage‑2测试
-- [ ] 20.5 精确commit/push并交付无需Git的内网命令
-- **Status:** in_progress
+- [x] 20.5 精确commit/push并交付无需Git的内网命令
+- **Status:** complete（完整Stage‑2 672 passed；runtime isolated probe PASS；GitHub提交`f46eb1b`；真实8×H100 smoke待内网复验）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？

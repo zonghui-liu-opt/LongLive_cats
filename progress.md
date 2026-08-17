@@ -3,7 +3,7 @@
 ## 会话：2026-08-17（Phase 20）
 
 ### 无Git内网累计热修闭环
-- **状态：** in_progress
+- **状态：** complete（代码与无Git交付已发布；真实8×H100 smoke待内网复验）
 - 用户明确内网无法做Git管理；此前最新commit的增量diff被应用到旧`model/stage2_dmd.py`后，只加入v2常量而没有带入历史`72465ff`的callback实现，runtime门禁因此正确拒绝。
 - 本轮不再要求clone/pull/reset；将提供单个可复制脚本，先备份目标文件，再以严格旧源码指纹执行累计变换，原子写回并在独立Python进程中验证F/G签名与callback行为。
 - 当前本地HEAD=`c1daa26`，用户metadata/checkpoints/results/tmp/prepare_stage1继续排除。
@@ -16,6 +16,7 @@
 - 静态首轮：py_compile、`bash -n`及真实`--check` runtime probe通过；Black仅要求格式化两个新文件，Ruff对新脚本报告可执行位/import排序，对trainer报告的其余12项为既有全文件债务。下一步只机械整理新文件并用HEAD差分确认trainer未新增lint债务。
 - 两个新文件已机械Black/import-sort并给热修器可执行位；新文件Ruff与任务文件Black均通过。全worktree `git diff --check`只报告用户现有metadata CSV尾随空格，未修改该资产；发布门禁改为对本轮精确路径执行。
 - 格式化后hotfix/guide/runbook 23项复验通过，任务路径Ruff/Black/py_compile/bash语法/diff-check全通过；runtime子进程进一步用隔离`-X pycache_prefix`规避内网旧`.pyc`误加载。20.1–20.4完成，剩精确发布。
+- 精确8文件提交`f46eb1b`已推送`longlive-cats/stage-2`；用户metadata/checkpoints/results/tmp/prepare_stage1及动作CSV均未暂存。无Git内网只需传入一个热修脚本并执行一条命令。
 
 ## 会话：2026-08-17（Phase 19）
 
