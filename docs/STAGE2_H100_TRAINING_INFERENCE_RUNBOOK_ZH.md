@@ -33,6 +33,18 @@ cd "$STAGE2_PROJECT_ROOT"
 mkdir -p "$STAGE2_WORK_ROOT/logs" "$STAGE2_TRAIN_ROOT"
 ```
 
+若代码通过手工拷贝部署，且出现 `Stage-2 DMD runtime API mismatch`，先只同步单文件
+`scripts/apply_stage2_innernet_hotfix.py`，再执行：
+
+```bash
+"$STAGE2_PYTHON" scripts/apply_stage2_innernet_hotfix.py --project-root "$STAGE2_PROJECT_ROOT"
+```
+
+该脚本不读取 Git：它识别旧版、当前版及“新 trainer + 旧 model”混合版，写前备份，完整
+变换通过 compile/AST 后才原子替换，并用隔离 Python 重新执行 runtime API audit。必须看到
+`STAGE2_DMD_RUNTIME_API=PASS` 和 `STAGE2_INNERNET_HOTFIX=PATCHED`（重复执行则为
+`ALREADY_APPLIED`）；若报告 `FAIL`，目标文件不会被猜测性改写，应保留错误和备份路径排查。
+
 若旧 prepare 曾生成 `checkpoints/`、`results/`、cache 或临时 YAML，先由操作者确认后归档；
 不要用未经检查的批量删除命令。
 

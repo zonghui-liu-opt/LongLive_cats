@@ -56,6 +56,10 @@ def _sha256_file(path: Path) -> str:
 
 
 _STAGE2_DMD_RUNTIME_API_VERSION = "longlive_stage2_dmd_runtime/v2"
+_STAGE2_DMD_RUNTIME_REPAIR = (
+    "Run scripts/apply_stage2_innernet_hotfix.py from the project root, or "
+    "deploy one complete stage-2 source snapshot; do not mix trainer and model files."
+)
 _STAGE2_DMD_RUNTIME_METHODS = {
     "fake_score_flow_dsm_loss_from_model": (
         "generated_future",
@@ -86,7 +90,7 @@ def _audit_stage2_dmd_runtime_api(model_type: type) -> dict[str, Any]:
             "Stage-2 DMD runtime API version mismatch: "
             f"expected={_STAGE2_DMD_RUNTIME_API_VERSION!r}, "
             f"actual={actual_version!r}, source={source_file}. "
-            "Use one clean stage-2 checkout; do not mix trainer and model files."
+            f"{_STAGE2_DMD_RUNTIME_REPAIR}"
         )
 
     methods: dict[str, str] = {}
@@ -114,7 +118,7 @@ def _audit_stage2_dmd_runtime_api(model_type: type) -> dict[str, Any]:
                 f"missing={missing}, unexpected={unexpected}, "
                 f"expected_order={list(expected_names)}, "
                 f"actual_order={list(actual_names)}, source={source_file}. "
-                "Use one clean stage-2 checkout; do not mix trainer and model files."
+                f"{_STAGE2_DMD_RUNTIME_REPAIR}"
             )
         invalid_kinds = [
             parameter.name

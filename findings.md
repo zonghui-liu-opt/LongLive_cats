@@ -1,5 +1,11 @@
 # 发现与决策
 
+## 2026-08-17 Phase 20：无Git内网部署事实
+
+- 内网报错中的model source path是当前checkout，但方法实际参数仍为旧三参数；结合v2常量已存在，说明操作者应用的是“最新commit相对新基线的增量”，而不是完整文件。最新commit只触碰常量，Git历史中的callback实现不会随单个增量自动补入。
+- 正确交付单元必须从“Git commit差异”切换为“累计热修器”：识别旧/新两种方法体，旧版补齐F/G callback签名与计时调用，新版只验证；未知或部分匹配源码拒绝写入。写前创建唯一备份，临时文件同目录fsync后`os.replace`，二次执行不再改文件。
+- 现有完整手册已明确运行期不依赖Git，但缺少“手工同步造成source/API skew”后的恢复入口；应在快速部署和完整手册都固定为先运行单文件热修器、看到runtime API PASS，再重跑原smoke，避免操作者继续手改两个长方法。
+
 ## 2026-08-17 Phase 19：Stage‑2 smoke 新接口异常
 
 - 新异常已越过上一轮cross-KV sink preload，说明FSDP2 cross-KV状态修复在真实H100路径上生效；当前中止点推进到`_compute_micro_loss`的fake-score DSM loss调用。

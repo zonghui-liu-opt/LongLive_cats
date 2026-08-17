@@ -6,8 +6,9 @@
 bash run_stage2_h100.sh help
 ```
 
-通过后继续运行该脚本显示的下一条命令。复杂故障排查才需要查看
-[完整训练与推理手册](STAGE2_H100_TRAINING_INFERENCE_RUNBOOK_ZH.md)。下面保留旧的手工 prepare 说明。
+通过后继续运行脚本显示的下一条命令；复杂故障才查看[完整手册](STAGE2_H100_TRAINING_INFERENCE_RUNBOOK_ZH.md)。下面保留旧的手工 prepare 说明。
+
+手工拷贝后若报告 API mismatch，只同步 `scripts/apply_stage2_innernet_hotfix.py` 并运行 `python scripts/apply_stage2_innernet_hotfix.py --project-root "$PWD"`；看到 `STAGE2_DMD_RUNTIME_API=PASS` 与 `STAGE2_INNERNET_HOTFIX=PATCHED`（或 `ALREADY_APPLIED`）后重跑 smoke。脚本自动备份、原子写回且不需要 Git。
 
 先准备一个 600 行的动作标签文件，表头必须是：
 
