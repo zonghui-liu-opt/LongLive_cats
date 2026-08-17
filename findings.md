@@ -1,5 +1,89 @@
 # 发现与决策
 
+## 2026-08-16 Phase 16：Stage‑2 H100 单一指导脚本
+
+- 用户不需要再从完整runbook中人工拼接命令；唯一推荐入口是仓库根目录的`run_stage2_h100.sh`。运行顺序固定为`prepare`→`smoke`→`train`→`control`→`plot`→`infer`，`status`只读查看进度。
+- 不提供`all`子命令，避免误触即启动两轮长训练。每个阶段独立重建所需环境、复用现有生产入口并在完成后做严格产物认证；wrapper不复制训练算法。
+- `train`是正式B1（DMD+DFD）训练，`control`是从同一G240分叉的B0纯DMD对照；二者中断后都只需在同一目录重跑同一子命令，脚本会验证合法ancestry并精确恢复。
+- `infer`只接受B1 G280 EMA，必须得到当前配置定义的56个完整video+trace pair、认证manifest和精确HTML index；技术PASS后仍要人工打开index审阅画质，不能把文件完整性等同于视觉质量。
+- 所有工作/训练/推理输出必须位于Git checkout外，正式运行要求clean commit；任何固定PASS缺失都必须停下保留日志，禁止自动删除checkpoint、拼接partial产物或绕过hash/lineage门禁。
+- 最终本地证据：guide/artifact/runbook目标集合27 passed，完整Stage‑2集合662 passed；shell syntax与Python静态门禁通过，两路独立审计P0=0/P1=0。真实8×H100 prepare/smoke/B1/B0/inference与人工画质仍需用户在内网执行，未伪造结论。
+
+## 2026-08-15 Phase 15：当前磁盘态重新严格审计
+
+- 用户明确确认已在内网 H100 上执行当时版本的 `prepare_stage2.sh` 且全部环境/准备门禁通过；本轮新增的真实FSDP2 `CHECK_6`、C0/C1/C2、正式训练和训练后推理仍必须在内网分别验收。
+- 当前本地分支为 `stage-2`，跟踪 `longlive-cats/stage-2`；工作树包含 planning、`prepare_stage2.sh`、600条metadata及新增缓存入口测试等未提交改动，并有 checkpoints/results/tmp 等用户资产。所有审计和修复必须保留这些现有改动，不清理、不覆盖。
+- 持久计划显示训练闭环（Steps 9–11）已有实现并停在检查点 B，Steps 12–14 的 Stage‑2 batch inference/trace/压缩接口仍未完成；本轮从任务书重新验证这些历史结论，不以旧测试通过数量替代代码证据。
+- 任务书前520行重新锁定：输出必须是sink外24个全新latent；C/W/H/S/K=8/16/8/1/4、物理KV容量17、每chunk独立UniPC shift5、noisy/exit不提交KV且clean recache后持久KV无autograd；score pack严格1+24、video-global 9750 token timestep，score连续sigma与rollout scheduler不得混用。
+- 训练闭环唯一顺序为F1..F5→G→EMA→commit；phase/DFD/EMA/checkpoint由成功G时钟驱动。Phase A/B为G240/40、F1200/200，checkpoint只能完整cycle边界原子保存，并完整恢复双optimizer、三adapter/EMA、双sampler、全rank RNG与来源hash。
+- JSONL必须以F/G/cycle独立时钟作为权威数据源，loss numerator/count先跨rank/accum SUM再求global mean；九组PNG/SVG和HTML全部从resolved config推导phase/终点，producer→plotter共用schema并对关键字段缺失fail-fast。
+- Stage‑2推理明确不同于旧continuation：单动作EMA/CFG1生成24 latent并decode 25→drop pixel0=96帧；双动作每个episode保留同一原始sink但清其余self/cross KV，分别decode/drop sink后拼成192帧，禁止HOLD/soft re-anchor语义。
+- 任务书余下部分锁定H100 C0 cold-save、C1 resume+DMD、C2 forced DFD-discard三cycle门禁；micro2×acc4不满足显存/泄漏/straggler阈值时才退micro1×acc8，仍失败只允许尝试Generator grad-exit saved-tensor CPU offload，禁止改变算法或假装global32解决峰值。
+- 压缩接口必须让baseline与W24/W16/W8、C4W12/C4W8、原生K2和S4/S8多帧sink走同一条resolver/cache/rollout/inference路径；S4/S8额外sink只从episode2启用，并恢复episode1时snapshot的detached KV，不能在新prompt下重算。
+- 当前stage2文件清单仅包含训练、数据、role、checkpoint、metrics/plot和runbook；没有命名明确的Stage‑2 inference config/runner/shell/trace模块或测试，初步与任务书Steps 12–14仍未完成的状态一致，后续需确认是否有隐藏在通用文件中的未命名实现。
+- `TASK-stage2-self-forcing-dmd-dfd.md` 顶部状态仍写“尚未进入trainer”，但同文Steps 9–11和验收表已标完成；这是明确的文档状态漂移，最终必须同步，不能让操作者误判代码边界。
+- 当前Stage‑2全量回归基线为445 passed / 1 failed / 14 warnings（117.13s）。唯一失败是`tests/test_stage2_runbook.py`要求`prepare_stage2.sh`保留`expected_step=3750`，而脚本已改为3075；这不是测试环境问题。
+- 初始化基线存在明确内在矛盾：任务书第74/220/221行、正式YAML第44–54行及runbook测试锁定step3750；当前脚本第23/33/142/160/188行则把checkpoint、产物名、manifest验证和resolved断言全部锁为3075。选择任一方都会改变Stage‑2 Generator起点和provenance，必须由用户确认，不能自行推断。
+- 用户已明确裁决：实际对比发现step3075权重表现更好，Stage‑2所有配置、代码、manifest、测试、文档与产物命名必须统一到3075；与独立Stage‑1 3750历史实验相关的入口不属于Stage‑2，不应被无差别改写。
+- 用户明确取消此前其他模型制定的Stage‑2任务划分/检查点暂停规则；任务书中的算法与验收要求继续有效，但实现应端到端连续推进，不再等待旧检查点确认。
+- step3075同步后的Stage‑2专属生产代码、配置、任务书和测试中已无正向3750引用；唯一保留的Stage‑2测试字符串是禁止`stage1_step3750`重新出现的负契约。独立Stage‑1 continuation/comparison仍保留其自身3750实验语义。
+- step3075首次统一后的path-independent Stage‑2 contract hash为`68b4a3b05535c70b979becf5984898d81b651ead84c929370b7f21dccdde4e2f`；修复A24同点安全分叉B0/B1后，当前hash更新为`a7365f2ec45f74c3918ec05725b5d19b488fa4447a409cc6b5db4ccb114dd6c6`。聚焦provenance/config/runbook回归曾为157 passed，完整Stage‑2回归曾为446 passed、14条既有TorchScript弃用warning；最终计数以当前磁盘态重跑为准。
+- `bash -n`（prepare/F25入口）与修改过的Stage‑2 Python `py_compile`通过。全工作树`git diff --check`只报告用户现有600条metadata的CRLF/trailing-whitespace，不来自本轮step3075代码；后续使用任务文件范围的whitespace检查，未经确认不机械重写该数据文件。
+- 训练闭环主体约6890行（trainer 1983、checkpoint 2532、train state/transaction 830、metrics/plot 1545），现有测试全绿不足以替代按状态机、事务、分布式归约和恢复顺序逐段核验；三路只读审计正在补充这一证据。
+- 主线程已核对trainer主路径：cold/resume先建数据与三role/FSDP，再恢复双optimizer/EMA、逻辑时钟，最后恢复RNG；每substep先快照sampler与全部专用RNG，materialize独立global64 accumulation，FSDP2只在末micro同步，所有finite门禁通过后才optimizer.step，成功G再EMA并commit时钟。
+- global mean backward使用`local_numerator * world_size / global_count`补偿FSDP平均归约；每个micro立即backward且只保留一个micro activation，符合global numerator/count与内存边界设计。该结论仍需审计不等数count、no-sync和真实FSDP API测试是否覆盖。
+- nonfinite重试只覆盖optimizer前失败并恢复sampler/loader/rollout/t/noise/exit/branch及Python/NumPy/CPU/CUDA RNG；optimizer后参数非finite明确不可rollback并抛错，要求从上一个完整checkpoint恢复。训练入口异常会重新抛出，不会伪装成功。
+- 推理审计初报曾把`exit_step=3`未调用最后一次`scheduler.step`列为P0；用真实FlowUniPC K4对多组随机tensor复验后更正：末步目标sigma=0时solver输出与raw `x0_pred=x-sigma*v` bitwise一致，且当前路径已执行4次DiT，因此无数值少步。仍需显式`generate_full_episode()`与真实scheduler parity/trace测试，避免部署语义依赖训练exit API。
+- 原生K2 timetable确认为`(999,833)→0`，不能截取K4的`(999,937)`；当前rollout `_validate_contract`和`_new_scheduler`硬锁K4/C8/W16/S1，说明任务书要求的C4/K2/S4/S8通用接口尚未实现。
+- metrics/plot独立审计发现2个P1：child JSONL lineage可写`logical_substep_id < resume boundary`并覆盖已提交父历史；plotter的complete终点/phase marker只信任重复metadata，没有与真实`resolved_config`交叉验证，篡改为G1/F5仍能把单cycle标为complete。
+- 另有明确P2：完整换行终止的坏JSON尾行被误当“截断尾行”静默删掉；producer→plotter测试是手写字段而非Trainer真实producer；绘图后才重读JSONL计算hash导致partial run图与hash可能来自不同快照；time_breakdown缺少raw低alpha曲线。这些都有明确修复契约。
+- timing closure当前validator只验证`parts + closure == wall`恒等式，能接受closure占wall 100%。仓库/任务书没有数值阈值；建议采用`abs(closure) <= max(0.1s, 5% * step_seconds_max)`，已按用户“不可臆断”要求暂停并询问。
+- 用户已确认采用`abs(timing_closure_error_seconds) <= max(0.1s, 0.05 * step_seconds_max)`；该值成为共享metrics writer/reader/test的权威门禁，不改变训练算法或loss。
+- trainer/checkpoint终审无P0，但确认6个必须修复的P1：A24同点无法按B0/B1合法分叉；rename后marker前崩溃会让latest拒绝回退完整旧点；resume不校验AdamW锁定超参；rank0 RNG验证会实例化其他rank CUDA generator；`_SUCCESS`前的sampler/EMA/provenance验证弱于真实loader；缺少真实FSDP2 sync/no-sync梯度parity门禁。
+- trainer/checkpoint另有3个P2：生产provenance未保存代码版本；nonfinite精确重放测试只覆盖未被Trainer使用的transaction helper；写入checkpoint的RNG快照捕获晚于LoRA/optimizer/EMA gather，可能让continued与resumed下一draw分叉。pending live-state只写常量false且重复loader RNG未交叉校验列为P3。
+- 已确认正确的trainer核心不变量不重写：严格5F→G→EMA→commit、B1概率、G40 EMA、rank0 CPU branch RNG+broadcast、global-mean缩放、末micro同步与optimizer角色隔离均与规格一致。
+- inference终审确认P0交付缺口：尚无Stage‑2 inference config/runner/shell、EMA-only generator加载、96/192帧decode、技术trace/manifest/index；legacy causal pipeline具有双CFG cache和旧commit/continuation语义，禁止代用。正确实现必须复用`pipeline/stage2_rollout.py`。
+- inference core需新增纯派生profile/spec、K2/K4真实scheduler、显式`generate_full_episode()`、S4/S8 episode1 detached prefix snapshot与episode2 restore、逐sample/chunk trace；single/two orchestration分别decode `[sink,A24]`/`[sink,B24]`并丢弃各自pixel frame0，双动作拼为192帧。
+- 用户已裁决双动作noise语义：每个样本在显式seed上只初始化一次RNG并连续生成48个temporal noise slots，A使用前24、B使用后24；B前不得重置同seed，因此A/B随机起点不同，同时同一`(sample, seed)`可确定性复现。trace需保存总/A/B noise hash，测试需证明batch大小与rank分片不改变映射。
+- 用户已裁决正式动作数量以当前内网冻结资产为准：`head_tilt_and_wink=198`、`jump=202`、`play_with_a_cat_wand=200`；任务书旧的均分口径废止，配置、cache门禁、sampler、测试与runbook只接受这一组精确映射。
+- 最终推理链已新增strict config identity并贯穿跨rank startup、sample trace、resume与manifest；identity绑定checkpoint/architecture/T5/tokenizer/VAE/metadata/output/profile/seeds/runtime的canonical resolved配置及contract/launch hash，任一rank或旧产物漂移均fail closed。
+- 真实Wan VAE encoder固定返回FP32；runtime现先验证FP32 raw latent的shape/device/finite，再显式转换为contiguous BF16交给rollout，避免正式推理首样本必失败。
+- 完整内网runbook必须把prepare/smoke/formal/plot/inference输出放在checkout外；prepare默认工作根已迁出仓库，正式推理在任何模型加载前拒绝checkout内output root和dirty Git。
+- metrics修复代理中断前没有修改production或test文件；当前工作树只有step3075/planning及用户原有资产改动，可以从红测开始安全恢复。
+- Phase 15最终结论：正式动作分布只接受`head_tilt_and_wink=198`、`jump=202`、`play_with_a_cat_wand=200`；所有Stage‑2 Generator初始化/manifest/文件名只接受Stage‑1 step3075。人工fixture里的均分200和独立Stage‑1 step3750实验不属于正式Stage‑2契约，不能机械替换。
+- checkpoint/resume最终采用双层身份：research contract允许A24/G240同点分叉B0/B1，G240之后严格绑定arm；explicit G240是immutable ancestry anchor，本地child必须逐边以canonical parent path和manifest SHA证明可达。checkpoint内认证的metrics JSONL前缀解决了外部分支空logdir与独立完整plot lineage。
+- C0/C1/C2不能只证明“能加载”：C0/C1保存无消费next-F1 probe，下一阶段首个F1按生产顺序重放sampler/exit/loader/rollout/timestep/noise/计数器后只消费一次；任何cycle出现nonfinite即使精确重试成功也不得通过smoke。
+- baseline部署推理使用Generator-only EMA快读路径，canonical EMA由同一bytes snapshot校验hash并反序列化；T5/tokenizer/VAE/architecture/Generator base由checkpoint绑定的source/role provenance认证。rank0只流式hash一次大资产，其余rank以stat identity在真实loader前后闭包，避免8倍大文件I/O。
+- inference identity必须区分四类hash：resolved contract/launch只描述解析配置，runtime contract/launch再加入已认证模型资产内容；output root只影响两种launch，资产内容只影响两种runtime。沿用同名但不同含义的两个hash会破坏审计，现exact-schema已拒绝旧键。
+- 正式双动作noise不是A/B重置同seed：每个sample seed只初始化一次generator并一次产生连续48 slots，A/B分别使用前/后24，因此起点独立且`(sample,seed)`确定复现，不受batch/rank-stride分片影响。
+- 8个named rollout profiles复用唯一episode kernel；K4为`999,937,833,624`，原生K2为`999,833`。部署最后一步直接采用raw x0以保持训练exit bit pattern；不能声称BF16额外terminal scheduler step bitwise相等。C4/K2/S4/S8目前是技术压力接口，不是已训练的部署适配结论。
+- 推理sample落盘前必须完成runtime assets、config/code/metadata/plan、Generator checkpoint和全部已有video+trace pair的全rank共识。output root还需固定canonical dev/inode/mode；root被换成symlink或同路径新目录时必须在创建child前拒绝，manifest继续作为最后commit marker。
+- 本地最终动态证据为Stage‑2 656 passed、仓库正式tests 964 passed及2 subtests；14条warning均为既有TorchScript弃用提示。两路独立最终审计均为P0=0、P1=0。真实8×H100新版CHECK6、C0/C1/C2、B1/B0训练、绘图、56视频和人工质量仍是外部验收，不能用本地结果替代。
+- 全工作树diff检查唯一已知例外是用户既有`training_sets/metadata_600clips_480x832_buckets.csv`的CRLF/trailing whitespace；该文件当前也不是正式600条内网资产。为保护用户数据不擅自改行尾或补记录，代码/文档范围单独执行whitespace门禁并在交付中明示。
+
+## 2026-08-13 Phase 14：Stage‑2 F25 latent 专用重提
+
+- Stage‑1配置的93是像素帧数，VAE输出是F24；Stage‑2必须固定读取像素帧0..96共97帧并输出F25，训练只取`video_latent[1:25]`作为24个真实未来目标。
+- 新入口复用仓库已有`prepare_stage2_i2v_f25_cache.py`，它会从旧F24逐样本重新编码97帧并要求新F25前24帧与旧F24逐位相同；禁止padding、复制或截断。
+- F25输出目录必须独立于旧Stage‑1 cache；YAML的`source_cache_manifest`指向新F25的`cache_manifest.attested.json`，`cache_dir`指向F25目录，negative字段指向独立negative目录内的manifest。
+- 已确认的数据策略：F25迁移继续使用生成旧Stage‑1 cache时完全相同的六列metadata；动作标签使用独立`video,action_id` sidecar，video字符串必须与metadata逐字相同。
+- 当前本地`metadata_600clips_480x832_buckets_action.csv`与`action_labels_600cats.csv`都只有1条，不能用于正式运行；七列metadata还会改变row hash，不能替换旧cache绑定的六列metadata。
+- 专用脚本先做CPU级600条、动作数`198/202/200`、路径对应与manifest兼容预检，再允许8×H100 VAE重提；最终依次产生F25 base、attested source、negative conditioning和`stage2_i2v_manifest.json`，不加载DiT或启动训练。
+- 正式cache manifest绑定完整launch hash，因此专用脚本使用与`prepare_stage2.sh`相同的architecture/generator/teacher默认路径环境，防止缓存完成后因模型路径不同而被训练启动门禁拒绝。
+- F25逐行产物与completion sidecar支持安全断点续跑；attested/negative/final manifest存在时会重新严格验证，negative半成品目录会fail closed。
+- 最终验证：新增6项入口/输入测试通过；完整`tests/test_stage2_*.py`为443 passed、14条既有TorchScript弃用警告；Black、Ruff、py_compile、bash syntax与whitespace检查通过。
+
+## 2026-08-12 Phase 13：前5项检查一键化
+
+- 用户明确只做正式训练前前5项，要求删除操作层面的冗长说明。
+- 最小用户接口应是一个`prepare_stage2.sh`：顶部集中路径，单命令执行，成功只认`CHECK_1_TEACHER_PASS`到`CHECK_5_ROLE_INIT_PASS`。
+- C0/C1/C2、正式训练、resume和plot全部移出本轮简版手册；它们的生产代码不删除。
+- 昂贵F25和模型merge允许在严格复核后复用；只存在一半的产物或验证失败必须停止，不能自动覆盖。
+- `prepare_stage2.sh` 从脚本所在clean checkout执行，并把产物限制在仓库外工作根；依次执行teacher、step3075 EMA Generator、配置、数据、role init和真实FSDP2六个gate，不会调用训练入口。
+- teacher仍直接使用原始双向native checkpoint目录；`provenance.source_sha256`绑定完整DiffSynth `merge_manifest.json`文件SHA，不使用其内部`merged_state_sha256`。
+- 数据gate调用仓库真实F25、`upgrade-source-manifest`、`prepare-negative`和正式audit CLI；negative正式文件名为`negative_conditioning_manifest.json`。
+- 极简文档只有43行，保留动作标签要求、两个必需export、可选路径覆盖、单命令和最终PASS列表。
+
 ## 2026-08-11 Phase 12：real-score manifest 后的 Stage-2 H100 指南重生成
 
 - 用户要求一次性重生成 teacher manifest 之后的全部操作指导，不能只修正 manifest 生成段。

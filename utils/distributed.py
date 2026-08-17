@@ -1,9 +1,10 @@
 from datetime import timedelta
 from contextlib import contextmanager
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 import inspect
+import math
 import os
 import re
 import socket
@@ -779,6 +780,274 @@ def _parameter_shard_metadata(parameter: torch.Tensor) -> dict[str, Any]:
     return metadata
 
 
+def validate_trainable_sharded_ema_state_dict(
+    state_dict: Mapping[str, Any],
+    *,
+    expected_rank: int | None = None,
+    expected_world_size: int | None = None,
+    expected_decay: float | None = None,
+    expected_start_step: int | None = None,
+    expected_completed_step: int | None = None,
+    expected_initialized: bool | None = None,
+    expected_topology: Mapping[str, Any] | None = None,
+    expected_parameter_names: set[str] | None = None,
+) -> dict[str, Any]:
+    """Validate the complete portable schema of a sharded EMA checkpoint.
+
+    This deliberately does not require a live module.  It is therefore safe to
+    run on rank 0 for every rank's CPU payload before publishing ``_SUCCESS``;
+    :meth:`TrainableShardedEMA.load_state_dict` adds the final comparison with
+    the live DTensor shard layout.
+    """
+
+    required = {
+        "schema_version",
+        "decay",
+        "start_step",
+        "last_completed_step",
+        "initialized",
+        "rank",
+        "world_size",
+        "topology",
+        "local_shapes",
+        "global_shapes",
+        "shard_metadata",
+        "shadow",
+    }
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("EMA state must be a mapping")
+    state = dict(state_dict)
+    missing = sorted(required - set(state))
+    extra = sorted(set(state) - required)
+    if missing or extra:
+        raise ValueError(f"EMA state key mismatch: missing={missing}, extra={extra}")
+    if type(state["schema_version"]) is not int or state["schema_version"] != 2:
+        raise ValueError(f"unsupported EMA schema version: {state['schema_version']}")
+    if isinstance(state["decay"], bool) or not isinstance(state["decay"], (int, float)):
+        raise TypeError("EMA decay must be numeric")
+    decay = float(state["decay"])
+    if not 0.0 <= decay < 1.0:
+        raise ValueError(f"EMA decay must be in [0,1), got {decay}")
+    if expected_decay is not None and decay != float(expected_decay):
+        raise ValueError(
+            f"EMA decay mismatch: checkpoint={decay}, expected={expected_decay}"
+        )
+    if isinstance(state["start_step"], bool) or not isinstance(
+        state["start_step"], int
+    ):
+        raise TypeError("EMA start_step must be an integer")
+    start_step = state["start_step"]
+    if start_step < 1:
+        raise ValueError("EMA start_step must be >= 1")
+    if expected_start_step is not None and start_step != int(expected_start_step):
+        raise ValueError(
+            f"EMA start_step mismatch: checkpoint={start_step}, expected={expected_start_step}"
+        )
+    if (
+        isinstance(state["rank"], bool)
+        or not isinstance(state["rank"], int)
+        or isinstance(state["world_size"], bool)
+        or not isinstance(state["world_size"], int)
+    ):
+        raise TypeError("EMA rank/world_size must be integers")
+    rank = state["rank"]
+    world_size = state["world_size"]
+    if rank < 0 or world_size < 1 or rank >= world_size:
+        raise ValueError(f"EMA rank/world_size is invalid: {rank}/{world_size}")
+    if expected_rank is not None and rank != int(expected_rank):
+        raise ValueError(
+            f"EMA rank mismatch: checkpoint={rank}, expected={expected_rank}"
+        )
+    if expected_world_size is not None and world_size != int(expected_world_size):
+        raise ValueError(
+            "EMA world_size mismatch: "
+            f"checkpoint={world_size}, expected={expected_world_size}"
+        )
+    if not isinstance(state["topology"], Mapping):
+        raise TypeError("EMA topology must be a mapping")
+    topology = dict(state["topology"])
+    if expected_topology is not None and topology != dict(expected_topology):
+        raise ValueError(
+            f"EMA logical topology mismatch: checkpoint={topology}, "
+            f"expected={dict(expected_topology)}"
+        )
+
+    def shapes(value: Any, label: str) -> dict[str, tuple[int, ...]]:
+        if not isinstance(value, Mapping) or not value:
+            raise TypeError(f"EMA {label} must be a non-empty mapping")
+        result: dict[str, tuple[int, ...]] = {}
+        for raw_name, raw_shape in value.items():
+            if not isinstance(raw_name, str) or not raw_name:
+                raise TypeError(f"EMA {label} names must be non-empty strings")
+            if isinstance(raw_shape, (str, bytes)) or not isinstance(
+                raw_shape, (tuple, list)
+            ):
+                raise TypeError(f"EMA {label}[{raw_name!r}] must be a shape sequence")
+            shape = tuple(raw_shape)
+            if any(
+                isinstance(dimension, bool)
+                or not isinstance(dimension, int)
+                or dimension < 0
+                for dimension in shape
+            ):
+                raise ValueError(
+                    f"EMA {label}[{raw_name!r}] contains invalid dimensions"
+                )
+            result[raw_name] = shape
+        return result
+
+    local_shapes = shapes(state["local_shapes"], "local_shapes")
+    global_shapes = shapes(state["global_shapes"], "global_shapes")
+    names = set(local_shapes)
+    if set(global_shapes) != names:
+        raise ValueError("EMA local/global shape names differ")
+    if expected_parameter_names is not None and names != set(expected_parameter_names):
+        raise ValueError(
+            "EMA parameter names mismatch: "
+            f"missing={sorted(set(expected_parameter_names) - names)}, "
+            f"extra={sorted(names - set(expected_parameter_names))}"
+        )
+    metadata = state["shard_metadata"]
+    if not isinstance(metadata, Mapping) or set(metadata) != names:
+        raise ValueError("EMA shard_metadata names differ from shape names")
+    for name, raw_metadata in metadata.items():
+        if not isinstance(raw_metadata, Mapping):
+            raise TypeError("EMA shard_metadata values must be mappings")
+        item = dict(raw_metadata)
+        kind = item.get("kind")
+        base_keys = {"kind", "global_shape", "local_shape", "dtype"}
+        dtensor_keys = {
+            "mesh_device_type",
+            "mesh_dim_names",
+            "mesh_shape",
+            "rank_layout",
+            "coordinate",
+            "placements",
+        }
+        expected_keys = base_keys | (dtensor_keys if kind == "dtensor" else set())
+        if kind not in {"tensor", "dtensor"} or set(item) != expected_keys:
+            raise ValueError(f"EMA shard_metadata schema mismatch for {name!r}")
+        if tuple(item["global_shape"]) != global_shapes[name]:
+            raise ValueError(f"EMA shard global_shape mismatch for {name!r}")
+        if tuple(item["local_shape"]) != local_shapes[name]:
+            raise ValueError(f"EMA shard local_shape mismatch for {name!r}")
+        if item["dtype"] != "torch.float32":
+            raise TypeError(f"EMA shard {name!r} must describe FP32 trainables")
+        if expected_world_size is not None and int(expected_world_size) > 1:
+            if kind != "dtensor":
+                raise ValueError(
+                    f"EMA shard {name!r} must be DTensor for distributed topology"
+                )
+        if kind != "dtensor":
+            continue
+        if (
+            not isinstance(item["mesh_device_type"], str)
+            or not item["mesh_device_type"]
+        ):
+            raise TypeError("EMA DTensor mesh_device_type must be a non-empty string")
+        mesh_names = tuple(item["mesh_dim_names"])
+        mesh_shape = tuple(item["mesh_shape"])
+        placements = tuple(item["placements"])
+        coordinate = item["coordinate"]
+        if (
+            not mesh_names
+            or len(mesh_names) != len(mesh_shape)
+            or len(placements) != len(mesh_shape)
+            or any(
+                not isinstance(dimension, int)
+                or isinstance(dimension, bool)
+                or dimension < 1
+                for dimension in mesh_shape
+            )
+            or math.prod(mesh_shape) != world_size
+        ):
+            raise ValueError("EMA DTensor mesh schema is inconsistent with world_size")
+        if expected_topology is not None and "mesh_dim_names" in expected_topology:
+            if mesh_names != tuple(expected_topology["mesh_dim_names"]):
+                raise ValueError("EMA DTensor mesh_dim_names mismatch")
+
+        def flatten_layout(value: Any) -> list[int]:
+            if isinstance(value, bool):
+                raise TypeError("EMA DTensor rank_layout cannot contain booleans")
+            if isinstance(value, int):
+                return [value]
+            if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+                raise TypeError("EMA DTensor rank_layout must be nested integers")
+            flattened: list[int] = []
+            for child in value:
+                flattened.extend(flatten_layout(child))
+            return flattened
+
+        layout = flatten_layout(item["rank_layout"])
+        if sorted(layout) != list(range(world_size)):
+            raise ValueError(
+                "EMA DTensor rank_layout must contain every rank exactly once"
+            )
+        if coordinate is None:
+            raise ValueError("EMA DTensor shard is missing its mesh coordinate")
+        coordinate = tuple(coordinate)
+        if len(coordinate) != len(mesh_shape) or any(
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+            or index >= mesh_shape[axis]
+            for axis, index in enumerate(coordinate)
+        ):
+            raise ValueError("EMA DTensor coordinate is invalid")
+        if any(not isinstance(value, str) or not value for value in placements):
+            raise TypeError("EMA DTensor placements must be non-empty strings")
+
+    initialized = state["initialized"]
+    if type(initialized) is not bool:
+        raise TypeError("EMA initialized must be bool")
+    if expected_initialized is not None and initialized is not expected_initialized:
+        raise ValueError(
+            f"EMA initialized mismatch: checkpoint={initialized}, "
+            f"expected={expected_initialized}"
+        )
+    last_completed = state["last_completed_step"]
+    if last_completed is not None:
+        if isinstance(last_completed, bool) or not isinstance(last_completed, int):
+            raise TypeError("EMA last_completed_step must be an integer or None")
+        if last_completed < 1:
+            raise ValueError("EMA last_completed_step must be >= 1")
+    if expected_completed_step is not None and last_completed != int(
+        expected_completed_step
+    ):
+        raise ValueError(
+            "EMA last_completed_step mismatch: "
+            f"checkpoint={last_completed}, expected={expected_completed_step}"
+        )
+    if initialized and (last_completed is None or last_completed < start_step):
+        raise ValueError("initialized EMA state has an invalid last_completed_step")
+    if not initialized and last_completed is not None and last_completed >= start_step:
+        raise ValueError("uninitialized EMA state reached or passed start_step")
+
+    shadows = state["shadow"]
+    if not isinstance(shadows, Mapping):
+        raise TypeError("EMA shadow must be a mapping")
+    expected_shadow_names = names if initialized else set()
+    if set(shadows) != expected_shadow_names:
+        raise ValueError(
+            "EMA shadow key mismatch: "
+            f"missing={sorted(expected_shadow_names - set(shadows))}, "
+            f"extra={sorted(set(shadows) - expected_shadow_names)}"
+        )
+    for name, value in shadows.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"EMA shadow {name!r} is not a tensor")
+        if value.device.type != "cpu" or value.dtype != torch.float32:
+            raise TypeError(f"EMA shadow {name!r} must be CPU FP32")
+        if tuple(value.shape) != local_shapes[name]:
+            raise ValueError(
+                f"EMA shadow shape mismatch for {name}: "
+                f"expected={local_shapes[name]}, actual={tuple(value.shape)}"
+            )
+        if value.numel() and not bool(torch.isfinite(value).all().item()):
+            raise ValueError(f"EMA shadow {name!r} contains non-finite values")
+    return state
+
+
 class TrainableShardedEMA:
     """CPU FP32 EMA over only the local trainable LoRA parameter shards.
 
@@ -1055,40 +1324,16 @@ class TrainableShardedEMA:
     def load_state_dict(
         self, state_dict: Mapping[str, Any], module: torch.nn.Module
     ) -> None:
-        required = {
-            "schema_version",
-            "decay",
-            "start_step",
-            "last_completed_step",
-            "initialized",
-            "rank",
-            "world_size",
-            "topology",
-            "local_shapes",
-            "global_shapes",
-            "shard_metadata",
-            "shadow",
-        }
-        missing = sorted(required - set(state_dict))
-        extra = sorted(set(state_dict) - required)
-        if missing or extra:
-            raise ValueError(
-                f"EMA state key mismatch: missing={missing}, extra={extra}"
-            )
-        if int(state_dict["schema_version"]) != self.schema_version:
-            raise ValueError(
-                f"unsupported EMA schema version: {state_dict['schema_version']}"
-            )
-        if float(state_dict["decay"]) != self.decay:
-            raise ValueError(
-                f"EMA decay mismatch: checkpoint={state_dict['decay']}, current={self.decay}"
-            )
-        if int(state_dict["start_step"]) != self.start_step:
-            raise ValueError(
-                "EMA start_step mismatch: "
-                f"checkpoint={state_dict['start_step']}, current={self.start_step}"
-            )
         rank, world_size = self._rank_and_world_size()
+        validate_trainable_sharded_ema_state_dict(
+            state_dict,
+            expected_rank=rank,
+            expected_world_size=world_size,
+            expected_decay=self.decay,
+            expected_start_step=self.start_step,
+            expected_topology=self.topology,
+            expected_parameter_names=set(self.local_shapes),
+        )
         if (
             int(state_dict["rank"]) != rank
             or int(state_dict["world_size"]) != world_size

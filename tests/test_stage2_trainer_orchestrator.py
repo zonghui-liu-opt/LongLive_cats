@@ -1,23 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import random
+import copy
 from collections import OrderedDict
 from contextlib import nullcontext
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
 
-from trainer.stage2_distillation import Trainer
 import trainer.stage2_distillation as trainer_module
 import utils.distributed as distributed_utils
 import utils.stage2_checkpoint as stage2_checkpoint
 import utils.stage2_metrics as stage2_metrics
-from utils.stage2_config import load_stage2_config
-from utils.stage2_train_state import Stage2TrainingSchedule, Stage2TrainingState
 import utils.stage2_train_state as train_state_module
+from trainer.stage2_distillation import Trainer
+from utils.stage2_config import load_stage2_config
+from utils.stage2_sampler import build_stage2_role_samplers
+from utils.stage2_train_state import Stage2TrainingSchedule, Stage2TrainingState
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "train_i2v_stage2_600cats.yaml"
 
@@ -41,6 +46,317 @@ def _bare_trainer(**attributes):
     for name, value in attributes.items():
         setattr(trainer, name, value)
     return trainer
+
+
+def _sampler_state(*, completed_f: int, completed_g: int):
+    actions = ("a", "b", "c")
+    streams = build_stage2_role_samplers(
+        [action for action in actions for _ in range(200)],
+        [(30, 52)] * 600,
+        action_order=actions,
+        base_seed=17,
+    )
+    for _ in range(completed_f):
+        streams.fake_score.next_global_batch()
+    for _ in range(completed_g):
+        streams.generator.next_global_batch()
+    return streams.state_dict()
+
+
+def _next_f1_probe_trainer(*, smoke_mode="C1"):
+    from pipeline.stage2_rollout import Stage2ExitRNGStreams
+
+    resolved = load_stage2_config(CONFIG_PATH)
+    schedule = Stage2TrainingSchedule.from_resolved_config(resolved)
+    state = Stage2TrainingState()
+    for substep in ("F1", "F2", "F3", "F4", "F5"):
+        state.commit_successful_fake_update(substep, schedule=schedule)
+    state.commit_successful_generator_update(
+        ema_action=schedule.expected_ema_action(1),
+        schedule=schedule,
+    )
+    actions = ("a", "b", "c")
+    spatial_shapes = [(30, 52)] * 600
+    samplers = build_stage2_role_samplers(
+        [action for action in actions for _ in range(200)],
+        spatial_shapes,
+        action_order=actions,
+        base_seed=resolved.training_seed,
+        microbatch_size_per_device=resolved.microbatch_size_per_device,
+    )
+    for _ in range(state.completed_f):
+        samplers.fake_score.next_global_batch()
+    for _ in range(state.completed_g):
+        samplers.generator.next_global_batch()
+    dataloader_generators = {
+        role: torch.Generator(device="cpu").manual_seed(seed)
+        for role, seed in (("fake_score", 101), ("generator", 102))
+    }
+    dedicated_generators = {
+        f"{role}_{kind}": torch.Generator(device="cpu").manual_seed(seed)
+        for role, base in (("fake_score", 200), ("generator", 300))
+        for kind, seed in zip(("rollout", "timestep", "noise"), range(base, base + 3))
+    }
+    return _bare_trainer(
+        resolved=resolved,
+        schedule=schedule,
+        state=state,
+        options=SimpleNamespace(smoke_mode=smoke_mode),
+        rank=0,
+        world_size=8,
+        is_main_process=True,
+        device=torch.device("cpu"),
+        dataset=SimpleNamespace(spatial_shapes=spatial_shapes),
+        samplers=samplers,
+        dataloader_generators=dataloader_generators,
+        dedicated_generators=dedicated_generators,
+        exit_rng=Stage2ExitRNGStreams(resolved.training_seed),
+        branch_rng=torch.Generator(device="cpu").manual_seed(401),
+        resume_payload=None,
+        _smoke_parent_probe_consumed=False,
+    )
+
+
+def test_next_f1_probe_predicts_exact_draws_without_consuming_any_state():
+    from utils.stage2_sampler import partition_stage2_global_batch
+    from utils.stage2_score_math import sample_stage2_score_timesteps
+
+    trainer = _next_f1_probe_trainer()
+    snapshot = trainer._snapshot_attempt()
+    before = trainer._attempt_state_sha256(snapshot)
+
+    probe = trainer._capture_next_f1_probe()
+
+    assert trainer._attempt_state_sha256(trainer._snapshot_attempt()) == before
+    assert probe["schema"] == "longlive_stage2_next_f1_probe/v1"
+    assert probe["state"] == {
+        "next_substep": "F1",
+        "current_role": "fake_score",
+        "completed_fake_updates": 5,
+        "completed_generator_updates": 1,
+        "completed_cycles": 1,
+        "successful_attempts": 6,
+        "nonfinite_attempts": 0,
+        "nonfinite_attempts_by_role": {"generator": 0, "fake_score": 0},
+    }
+    assert probe["sampler"]["completed_batches"] == 5
+    assert probe["sampler"]["batch_cursor"] == 5
+    assert len(probe["sampler"]["global_batch_ids"]) == 64
+    assert sorted(probe["exit_schedule"]) == [0, 1, 2, 3]
+    assert [payload["rank"] for payload in probe["rank_payloads"]] == [0]
+    rank_payload = probe["rank_payloads"][0]
+    assert rank_payload["attempt_state_sha256"] == before
+    assert set(rank_payload["stream_state_sha256"]) == {
+        "fake_score_loader",
+        "fake_score_exit",
+        "fake_score_rollout",
+        "fake_score_timestep",
+        "fake_score_noise",
+    }
+    assert len(rank_payload["microbatches"]) == 4
+
+    # Independently replay the production draw order from the saved boundary:
+    # sampler -> exit -> per-micro rollout noise -> timestep -> score epsilon.
+    trainer._restore_attempt(snapshot)
+    global_batch = trainer.samplers.fake_score.next_global_batch()
+    local_microbatches = partition_stage2_global_batch(
+        global_batch,
+        rank=trainer.rank,
+        world_size=trainer.world_size,
+        microbatch_size_per_device=trainer.resolved.microbatch_size_per_device,
+        gradient_accumulation_steps=trainer.resolved.gradient_accumulation_steps,
+        spatial_shapes=trainer.dataset.spatial_shapes,
+    )
+    exits = trainer.exit_rng.draw(
+        "fake_score",
+        accumulation_steps=trainer.resolved.gradient_accumulation_steps,
+        num_denoising_steps=trainer.resolved.num_denoising_steps,
+        mode=trainer.resolved.exit_sampling,
+        device=trainer.device,
+        synchronize_ranks=True,
+    )
+    assert list(global_batch) == probe["sampler"]["global_batch_ids"]
+    assert list(exits) == probe["exit_schedule"]
+    for sample_ids, predicted in zip(local_microbatches, rank_payload["microbatches"]):
+        shape = (
+            len(sample_ids),
+            trainer.resolved.generated_episode_frames,
+            trainer.resolved.latent_channels,
+            *trainer.dataset.spatial_shapes[sample_ids[0]],
+        )
+        rollout_noise = torch.randn(
+            shape,
+            device=trainer.device,
+            dtype=torch.bfloat16,
+            generator=trainer.dedicated_generators["fake_score_rollout"],
+        )
+        timesteps = sample_stage2_score_timesteps(
+            batch_size=len(sample_ids),
+            device=trainer.device,
+            generator=trainer.dedicated_generators["fake_score_timestep"],
+        )
+        score_noise = torch.randn(
+            shape,
+            device=trainer.device,
+            dtype=torch.float32,
+            generator=trainer.dedicated_generators["fake_score_noise"],
+        )
+        assert predicted == {
+            "sample_ids": list(sample_ids),
+            "spatial_shape": list(trainer.dataset.spatial_shapes[sample_ids[0]]),
+            "rollout_noise_sha256": trainer._tensor_sha256(rollout_noise),
+            "score_uniform_integers": timesteps.uniform_integer.tolist(),
+            "score_frame_timestep_sha256": trainer._tensor_sha256(
+                timesteps.frame_timestep
+            ),
+            "score_noise_sha256": trainer._tensor_sha256(score_noise),
+        }
+    trainer._restore_attempt(snapshot)
+    assert trainer._attempt_state_sha256(trainer._snapshot_attempt()) == before
+
+
+def test_resume_probe_accepts_exact_parent_then_rejects_every_bound_field():
+    trainer = _next_f1_probe_trainer()
+    state_before = trainer._attempt_state_sha256(trainer._snapshot_attempt())
+    expected = trainer._capture_next_f1_probe()
+    trainer.resume_payload = SimpleNamespace(
+        provenance={"smoke_probe": {"next_f1_probe": expected}}
+    )
+
+    trainer._verify_parent_next_f1_probe()
+
+    assert trainer._smoke_parent_probe_consumed is True
+    assert trainer._attempt_state_sha256(trainer._snapshot_attempt()) == state_before
+    trainer._capture_next_f1_probe = lambda: (_ for _ in ()).throw(
+        AssertionError("a consumed parent probe must never run twice")
+    )
+    trainer._verify_parent_next_f1_probe()
+
+    mutations = {
+        "counter": lambda value: value["state"].__setitem__(
+            "completed_fake_updates", 4
+        ),
+        "sampler state": lambda value: value["sampler"].__setitem__(
+            "state_sha256", "0" * 64
+        ),
+        "sampler cursor": lambda value: value["sampler"].__setitem__("batch_cursor", 4),
+        "batch id": lambda value: value["sampler"]["global_batch_ids"].__setitem__(
+            0, (value["sampler"]["global_batch_ids"][0] + 1) % 600
+        ),
+        "exit": lambda value: value["exit_schedule"].__setitem__(0, 9),
+        "attempt state": lambda value: value["rank_payloads"][0].__setitem__(
+            "attempt_state_sha256", "1" * 64
+        ),
+        "loader stream": lambda value: value["rank_payloads"][0][
+            "stream_state_sha256"
+        ].__setitem__("fake_score_loader", "2" * 64),
+        "exit stream": lambda value: value["rank_payloads"][0][
+            "stream_state_sha256"
+        ].__setitem__("fake_score_exit", "3" * 64),
+        "rollout stream": lambda value: value["rank_payloads"][0][
+            "stream_state_sha256"
+        ].__setitem__("fake_score_rollout", "4" * 64),
+        "timestep stream": lambda value: value["rank_payloads"][0][
+            "stream_state_sha256"
+        ].__setitem__("fake_score_timestep", "5" * 64),
+        "score-noise stream": lambda value: value["rank_payloads"][0][
+            "stream_state_sha256"
+        ].__setitem__("fake_score_noise", "6" * 64),
+        "rollout prediction": lambda value: value["rank_payloads"][0]["microbatches"][
+            0
+        ].__setitem__("rollout_noise_sha256", "7" * 64),
+        "timestep draw": lambda value: value["rank_payloads"][0]["microbatches"][0][
+            "score_uniform_integers"
+        ].__setitem__(0, 999),
+        "timestep projection": lambda value: value["rank_payloads"][0]["microbatches"][
+            0
+        ].__setitem__("score_frame_timestep_sha256", "8" * 64),
+        "score-noise prediction": lambda value: value["rank_payloads"][0][
+            "microbatches"
+        ][0].__setitem__("score_noise_sha256", "9" * 64),
+    }
+    trainer._capture_next_f1_probe = lambda: expected
+    for label, mutate in mutations.items():
+        tampered = copy.deepcopy(expected)
+        mutate(tampered)
+        trainer.resume_payload = SimpleNamespace(
+            provenance={"smoke_probe": {"next_f1_probe": tampered}}
+        )
+        trainer._smoke_parent_probe_consumed = False
+        with pytest.raises(RuntimeError, match="next F1 probe mismatch") as error:
+            trainer._verify_parent_next_f1_probe()
+        assert trainer._smoke_parent_probe_consumed is False
+        assert "mismatch" in str(error.value), label
+
+
+def test_resume_probe_requires_a_parent_probe_and_exact_f1_boundary():
+    trainer = _next_f1_probe_trainer()
+    trainer.resume_payload = SimpleNamespace(provenance={"smoke_probe": {}})
+    with pytest.raises(RuntimeError, match="parent has no next F1 probe"):
+        trainer._verify_parent_next_f1_probe()
+
+    trainer.state.next_substep = "F2"
+    with pytest.raises(RuntimeError, match="did not resume at F1"):
+        trainer._verify_parent_next_f1_probe()
+
+
+def test_c2_parent_probe_is_consumed_exactly_once():
+    trainer = _next_f1_probe_trainer(smoke_mode="C2")
+    expected = {"schema": "test-probe"}
+    calls = []
+    trainer.resume_payload = SimpleNamespace(
+        provenance={"smoke_probe": {"next_f1_probe": expected}}
+    )
+    trainer._capture_next_f1_probe = lambda: calls.append(True) or expected
+
+    trainer._verify_parent_next_f1_probe()
+    trainer._verify_parent_next_f1_probe()
+
+    assert calls == [True]
+    assert trainer._smoke_parent_probe_consumed is True
+
+
+@pytest.mark.parametrize(
+    ("gather_mode", "message"),
+    [
+        pytest.param("missing", "every rank payload", id="missing-ranks"),
+        pytest.param("duplicate", "incomplete or duplicated", id="duplicate-ranks"),
+    ],
+)
+def test_next_f1_probe_rejects_incomplete_distributed_rank_payloads(
+    monkeypatch, gather_mode, message
+):
+    trainer = _next_f1_probe_trainer()
+    trainer.resolved = SimpleNamespace(
+        microbatch_size_per_device=2,
+        gradient_accumulation_steps=4,
+        generated_episode_frames=1,
+        latent_channels=1,
+        num_denoising_steps=4,
+        exit_sampling="stratified_uniform",
+    )
+    trainer._runtime_world_checked = lambda _label, callback: callback()
+    trainer._world_consensus = bool
+
+    monkeypatch.setattr(trainer_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trainer_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_module.dist, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(trainer_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        trainer_module.dist, "broadcast", lambda *_args, **_kwargs: None
+    )
+
+    def all_gather_object(outputs, local):
+        if gather_mode == "missing":
+            outputs[0] = local
+        else:
+            for index in range(len(outputs)):
+                outputs[index] = copy.deepcopy(local)
+
+    monkeypatch.setattr(trainer_module.dist, "all_gather_object", all_gather_object)
+
+    with pytest.raises(RuntimeError, match=message):
+        trainer._capture_next_f1_probe()
 
 
 @pytest.mark.parametrize(
@@ -109,6 +425,211 @@ def test_c0_smoke_rejects_an_explicit_resume_checkpoint(tmp_path):
 
     with pytest.raises(RuntimeError, match="C0 must start from the cold"):
         trainer._discover_resume_checkpoint()
+
+
+def _branch_resume_trainer(tmp_path, anchor):
+    return _bare_trainer(
+        resolved=SimpleNamespace(
+            resume_stage2_checkpoint=str(anchor),
+            contract_hash=lambda: "a" * 64,
+            phase_b_mode="dmd_only",
+            fsdp_backend="fully_shard",
+            microbatch_size_per_device=2,
+            gradient_accumulation_steps=4,
+            global_batch_size=64,
+        ),
+        options=SimpleNamespace(
+            output_dir=tmp_path,
+            auto_resume=True,
+            smoke_mode=None,
+        ),
+        world_size=8,
+    )
+
+
+def _write_branch_lineage(path, *, parent, parent_sha256):
+    from utils.stage1_io import canonical_json_sha256
+
+    path.mkdir(parents=True)
+    provenance = {
+        "lineage": {
+            "parent_checkpoint": None if parent is None else str(parent.resolve()),
+            "parent_checkpoint_manifest_sha256": parent_sha256,
+        }
+    }
+    (path / "provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+    return canonical_json_sha256(provenance)
+
+
+def test_explicit_a24_is_used_when_branch_output_has_no_local_checkpoint(
+    monkeypatch, tmp_path
+):
+    anchor = tmp_path / "parent" / "checkpoint_stage2_g000240"
+    trainer = _branch_resume_trainer(tmp_path / "b0", anchor)
+    monkeypatch.setattr(
+        stage2_checkpoint, "find_latest_stage2_checkpoint", lambda _root: None
+    )
+
+    assert trainer._discover_resume_checkpoint() == anchor.resolve()
+
+
+def test_explicit_a24_becomes_anchor_for_strict_local_child_auto_resume(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "b0"
+    anchor = tmp_path / "b1" / "checkpoint_stage2_g000240"
+    g250 = output / "checkpoint_stage2_g000250"
+    g260 = output / "checkpoint_stage2_g000260"
+    anchor.mkdir(parents=True)
+    hashes = {
+        anchor.resolve(): "1" * 64,
+        g250.resolve(): "2" * 64,
+        g260.resolve(): "3" * 64,
+    }
+    provenance_hashes = {
+        g250.resolve(): _write_branch_lineage(
+            g250, parent=anchor, parent_sha256=hashes[anchor.resolve()]
+        ),
+        g260.resolve(): _write_branch_lineage(
+            g260, parent=g250, parent_sha256=hashes[g250.resolve()]
+        ),
+    }
+    trainer = _branch_resume_trainer(output, anchor)
+    monkeypatch.setattr(
+        stage2_checkpoint, "find_latest_stage2_checkpoint", lambda _root: g260
+    )
+    validated = []
+
+    def validate(path, **expected):
+        path = Path(path).resolve()
+        validated.append(path)
+        assert expected["expected_contract_hash"] == "a" * 64
+        assert expected["expected_phase_b_mode"] == "dmd_only"
+        assert expected["expected_topology"] == trainer._checkpoint_topology()
+        return {
+            "manifest_sha256": hashes[path],
+            "provenance_sha256": provenance_hashes.get(path, "f" * 64),
+        }
+
+    monkeypatch.setattr(stage2_checkpoint, "validate_stage2_checkpoint", validate)
+
+    assert trainer._discover_resume_checkpoint() == g260.resolve()
+    assert validated == [g260.resolve(), g250.resolve(), anchor.resolve()]
+
+
+@pytest.mark.parametrize("corruption", ["unrelated_parent", "parent_hash"])
+def test_explicit_branch_anchor_rejects_unrelated_or_drifted_local_lineage(
+    monkeypatch, tmp_path, corruption
+):
+    output = tmp_path / "b0"
+    anchor = tmp_path / "b1" / "checkpoint_stage2_g000240"
+    unrelated = tmp_path / "other" / "checkpoint_stage2_g000240"
+    child = output / "checkpoint_stage2_g000250"
+    anchor.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    parent = unrelated if corruption == "unrelated_parent" else anchor
+    parent_hash = "9" * 64 if corruption == "parent_hash" else "4" * 64
+    provenance_hash = _write_branch_lineage(
+        child,
+        parent=parent,
+        parent_sha256=parent_hash,
+    )
+    trainer = _branch_resume_trainer(output, anchor)
+    monkeypatch.setattr(
+        stage2_checkpoint, "find_latest_stage2_checkpoint", lambda _root: child
+    )
+    manifests = {
+        child.resolve(): {
+            "manifest_sha256": "2" * 64,
+            "provenance_sha256": provenance_hash,
+        },
+        anchor.resolve(): {
+            "manifest_sha256": "1" * 64,
+            "provenance_sha256": "e" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        stage2_checkpoint,
+        "validate_stage2_checkpoint",
+        lambda path, **_expected: manifests[Path(path).resolve()],
+    )
+
+    match = "left --logdir" if corruption == "unrelated_parent" else "hash drifted"
+    with pytest.raises(RuntimeError, match=match):
+        trainer._discover_resume_checkpoint()
+
+
+def test_incomplete_newer_branch_directory_does_not_mask_complete_child(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "b0"
+    anchor = tmp_path / "b1" / "checkpoint_stage2_g000240"
+    child = output / "checkpoint_stage2_g000250"
+    incomplete = output / "checkpoint_stage2_g000260"
+    anchor.mkdir(parents=True)
+    incomplete.mkdir(parents=True)
+    provenance_hash = _write_branch_lineage(
+        child,
+        parent=anchor,
+        parent_sha256="1" * 64,
+    )
+    trainer = _branch_resume_trainer(output, anchor)
+    # ``find_latest_stage2_checkpoint`` owns the committed-marker filter; this
+    # return value models its already-tested decision to ignore ``incomplete``.
+    monkeypatch.setattr(
+        stage2_checkpoint, "find_latest_stage2_checkpoint", lambda _root: child
+    )
+    manifests = {
+        child.resolve(): {
+            "manifest_sha256": "2" * 64,
+            "provenance_sha256": provenance_hash,
+        },
+        anchor.resolve(): {
+            "manifest_sha256": "1" * 64,
+            "provenance_sha256": "e" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        stage2_checkpoint,
+        "validate_stage2_checkpoint",
+        lambda path, **_expected: manifests[Path(path).resolve()],
+    )
+
+    assert trainer._discover_resume_checkpoint() == child.resolve()
+
+
+def test_metrics_lineage_resume_refuses_existing_nonprefix_or_changed_snapshot(
+    tmp_path,
+):
+    checkpoint = tmp_path / "checkpoint_stage2_g000240"
+    checkpoint.mkdir()
+    source = checkpoint / "metrics_lineage.jsonl"
+    snapshot = b'{"record_type":"run_start","run_id":"parent"}\n'
+    source.write_bytes(snapshot)
+    entry = {
+        "name": "metrics_lineage.jsonl",
+        "size": len(snapshot),
+        "sha256": hashlib.sha256(snapshot).hexdigest(),
+    }
+    payload = SimpleNamespace(
+        directory=checkpoint,
+        manifest={"files": [entry]},
+    )
+    destination = tmp_path / "child" / "metrics.jsonl"
+    destination.parent.mkdir()
+    destination.write_bytes(b'{"run_id":"unrelated"}\n')
+    trainer = _bare_trainer(
+        resolved=SimpleNamespace(jsonl_path=str(destination)),
+        options=SimpleNamespace(output_dir=destination.parent),
+    )
+
+    with pytest.raises(RuntimeError, match="exact authenticated metrics prefix"):
+        trainer._prepare_metrics_lineage(payload)
+
+    destination.unlink()
+    source.write_bytes(snapshot + b'{"tampered":true}\n')
+    with pytest.raises(RuntimeError, match="changed after checkpoint load"):
+        trainer._prepare_metrics_lineage(payload)
 
 
 @pytest.mark.parametrize(
@@ -186,11 +707,7 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
         "generator": torch.Generator().manual_seed(101).get_state(),
         "fake_score": torch.Generator().manual_seed(202).get_state(),
     }
-    sampler_state = {
-        "schema": "longlive_stage2_sampler_streams/v2",
-        "fake_score": {"role": "fake_score", "completed_batches": 10},
-        "generator": {"role": "generator", "completed_batches": 2},
-    }
+    sampler_state = _sampler_state(completed_f=10, completed_g=2)
     trainer_state = stage2_checkpoint.build_stage2_trainer_state(
         completed_generator_updates=2,
         completed_fake_updates=10,
@@ -230,6 +747,7 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
         expected_contract_hash,
         expected_world_size,
         expected_topology,
+        expected_phase_b_mode,
     ):
         load_calls.append(
             {
@@ -237,6 +755,7 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
                 "expected_contract_hash": expected_contract_hash,
                 "expected_world_size": expected_world_size,
                 "expected_topology": expected_topology,
+                "expected_phase_b_mode": expected_phase_b_mode,
             }
         )
         return payload
@@ -286,6 +805,7 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
             "expected_contract_hash": resolved.contract_hash(),
             "expected_world_size": 8,
             "expected_topology": trainer._checkpoint_topology(),
+            "expected_phase_b_mode": resolved.phase_b_mode,
         }
     ]
 
@@ -364,11 +884,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
         nonfinite_attempts_by_role={"generator": 2, "fake_score": 3},
     )
     state.validate(schedule)
-    sampler_state = {
-        "schema": "longlive_stage2_sampler_streams/v2",
-        "fake_score": {"role": "fake_score", "completed_batches": 10},
-        "generator": {"role": "generator", "completed_batches": 2},
-    }
+    sampler_state = _sampler_state(completed_f=10, completed_g=2)
     generator_loader = torch.Generator().manual_seed(601)
     fake_score_loader = torch.Generator().manual_seed(602)
     generator_rollout = torch.Generator().manual_seed(603)
@@ -380,8 +896,9 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
         "generator": generator_exit,
         "fake_score": fake_score_exit,
     }
-    generator_module = object()
-    fake_score_module = object()
+    generator_module = nn.Linear(1, 1)
+    fake_score_module = nn.Linear(1, 1)
+    real_score_module = nn.Linear(1, 1).requires_grad_(False)
     generator_optimizer = object()
     fake_score_optimizer = object()
     generator_schema = {"generator.lora": object()}
@@ -437,6 +954,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
         root,
         *,
         trainer_state,
+        metrics_lineage_snapshot,
         resolved_config,
         generator_module,
         fake_score_module,
@@ -456,6 +974,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
             {
                 "root": root,
                 "trainer_state": trainer_state,
+                "metrics_lineage_snapshot": metrics_lineage_snapshot,
                 "resolved_config": resolved_config,
                 "generator_module": generator_module,
                 "fake_score_module": fake_score_module,
@@ -484,12 +1003,16 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
         stage2_checkpoint, "build_stage2_trainer_state", capture_builder
     )
     monkeypatch.setattr(stage2_checkpoint, "save_stage2_checkpoint", capture_saver)
+    metric_path = tmp_path / "metrics" / "stage2.jsonl"
+    metric_path.parent.mkdir()
+    metric_path.write_bytes(b'{"record_type":"cycle_summary"}\n')
     trainer = _bare_trainer(
         state=state,
         schedule=schedule,
         resolved=resolved,
         options=SimpleNamespace(output_dir=tmp_path),
         logger=SimpleNamespace(run_id="checkpoint-run", next_attempt_index=41),
+        metric_path=metric_path,
         samplers=SimpleNamespace(state_dict=lambda: sampler_state),
         dataloader_generators={
             "generator": generator_loader,
@@ -507,6 +1030,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
         cache_audit_launch_hash=cache_audit_launch_hash,
         model=SimpleNamespace(
             generator=generator_module,
+            real_score=real_score_module,
             fake_score=fake_score_module,
         ),
         optimizers={
@@ -556,6 +1080,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
     saver = saver_calls[0]
     assert saver["root"] == tmp_path
     assert saver["trainer_state"]["cache_audit_launch_hash"] == cache_audit_launch_hash
+    assert saver["metrics_lineage_snapshot"] == metric_path.read_bytes()
     assert saver["resolved_config"] is resolved
     assert saver["generator_module"] is generator_module
     assert saver["fake_score_module"] is fake_score_module
@@ -736,7 +1261,9 @@ def test_smoke_loop_runs_one_complete_cycle_then_saves_or_discards_at_boundary(
             (record_type, dict(fields))
         ),
         _run_one_logical_substep=run_one_substep,
+        _capture_next_f1_probe=lambda: {"schema": "test-next-f1-probe"},
         _save_checkpoint=save_checkpoint,
+        _smoke_parent_probe_consumed=smoke_mode in {"C1", "C2"},
     )
 
     trainer._train_loop()
@@ -750,6 +1277,98 @@ def test_smoke_loop_runs_one_complete_cycle_then_saves_or_discards_at_boundary(
         else ["cycle_summary"]
     )
     assert records[0][1]["dry_run"] is True
+    smoke_acceptance = records[0][1]["smoke_acceptance"]
+    assert smoke_acceptance["parent_next_f1_probe_consumed"] is (
+        smoke_mode in {"C1", "C2"}
+    )
+    if smoke_mode in {"C0", "C1"}:
+        assert smoke_acceptance["next_f1_probe"] == {"schema": "test-next-f1-probe"}
+    else:
+        assert "next_f1_probe" not in smoke_acceptance
+
+
+def test_cpu_smoke_gate_requires_zero_nonfinite_attempts_in_cycle():
+    trainer = _bare_trainer(
+        options=SimpleNamespace(dry_run=True, smoke_mode="C0"),
+        device=torch.device("cpu"),
+    )
+
+    probe = trainer._validate_smoke_cycle(
+        [{} for _ in range(6)],
+        nonfinite_attempts=0,
+    )
+
+    assert probe == {
+        "smoke_mode": "C0",
+        "status": "PASS_CPU_TEST_SEAM",
+        "live_allocated_gib_max": 0.0,
+        "nonfinite_attempts": 0,
+    }
+    with pytest.raises(RuntimeError, match=r"failures=\['nonfinite_attempts'\]"):
+        trainer._validate_smoke_cycle(
+            [{} for _ in range(6)],
+            nonfinite_attempts=1,
+        )
+
+
+def test_train_loop_passes_one_nonfinite_delta_to_gate_and_cycle_summary():
+    resolved = load_stage2_config(CONFIG_PATH)
+    schedule = Stage2TrainingSchedule.from_resolved_config(resolved)
+    state = Stage2TrainingState()
+    gate_calls = []
+    records = []
+    executed = []
+
+    def run_one_substep():
+        substep = state.next_substep
+        if not executed:
+            state.record_nonfinite_attempt()
+        executed.append(substep)
+        if substep == "G":
+            state.commit_successful_generator_update(
+                ema_action=schedule.expected_ema_action(state.completed_g + 1),
+                schedule=schedule,
+            )
+        else:
+            state.commit_successful_fake_update(substep, schedule=schedule)
+        return {"elapsed": 1.0}
+
+    def validate(step_fields, *, nonfinite_attempts):
+        gate_calls.append(
+            {
+                "steps": len(step_fields),
+                "nonfinite_attempts": nonfinite_attempts,
+                "next_substep": state.next_substep,
+                "completed_cycles": state.cycle,
+            }
+        )
+        return {"smoke_mode": "C2", "status": "TEST_GATE"}
+
+    trainer = _bare_trainer(
+        resolved=resolved,
+        schedule=schedule,
+        state=state,
+        options=SimpleNamespace(smoke_mode="C2", dry_run=True, no_save=True),
+        _append_metric=lambda record_type, fields: records.append(
+            (record_type, dict(fields))
+        ),
+        _run_one_logical_substep=run_one_substep,
+        _validate_smoke_cycle=validate,
+        _smoke_parent_probe_consumed=True,
+    )
+
+    trainer._train_loop()
+
+    assert gate_calls == [
+        {
+            "steps": 6,
+            "nonfinite_attempts": 1,
+            "next_substep": "F1",
+            "completed_cycles": 1,
+        }
+    ]
+    assert records[0][0] == "cycle_summary"
+    assert records[0][1]["nonfinite_attempts"] == 1
 
 
 @pytest.mark.parametrize("sample_count", [1, 2])
@@ -1013,6 +1632,312 @@ def test_nonfinite_attempt_is_replayed_then_only_the_success_clock_commits(monke
     assert len(restores) == 2
 
 
+def test_production_nonfinite_retry_clears_partial_backward_and_replays_every_stream(
+    monkeypatch,
+):
+    """Exercise Trainer's real snapshot/attempt/restore path after one backward."""
+
+    from pipeline.stage2_rollout import Stage2ExitRNGStreams
+
+    resolved = load_stage2_config(CONFIG_PATH)
+    schedule = Stage2TrainingSchedule.from_resolved_config(resolved)
+    state = Stage2TrainingState()
+    for substep in ("F1", "F2", "F3", "F4", "F5"):
+        state.commit_successful_fake_update(substep, schedule=schedule)
+    assert state.next_substep == "G"
+
+    class ReplaySamplers:
+        def __init__(self):
+            self.generator_cursor = 0
+
+        def draw_generator_batch(self):
+            value = self.generator_cursor
+            self.generator_cursor += 1
+            return value
+
+        def state_dict(self):
+            return {"generator_cursor": self.generator_cursor}
+
+        def load_state_dict(self, value):
+            self.generator_cursor = int(value["generator_cursor"])
+
+    parameter = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+    generator_role = nn.Module()
+    generator_role.register_parameter("lora_weight", parameter)
+    frozen_role = nn.Linear(1, 1).requires_grad_(False)
+
+    class CountingOptimizer:
+        def __init__(self):
+            self.step_calls = 0
+            self.zero_grad_calls = 0
+
+        def zero_grad(self, *, set_to_none):
+            assert set_to_none is True
+            self.zero_grad_calls += 1
+            parameter.grad = None
+
+        def step(self):
+            self.step_calls += 1
+            assert parameter.grad is not None
+            with torch.no_grad():
+                parameter.add_(parameter.grad, alpha=-0.05)
+
+    optimizer = CountingOptimizer()
+    ema_calls = []
+    generator_ema = SimpleNamespace(
+        update_after_step=lambda _module, completed_g: ema_calls.append(completed_g)
+        or schedule.expected_ema_action(completed_g)
+    )
+    samplers = ReplaySamplers()
+    dataloader_generators = {
+        role: torch.Generator(device="cpu").manual_seed(seed)
+        for role, seed in (("generator", 101), ("fake_score", 102))
+    }
+    dedicated_generators = {
+        f"{role}_{kind}": torch.Generator(device="cpu").manual_seed(seed)
+        for role, base in (("generator", 200), ("fake_score", 300))
+        for kind, seed in zip(("rollout", "timestep", "noise"), range(base, base + 3))
+    }
+    exit_rng = Stage2ExitRNGStreams(401)
+    branch_rng = torch.Generator(device="cpu").manual_seed(402)
+    initial_branch_state = branch_rng.get_state().clone()
+    expected_branch_rng = torch.Generator(device="cpu")
+    expected_branch_rng.set_state(initial_branch_state.clone())
+    torch.rand((), generator=expected_branch_rng)
+    expected_branch_state_after_one_draw = expected_branch_rng.get_state().clone()
+
+    random.seed(501)
+    np.random.seed(502)
+    torch.manual_seed(503)
+    materializations = []
+    micro_draws = []
+    partial_gradient_before_failure = []
+    metric_records = []
+
+    def materialize(role):
+        assert role == "generator"
+        batch_id = samplers.draw_generator_batch()
+        loader_draws = torch.rand(
+            resolved.gradient_accumulation_steps,
+            generator=dataloader_generators[role],
+        )
+        record = (batch_id, tuple(float(value) for value in loader_draws))
+        materializations.append(record)
+        return [
+            {
+                "sample_id": torch.tensor([batch_id * 10 + index]),
+                "loader_draw": loader_draws[index].clone(),
+            }
+            for index in range(resolved.gradient_accumulation_steps)
+        ]
+
+    def compute_micro_loss(*, role, batch, exit_step, branch):
+        assert role == "generator"
+        call_index = len(micro_draws)
+        if call_index == 1:
+            assert parameter.grad is not None
+            partial_gradient_before_failure.append(parameter.grad.detach().clone())
+        record = {
+            "sample_id": int(batch["sample_id"].item()),
+            "loader_draw": float(batch["loader_draw"].item()),
+            "exit_step": int(exit_step),
+            "branch": branch,
+            "python": random.random(),
+            "numpy": float(np.random.random()),
+            "torch_default": float(torch.rand(()).item()),
+            "rollout": float(
+                torch.rand((), generator=dedicated_generators["generator_rollout"])
+            ),
+            "timestep": float(
+                torch.rand((), generator=dedicated_generators["generator_timestep"])
+            ),
+            "noise": float(
+                torch.rand((), generator=dedicated_generators["generator_noise"])
+            ),
+        }
+        micro_draws.append(record)
+        numerator = parameter.square()
+        output = SimpleNamespace(
+            numerator=numerator,
+            count=1,
+            loss=(
+                torch.full((), float("nan"), dtype=torch.float32)
+                if call_index == 1
+                else numerator
+            ),
+        )
+        return {
+            "output": output,
+            "diagnostic": {"finite_metric": 1.0},
+            "sample_count": 1,
+            "rollout_result": SimpleNamespace(
+                latents=torch.zeros(1),
+                cache_audit={
+                    "generator_forward_calls": 1,
+                    "logical_query_tokens": 390,
+                },
+            ),
+            "score_calls": 3,
+            "fake_score_calls": 1,
+            "real_score_calls": 2,
+            "frame_time": torch.tensor([[0.0, 100.0]]),
+            "phase_timings": {},
+        }
+
+    def append_metric(record_type, fields):
+        metric_records.append((record_type, dict(fields)))
+        if record_type == "nonfinite_attempt":
+            assert parameter.grad is None
+            assert parameter.detach().item() == 1.0
+            assert optimizer.step_calls == 0
+            assert ema_calls == []
+            assert state.completed_f == 5
+            assert state.completed_g == 0
+            assert state.cycle == 0
+            assert state.next_substep == "G"
+            assert samplers.generator_cursor == 0
+            assert torch.equal(branch_rng.get_state(), initial_branch_state)
+
+    timing = {
+        "step_seconds_max": 1.0,
+        "step_seconds_mean": 1.0,
+        "straggler_ratio": 1.0,
+        "data_seconds_max": 0.1,
+        "h2d_seconds_max": 0.1,
+        "rollout_seconds_max": 0.1,
+        "fake_score_seconds_max": 0.1,
+        "real_cond_seconds_max": 0.1,
+        "real_uncond_seconds_max": 0.1,
+        "loss_build_seconds_max": 0.1,
+        "backward_seconds_max": 0.1,
+        "clip_optimizer_seconds_max": 0.1,
+        "compute_seconds_max": 0.6,
+        "optimizer_seconds_max": 0.1,
+        "ema_seconds_max": 0.0,
+        "timing_closure_error_seconds": 0.0,
+    }
+    trainer = _bare_trainer(
+        state=state,
+        schedule=schedule,
+        resolved=resolved,
+        options=SimpleNamespace(smoke_mode=None, dry_run=False),
+        device=torch.device("cpu"),
+        world_size=8,
+        rank=0,
+        is_main_process=True,
+        logger=SimpleNamespace(append=append_metric),
+        model=SimpleNamespace(
+            generator=generator_role,
+            fake_score=frozen_role,
+            real_score=frozen_role,
+        ),
+        optimizers={"generator": optimizer},
+        generator_ema=generator_ema,
+        samplers=samplers,
+        dataloader_generators=dataloader_generators,
+        dedicated_generators=dedicated_generators,
+        exit_rng=exit_rng,
+        branch_rng=branch_rng,
+        _materialize_batches=materialize,
+        _to_device=lambda batch: batch,
+        _compute_micro_loss=compute_micro_loss,
+        _world_consensus=lambda condition: bool(condition),
+        _reduce_loss=lambda numerator, count: (float(numerator), count),
+        _timing_summary=lambda *_args, **_kwargs: timing,
+        _memory_fields=lambda: {
+            "gpu_memory_allocated_gib_max": 1.0,
+            "gpu_memory_reserved_gib_max": 2.0,
+            "gpu_memory_free_gib_min": 70.0,
+            "gpu_memory_total_gib_min": 80.0,
+            "gpu_step_seconds_mean": 1.0,
+            "gpu_step_seconds_max": 1.0,
+        },
+    )
+    monkeypatch.setattr(
+        distributed_utils, "fsdp2_accumulation", lambda *_args, **_kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        trainer_module.dist, "broadcast", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        torch.cuda, "reset_peak_memory_stats", lambda *_args, **_kwargs: None
+    )
+
+    result = trainer._run_one_logical_substep()
+
+    assert partial_gradient_before_failure
+    assert bool(torch.isfinite(partial_gradient_before_failure[0]).all())
+    assert materializations[0] == materializations[1]
+    assert micro_draws[0] == micro_draws[2]
+    assert micro_draws[1] == micro_draws[3]
+    assert [name for name, _fields in metric_records] == [
+        "nonfinite_attempt",
+        "train_step",
+    ]
+    assert optimizer.step_calls == 1
+    assert ema_calls == [1]
+    assert state.nonfinite_attempts_by_role == {"generator": 1, "fake_score": 0}
+    assert state.completed_f == 5
+    assert state.completed_g == 1
+    assert state.cycle == 1
+    assert state.next_substep == "F1"
+    assert result["fields"]["phase"] == "A"
+    assert torch.equal(branch_rng.get_state(), expected_branch_state_after_one_draw)
+
+
+def test_checkpoint_live_quiescence_rejects_active_substep_gradients_and_runtime():
+    roles = {
+        role: nn.Linear(1, 1).requires_grad_(role != "real_score")
+        for role in ("generator", "real_score", "fake_score")
+    }
+    trainer = _bare_trainer(
+        model=SimpleNamespace(**roles),
+        _active_logical_substep=None,
+    )
+    assert trainer._assert_live_checkpoint_quiescence() == {
+        "pending_gradients": False,
+        "pending_batch": False,
+        "pending_branch": False,
+        "pending_rollout_kv": False,
+        "pending_transaction": False,
+    }
+
+    trainer._active_logical_substep = {"cycle_substep": "G"}
+    with pytest.raises(RuntimeError, match="logical substep is active"):
+        trainer._assert_live_checkpoint_quiescence()
+    trainer._active_logical_substep = None
+
+    roles["generator"].weight.grad = torch.ones_like(roles["generator"].weight)
+    with pytest.raises(RuntimeError, match="retained parameter gradients"):
+        trainer._assert_live_checkpoint_quiescence()
+    roles["generator"].weight.grad = None
+
+    trainer.pending_rollout_state = object()
+    with pytest.raises(RuntimeError, match="attempt-local runtime state"):
+        trainer._assert_live_checkpoint_quiescence()
+
+
+def test_tracked_logical_substep_clears_the_live_marker_on_failure():
+    state = SimpleNamespace(
+        current_role="fake_score", next_substep="F1", successful_attempts=0
+    )
+    trainer = _bare_trainer(state=state, _active_logical_substep=None)
+
+    def fail_inside_substep():
+        assert trainer._active_logical_substep == {
+            "role": "fake_score",
+            "cycle_substep": "F1",
+            "logical_substep_id": 0,
+        }
+        raise FloatingPointError("stop")
+
+    trainer._run_one_logical_substep = fail_inside_substep
+    with pytest.raises(FloatingPointError, match="stop"):
+        trainer._run_tracked_logical_substep()
+    assert trainer._active_logical_substep is None
+
+
 @pytest.mark.parametrize(
     ("smoke_mode", "expected_branch"),
     [
@@ -1093,6 +2018,7 @@ def test_resume_smoke_forces_its_generator_branch(
             "gpu_memory_allocated_gib_max": 1.0,
             "gpu_memory_reserved_gib_max": 2.0,
         },
+        _smoke_parent_probe_consumed=True,
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(

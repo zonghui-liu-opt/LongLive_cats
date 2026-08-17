@@ -8,25 +8,29 @@ every checkpoint.
 Publication is deliberately stricter than a collection of atomic files:
 everything is written below a same-parent hidden directory, every byte is
 hashed into a self-hashed manifest, that directory is atomically renamed, and
-``_SUCCESS`` is written last.  Discovery treats a final-name directory without
-the marker, or a damaged newer checkpoint, as an error rather than silently
-resuming older work.
+``_SUCCESS`` is written last. Discovery ignores a final-name directory without
+the marker (the only expected crash window), while a damaged checkpoint that
+claims completion still fails closed instead of silently resuming older work.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
-from pathlib import Path
+import random
 import re
 import shutil
+import subprocess
 import tempfile
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TypeVar
 
+import numpy as np
 import torch
 
 from utils.lora_utils import LocalLoraShard, LoraTensorSpec
@@ -41,7 +45,7 @@ from utils.stage1_io import (
 )
 
 STAGE2_CHECKPOINT_SCHEMA = "longlive_stage2_checkpoint"
-STAGE2_CHECKPOINT_SCHEMA_VERSION = 1
+STAGE2_CHECKPOINT_SCHEMA_VERSION = 2
 STAGE2_TRAINER_STATE_SCHEMA = "longlive_stage2_trainer_state"
 STAGE2_TRAINER_STATE_SCHEMA_VERSION = 1
 STAGE2_RNG_STATE_SCHEMA = "longlive_stage2_rank_rng"
@@ -58,10 +62,39 @@ STAGE2_CHECKPOINT_PATTERN = re.compile(r"checkpoint_stage2_g([0-9]{6})")
 STAGE2_RANK0_CONTROL_RNG_NAMES = frozenset(
     ("generator_exit", "fake_score_exit", "dfd_branch")
 )
+STAGE2_DEDICATED_RNG_NAMES = frozenset(
+    (
+        "fake_score_loader",
+        "generator_loader",
+        "fake_score_rollout",
+        "generator_rollout",
+        "fake_score_timestep",
+        "generator_timestep",
+        "fake_score_noise",
+        "generator_noise",
+    )
+)
 STAGE2_PENDING_STATE_KEYS = frozenset(
     ("gradients", "batch", "branch", "kv", "optimizer_step")
 )
 STAGE2_ROLE_NAMES = ("fake_score", "generator")
+STAGE2_PROVENANCE_SCHEMA = "longlive_stage2_checkpoint_provenance"
+STAGE2_PROVENANCE_SCHEMA_VERSION = 1
+
+_STAGE2_OPTIMIZER_CONTRACT = {
+    "generator": {
+        "lr": 2e-6,
+        "betas": (0.0, 0.999),
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+    },
+    "fake_score": {
+        "lr": 4e-7,
+        "betas": (0.0, 0.999),
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+    },
+}
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -92,6 +125,170 @@ def _exact_mapping(
     if missing or extra:
         raise ValueError(f"{label} keys mismatch: missing={missing}, extra={extra}")
     return result
+
+
+def _capture_stage2_code_version() -> dict[str, Any]:
+    """Return a portable commit hint plus an exact digest of Stage-2 sources."""
+
+    root = Path(__file__).resolve().parents[1]
+    source_paths: set[Path] = {root / "utils" / "distributed.py"}
+    for pattern in (
+        "trainer/stage2_*.py",
+        "model/stage2_*.py",
+        "pipeline/stage2_*.py",
+        "utils/stage2_*.py",
+        "scripts/*stage2*.py",
+    ):
+        source_paths.update(path for path in root.glob(pattern) if path.is_file())
+    digest = hashlib.sha256()
+    for path in sorted(
+        source_paths, key=lambda item: item.relative_to(root).as_posix()
+    ):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        payload = path.read_bytes()
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    commit: str | None = None
+    dirty: bool | None = None
+    try:
+        commit_result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        candidate = commit_result.stdout.strip().lower()
+        if _GIT_COMMIT_RE.fullmatch(candidate) is not None:
+            commit = candidate
+        status_result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        dirty = bool(status_result.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        # The exact source digest remains a usable code version in source-only
+        # deployments that intentionally omit .git metadata.
+        pass
+    return {
+        "git_commit": commit,
+        "git_tracked_dirty": dirty,
+        "stage2_source_sha256": digest.hexdigest(),
+    }
+
+
+def validate_stage2_provenance(
+    provenance: Mapping[str, Any],
+    *,
+    add_code_version: bool = False,
+) -> dict[str, Any]:
+    """Normalize and validate the exact checkpoint provenance schema."""
+
+    if not isinstance(provenance, Mapping):
+        raise TypeError("Stage-2 checkpoint provenance must be a mapping")
+    value = dict(provenance)
+    raw_keys = {"assets", "data", "lineage", "smoke_probe"}
+    normalized_keys = {
+        "schema",
+        "schema_version",
+        "code_version",
+        *raw_keys,
+    }
+    if set(value) == raw_keys:
+        if not add_code_version:
+            raise ValueError("Stage-2 provenance is missing schema/code_version")
+        value = {
+            "schema": STAGE2_PROVENANCE_SCHEMA,
+            "schema_version": STAGE2_PROVENANCE_SCHEMA_VERSION,
+            "code_version": _capture_stage2_code_version(),
+            **value,
+        }
+    value = _exact_mapping(
+        value,
+        label="Stage-2 checkpoint provenance",
+        expected_keys=normalized_keys,
+    )
+    if (
+        value["schema"] != STAGE2_PROVENANCE_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != STAGE2_PROVENANCE_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported Stage-2 checkpoint provenance schema")
+    code = _exact_mapping(
+        value["code_version"],
+        label="Stage-2 code_version",
+        expected_keys={"git_commit", "git_tracked_dirty", "stage2_source_sha256"},
+    )
+    if code["git_commit"] is not None and (
+        not isinstance(code["git_commit"], str)
+        or _GIT_COMMIT_RE.fullmatch(code["git_commit"]) is None
+    ):
+        raise ValueError("Stage-2 code_version.git_commit is invalid")
+    if (
+        code["git_tracked_dirty"] is not None
+        and type(code["git_tracked_dirty"]) is not bool
+    ):
+        raise TypeError("Stage-2 code_version.git_tracked_dirty must be bool/None")
+    _sha256(code["stage2_source_sha256"], "code_version.stage2_source_sha256")
+
+    assets = _exact_mapping(
+        value["assets"],
+        label="Stage-2 provenance assets",
+        expected_keys={"generator", "real_score", "fake_score"},
+    )
+    asset_hashes: dict[str, str] = {}
+    for role, asset in assets.items():
+        if not isinstance(asset, Mapping):
+            raise TypeError(f"Stage-2 provenance asset {role} must be a mapping")
+        asset_hashes[role] = _sha256(
+            asset.get("checkpoint_sha256"),
+            f"Stage-2 provenance assets.{role}.checkpoint_sha256",
+        )
+    if asset_hashes["real_score"] != asset_hashes["fake_score"]:
+        raise ValueError("Stage-2 real/fake immutable base hashes differ")
+
+    data = _exact_mapping(
+        value["data"],
+        label="Stage-2 provenance data",
+        expected_keys={
+            "stage2_manifest_sha256",
+            "source_manifest_sha256",
+            "negative_manifest_sha256",
+            "negative_artifact_sha256",
+        },
+    )
+    for name, sha256 in data.items():
+        _sha256(sha256, f"Stage-2 provenance data.{name}")
+    lineage = _exact_mapping(
+        value["lineage"],
+        label="Stage-2 provenance lineage",
+        expected_keys={
+            "parent_checkpoint",
+            "parent_checkpoint_manifest_sha256",
+        },
+    )
+    parent = lineage["parent_checkpoint"]
+    parent_sha = lineage["parent_checkpoint_manifest_sha256"]
+    if parent is None:
+        if parent_sha is not None:
+            raise ValueError("cold Stage-2 lineage cannot contain a parent hash")
+    else:
+        if not isinstance(parent, str) or not parent.strip():
+            raise ValueError("Stage-2 lineage parent_checkpoint must be a path string")
+        _sha256(parent_sha, "lineage.parent_checkpoint_manifest_sha256")
+    smoke_probe = value["smoke_probe"]
+    if smoke_probe is not None and not isinstance(smoke_probe, Mapping):
+        raise TypeError("Stage-2 provenance smoke_probe must be a mapping or None")
+    # Prove all nested values are canonical finite JSON before any filesystem
+    # mutation. This also rejects tensors or other non-portable provenance.
+    canonical_json_sha256(value)
+    return value
 
 
 def _uint8_rng_state_tensor(value: Any, label: str) -> torch.Tensor:
@@ -134,8 +331,10 @@ class Stage2CollectiveOps:
     broadcast_object: Callable[[Any, int], Any]
 
     def validate(self) -> "Stage2CollectiveOps":
-        world_size = int(self.get_world_size())
-        rank = int(self.get_rank())
+        world_size = self.get_world_size()
+        rank = self.get_rank()
+        if type(world_size) is not int or type(rank) is not int:
+            raise TypeError("Stage-2 collective rank/world_size must be integers")
         if world_size != STAGE2_WORLD_SIZE:
             raise RuntimeError(
                 f"Stage-2 checkpoint requires WORLD_SIZE=8, got {world_size}"
@@ -412,7 +611,8 @@ def validate_stage2_trainer_state(
     )
     if (
         value["schema"] != STAGE2_TRAINER_STATE_SCHEMA
-        or int(value["schema_version"]) != STAGE2_TRAINER_STATE_SCHEMA_VERSION
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != STAGE2_TRAINER_STATE_SCHEMA_VERSION
     ):
         raise ValueError("unsupported Stage-2 trainer state schema")
     boundary = validate_stage2_cycle_boundary(
@@ -480,27 +680,15 @@ def validate_stage2_trainer_state(
             f"{expected_phase}"
         )
 
-    sampler = _exact_mapping(
+    from utils.stage2_sampler import validate_stage2_sampler_streams_state
+
+    validate_stage2_sampler_streams_state(
         value["sampler_state"],
-        label="sampler_state",
-        expected_keys={"schema", "fake_score", "generator"},
+        expected_completed_batches={
+            "fake_score": completed_f,
+            "generator": completed_g,
+        },
     )
-    if sampler["schema"] != "longlive_stage2_sampler_streams/v2":
-        raise RuntimeError("unsupported Stage-2 sampler state schema")
-    for role, expected_completed in (
-        ("fake_score", completed_f),
-        ("generator", completed_g),
-    ):
-        role_state = sampler[role]
-        if not isinstance(role_state, Mapping):
-            raise TypeError(f"sampler {role} state must be a mapping")
-        if (
-            role_state.get("role") != role
-            or role_state.get("completed_batches") != expected_completed
-        ):
-            raise RuntimeError(
-                f"sampler {role} cursor/count disagrees with trainer counters"
-            )
 
     loader_states = _exact_mapping(
         value["dataloader_generator_states"],
@@ -595,6 +783,7 @@ def _validate_generator_snapshots(
     *,
     label: str,
     expected_names: set[str] | None = None,
+    expected_cuda_index: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not isinstance(snapshots, Mapping):
         raise TypeError(f"{label} snapshots must be a mapping")
@@ -619,6 +808,24 @@ def _validate_generator_snapshots(
         )
         if not isinstance(snapshot["device"], str) or not snapshot["device"]:
             raise TypeError(f"{label}.{name}.device must be a string")
+        try:
+            declared_device = torch.device(snapshot["device"])
+        except (RuntimeError, TypeError) as exc:
+            raise RuntimeError(f"invalid {label}.{name} device") from exc
+        if declared_device.type not in {"cpu", "cuda"}:
+            raise RuntimeError(
+                f"{label}.{name} must use a CPU or CUDA generator device"
+            )
+        if declared_device.type == "cuda" and (
+            declared_device.index is None
+            or (
+                expected_cuda_index is not None
+                and declared_device.index != expected_cuda_index
+            )
+        ):
+            raise RuntimeError(
+                f"{label}.{name} CUDA device must be explicit and rank-local"
+            )
         _uint8_rng_state_tensor(snapshot["state"], f"{label}.{name}.state")
         if (
             generators is not None
@@ -628,20 +835,75 @@ def _validate_generator_snapshots(
                 f"{label}.{name} device mismatch: checkpoint={snapshot['device']}, "
                 f"runtime={generators[name].device}"
             )
-        # Validate the bytes for the declared device without mutating runtime.
-        try:
-            candidate = torch.Generator(device=snapshot["device"])
-            candidate.set_state(snapshot["state"].clone())
-        except (RuntimeError, TypeError) as exc:
-            raise RuntimeError(f"invalid {label}.{name} generator state") from exc
+        # CPU bytes are always safe to validate. CUDA bytes are validated only
+        # against an explicitly supplied *local* runtime generator; rank 0 must
+        # never initialize cuda:1..7 merely to inspect foreign-rank payloads.
+        if declared_device.type == "cpu" or generators is not None:
+            candidate_device = (
+                str(generators[name].device)
+                if generators is not None
+                else snapshot["device"]
+            )
+            try:
+                candidate = torch.Generator(device=candidate_device)
+                candidate.set_state(snapshot["state"].clone())
+            except (RuntimeError, TypeError) as exc:
+                raise RuntimeError(f"invalid {label}.{name} generator state") from exc
         validated[name] = snapshot
     return validated
+
+
+def _validate_general_rng_state(state: Any) -> Mapping[str, Any]:
+    value = _exact_mapping(
+        state,
+        label="Stage-2 general RNG state",
+        expected_keys={
+            "schema_version",
+            "python",
+            "numpy",
+            "torch_cpu",
+            "cuda_device_count",
+            "cuda_device_index",
+            "torch_cuda",
+        },
+    )
+    if type(value["schema_version"]) is not int or value["schema_version"] != 2:
+        raise RuntimeError("unsupported Stage-2 general RNG schema")
+    try:
+        random.Random().setstate(value["python"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("invalid Stage-2 Python RNG state") from exc
+    try:
+        np.random.RandomState().set_state(value["numpy"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("invalid Stage-2 NumPy RNG state") from exc
+    _cpu_uint8_rng_state(value["torch_cpu"], "Stage-2 torch CPU RNG state")
+    cuda_count = _plain_int(value["cuda_device_count"], "cuda_device_count")
+    cuda_index = value["cuda_device_index"]
+    cuda_state = value["torch_cuda"]
+    if cuda_count == 0:
+        if cuda_index is not None or cuda_state is not None:
+            raise RuntimeError("CPU-only Stage-2 RNG state contains CUDA data")
+    else:
+        if (
+            isinstance(cuda_index, bool)
+            or not isinstance(cuda_index, int)
+            or cuda_index < 0
+            or cuda_index >= cuda_count
+        ):
+            raise RuntimeError("Stage-2 CUDA RNG device index is invalid")
+        # CUDA generator bytes are device-specific.  Structural publication
+        # validation checks their portable CPU representation without touching
+        # or initializing that rank's CUDA device on rank 0.
+        _uint8_rng_state_tensor(cuda_state, "Stage-2 torch CUDA RNG state")
+    return value
 
 
 def validate_stage2_rng_state(
     state: Mapping[str, Any],
     *,
     expected_rank: int,
+    expected_dedicated_names: set[str] | None = None,
 ) -> Mapping[str, Any]:
     value = _exact_mapping(
         state,
@@ -658,18 +920,32 @@ def validate_stage2_rng_state(
     )
     if (
         value["schema"] != STAGE2_RNG_STATE_SCHEMA
-        or int(value["schema_version"]) != STAGE2_RNG_STATE_SCHEMA_VERSION
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != STAGE2_RNG_STATE_SCHEMA_VERSION
     ):
         raise RuntimeError("unsupported Stage-2 rank RNG schema")
-    if value["rank"] != expected_rank or value["world_size"] != STAGE2_WORLD_SIZE:
+    if (
+        type(value["rank"]) is not int
+        or value["rank"] != expected_rank
+        or type(value["world_size"]) is not int
+        or value["world_size"] != STAGE2_WORLD_SIZE
+    ):
         raise RuntimeError("Stage-2 rank RNG topology mismatch")
-    if not isinstance(value["general"], Mapping):
-        raise TypeError("Stage-2 general RNG state must be a mapping")
+    general = _validate_general_rng_state(value["general"])
+    if general["cuda_device_count"] and general["cuda_device_index"] != expected_rank:
+        raise RuntimeError("Stage-2 CUDA RNG state is not rank-local")
     dedicated = _validate_generator_snapshots(
-        value["dedicated"], None, label="dedicated RNG"
+        value["dedicated"],
+        None,
+        label="dedicated RNG",
+        expected_names=expected_dedicated_names,
+        expected_cuda_index=expected_rank,
     )
     if not dedicated:
         raise RuntimeError("Stage-2 checkpoint is missing dedicated RNG streams")
+    for loader_name in ("fake_score_loader", "generator_loader"):
+        if loader_name in dedicated and dedicated[loader_name]["device"] != "cpu":
+            raise RuntimeError(f"Stage-2 {loader_name} RNG must be CPU")
     controls = _validate_generator_snapshots(
         value["rank0_control"],
         None,
@@ -677,9 +953,12 @@ def validate_stage2_rng_state(
         expected_names=(
             set(STAGE2_RANK0_CONTROL_RNG_NAMES) if expected_rank == 0 else set()
         ),
+        expected_cuda_index=expected_rank,
     )
     if expected_rank != 0 and controls:
         raise RuntimeError("nonzero rank contains rank0 control RNG state")
+    if any(snapshot["device"] != "cpu" for snapshot in controls.values()):
+        raise RuntimeError("Stage-2 rank0 control RNG streams must be CPU")
     return state
 
 
@@ -727,6 +1006,48 @@ def _is_lora_name(name: str) -> bool:
     return any(marker in name for marker in ("lora_A", "lora_B"))
 
 
+def _validate_stage2_optimizer_param_groups(
+    groups: Any,
+    *,
+    role: str,
+) -> Sequence[Mapping[str, Any]]:
+    if role not in _STAGE2_OPTIMIZER_CONTRACT:
+        raise ValueError(f"invalid Stage-2 optimizer role {role!r}")
+    if isinstance(groups, (str, bytes)) or not isinstance(groups, Sequence):
+        raise TypeError(f"Stage-2 {role} optimizer param_groups must be a sequence")
+    if len(groups) != 1 or not isinstance(groups[0], Mapping):
+        raise ValueError(
+            f"Stage-2 {role} optimizer must contain exactly one param group"
+        )
+    group = groups[0]
+    expected = _STAGE2_OPTIMIZER_CONTRACT[role]
+    for key in ("lr", "eps", "weight_decay"):
+        value = group.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"Stage-2 {role} AdamW {key} must be numeric")
+        if float(value) != expected[key]:
+            raise ValueError(
+                f"Stage-2 {role} AdamW {key} mismatch: "
+                f"checkpoint/runtime={value}, expected={expected[key]}"
+            )
+    betas = group.get("betas")
+    if (
+        isinstance(betas, (str, bytes))
+        or not isinstance(betas, Sequence)
+        or len(betas) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in betas
+        )
+        or tuple(float(value) for value in betas) != expected["betas"]
+    ):
+        raise ValueError(
+            f"Stage-2 {role} AdamW betas mismatch: "
+            f"checkpoint/runtime={betas}, expected={expected['betas']}"
+        )
+    return groups
+
+
 def audit_stage2_lora_optimizer(
     module: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -740,6 +1061,8 @@ def audit_stage2_lora_optimizer(
 
     if role not in STAGE2_ROLE_NAMES:
         raise ValueError(f"invalid Stage-2 optimizer role {role!r}")
+    if not isinstance(optimizer, torch.optim.AdamW):
+        raise TypeError(f"Stage-2 {role} optimizer must be torch.optim.AdamW")
     named = OrderedDict(
         (name, parameter)
         for name, parameter in module.named_parameters()
@@ -793,6 +1116,7 @@ def audit_stage2_lora_optimizer(
         )
     if any(id(parameter) not in expected_ids for parameter in optimizer.state):
         raise ValueError(f"Stage-2 {role} optimizer state contains another role")
+    _validate_stage2_optimizer_param_groups(optimizer.param_groups, role=role)
     if require_initialized_moments:
         if set(map(id, optimizer.state)) != expected_ids:
             raise ValueError(f"Stage-2 {role} optimizer moments are incomplete")
@@ -873,6 +1197,7 @@ def validate_stage2_full_optimizer_state(
     groups = value["param_groups"]
     if not isinstance(moments, Mapping) or not isinstance(groups, Sequence):
         raise TypeError(f"Stage-2 {role} optimizer containers are invalid")
+    _validate_stage2_optimizer_param_groups(groups, role=role)
     expected = set(expected_parameter_names)
     if not expected or len(expected) != len(tuple(expected_parameter_names)):
         raise ValueError(f"Stage-2 {role} expected parameter names are invalid")
@@ -1292,8 +1617,16 @@ def _validate_topology(value: Mapping[str, Any]) -> dict[str, Any]:
                 f"{topology[key]!r} != {expected!r}"
             )
     profile = (
-        topology["microbatch_size_per_device"],
-        topology["gradient_accumulation_steps"],
+        _plain_int(
+            topology["microbatch_size_per_device"],
+            "topology.microbatch_size_per_device",
+            minimum=1,
+        ),
+        _plain_int(
+            topology["gradient_accumulation_steps"],
+            "topology.gradient_accumulation_steps",
+            minimum=1,
+        ),
     )
     if profile not in {(2, 4), (1, 8)}:
         raise RuntimeError(f"unsupported Stage-2 checkpoint batch profile {profile}")
@@ -1301,48 +1634,50 @@ def _validate_topology(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_ema_state(
-    state: Mapping[str, Any], *, rank: int, completed_g: int
+    state: Mapping[str, Any],
+    *,
+    rank: int,
+    completed_g: int,
+    expected_parameter_names: set[str] | None = None,
 ) -> Mapping[str, Any]:
-    if not isinstance(state, Mapping):
-        raise TypeError(f"EMA rank{rank} state must be a mapping")
-    required = {
-        "schema_version",
-        "initialized",
-        "last_completed_step",
-        "rank",
-        "world_size",
-        "shadow",
-    }
-    if not required.issubset(state):
-        raise ValueError(
-            f"EMA rank{rank} state is missing {sorted(required - set(state))}"
-        )
-    if int(state["schema_version"]) != 2:
-        raise RuntimeError(f"EMA rank{rank} schema_version mismatch")
-    if state["rank"] != rank or state["world_size"] != STAGE2_WORLD_SIZE:
-        raise RuntimeError(f"EMA rank{rank} topology mismatch")
-    if state["last_completed_step"] != completed_g:
-        raise RuntimeError(f"EMA rank{rank} last completed G mismatch")
     expected_initialized = completed_g >= STAGE2_EMA_START_GENERATOR_UPDATE
     if (
-        type(state["initialized"]) is not bool
-        or state["initialized"] != expected_initialized
+        not isinstance(state, Mapping)
+        or type(state.get("initialized")) is not bool
+        or state["initialized"] is not expected_initialized
     ):
-        raise RuntimeError(f"EMA initialization mismatch at completed G={completed_g}")
-    shadows = state["shadow"]
-    if not isinstance(shadows, Mapping):
-        raise TypeError(f"EMA rank{rank} shadow must be a mapping")
-    if expected_initialized != bool(shadows):
         raise RuntimeError(
-            f"EMA rank{rank} shadow presence disagrees with initialization"
+            "Stage-2 EMA initialization state disagrees with the completed G clock"
         )
-    for name, tensor in shadows.items():
-        if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"EMA rank{rank} shadows must map names to tensors")
-        if tensor.device.type != "cpu" or tensor.dtype != torch.float32:
-            raise TypeError(f"EMA rank{rank} shadow {name} must be CPU FP32")
-        if tensor.numel() and not bool(torch.isfinite(tensor).all().item()):
-            raise ValueError(f"EMA rank{rank} shadow {name} is non-finite")
+    from utils.distributed import validate_trainable_sharded_ema_state_dict
+
+    validate_trainable_sharded_ema_state_dict(
+        state,
+        expected_rank=rank,
+        expected_world_size=STAGE2_WORLD_SIZE,
+        expected_decay=0.99,
+        expected_start_step=STAGE2_EMA_START_GENERATOR_UPDATE,
+        expected_completed_step=completed_g,
+        expected_initialized=expected_initialized,
+        expected_topology={
+            "rank_layout": tuple(range(STAGE2_WORLD_SIZE)),
+            "mesh_dim_names": ("shard",),
+        },
+        expected_parameter_names=expected_parameter_names,
+    )
+    for name, metadata in state["shard_metadata"].items():
+        if (
+            metadata["kind"] != "dtensor"
+            or metadata["mesh_device_type"] != "cuda"
+            or tuple(metadata["mesh_shape"]) != (STAGE2_WORLD_SIZE,)
+            or tuple(tuple(row) for row in metadata["rank_layout"])
+            != tuple((mesh_rank,) for mesh_rank in range(STAGE2_WORLD_SIZE))
+            or tuple(metadata["coordinate"]) != (rank,)
+            or tuple(metadata["placements"]) != ("S(0)",)
+        ):
+            raise RuntimeError(
+                f"Stage-2 EMA shard topology is not 1D FULL_SHARD for {name!r}"
+            )
     return state
 
 
@@ -1368,10 +1703,42 @@ def _load_safetensors(path: Path) -> OrderedDict[str, torch.Tensor]:
     return OrderedDict(sorted(load_file(str(path), device="cpu").items()))
 
 
+def _load_authenticated_safetensors_snapshot(
+    path: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> OrderedDict[str, torch.Tensor]:
+    """Authenticate and deserialize one immutable in-memory byte snapshot."""
+
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"canonical Generator EMA is not a regular file: {path}")
+    expected_size = _plain_int(expected_size, "canonical Generator EMA size")
+    expected_sha256 = _sha256(
+        expected_sha256,
+        "canonical Generator EMA SHA-256",
+    )
+    snapshot = path.read_bytes()
+    actual_sha256 = hashlib.sha256(snapshot).hexdigest()
+    if len(snapshot) != expected_size or actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            "canonical Generator EMA snapshot hash/size mismatch: "
+            f"expected=({expected_size},{expected_sha256}), "
+            f"actual=({len(snapshot)},{actual_sha256})"
+        )
+
+    # Deserialize the exact bytes authenticated above. Reopening ``path`` here
+    # would reintroduce a hash-check/load TOCTOU window.
+    from safetensors.torch import load
+
+    return OrderedDict(sorted(load(snapshot).items()))
+
+
 def _required_payload_names(ema_initialized: bool) -> set[str]:
     result = {
         "generator_raw.safetensors",
         "fake_score_raw.safetensors",
+        "metrics_lineage.jsonl",
         "optimizer_generator.pt",
         "optimizer_fake_score.pt",
         "trainer_state.pt",
@@ -1383,6 +1750,104 @@ def _required_payload_names(ema_initialized: bool) -> set[str]:
     if ema_initialized:
         result.add("generator_ema.safetensors")
     return result
+
+
+def _validate_metrics_lineage_snapshot(
+    path: Path,
+    *,
+    trainer_state: Mapping[str, Any],
+) -> bytes:
+    """Validate the exact pre-checkpoint-event JSONL prefix bound to a save."""
+
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Stage-2 metrics lineage is not a regular file: {path}")
+    snapshot = path.read_bytes()
+    if not snapshot or not snapshot.endswith(b"\n"):
+        raise RuntimeError(
+            "Stage-2 metrics lineage must be a non-empty, newline-terminated "
+            "JSONL snapshot"
+        )
+    records: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(snapshot.splitlines(), start=1):
+        if not raw_line.strip():
+            raise RuntimeError(
+                f"Stage-2 metrics lineage contains a blank line at {line_number}"
+            )
+        try:
+            record = json.loads(raw_line.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Stage-2 metrics lineage contains invalid JSON at line {line_number}"
+            ) from exc
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"Stage-2 metrics lineage line {line_number} is not an object"
+            )
+        records.append(record)
+
+    from utils.jsonl_logger import (
+        latest_run_id,
+        lineage_run_ids,
+        next_attempt_index,
+        records_for_latest_lineage,
+    )
+
+    lineage = trainer_state["jsonl_lineage"]
+    run_id = lineage["run_id"]
+    try:
+        owners = lineage_run_ids(records, run_id=run_id)
+        train_records = records_for_latest_lineage(
+            records,
+            record_type="train_step",
+            run_id=run_id,
+            step_key="logical_substep_id",
+        )
+        snapshot_next_attempt = next_attempt_index(records, run_id=run_id)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Stage-2 metrics lineage graph is invalid") from exc
+    if latest_run_id(records) != run_id:
+        raise RuntimeError(
+            "Stage-2 metrics lineage checkpoint owner is not the latest run"
+        )
+    run_start_counts = {
+        owner: sum(
+            record.get("record_type") == "run_start" and record.get("run_id") == owner
+            for record in records
+        )
+        for owner in owners
+    }
+    if any(count != 1 for count in run_start_counts.values()):
+        raise RuntimeError(
+            "Stage-2 metrics lineage requires exactly one run_start per ancestor"
+        )
+    owner_set = set(owners)
+    attempts = [
+        record["attempt_index"]
+        for record in records
+        if "attempt_index" in record and record.get("run_id") in owner_set
+    ]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in attempts
+    ) or attempts != sorted(set(attempts)):
+        raise RuntimeError(
+            "Stage-2 metrics lineage attempt indices must be unique and increasing"
+        )
+    expected_logical = int(trainer_state["next_logical_substep_id"])
+    logical_ids = [int(record["logical_substep_id"]) for record in train_records]
+    if logical_ids != list(range(expected_logical)):
+        raise RuntimeError(
+            "Stage-2 metrics lineage does not contain the exact committed "
+            f"logical prefix 0..{expected_logical - 1}"
+        )
+    # The checkpoint is published before its checkpoint_event. The stored
+    # cursor reserves exactly that one future attempt index.
+    if int(lineage["next_attempt_index"]) != snapshot_next_attempt + 1:
+        raise RuntimeError(
+            "Stage-2 metrics lineage attempt cursor does not reserve exactly "
+            "one checkpoint_event"
+        )
+    return snapshot
 
 
 def _file_entries(directory: Path, names: Iterable[str]) -> list[dict[str, Any]]:
@@ -1441,13 +1906,51 @@ def _validate_rank_state_maps(
     rank_ema_states: Mapping[int, Mapping[str, Any]],
     rank_rng_states: Mapping[int, Mapping[str, Any]],
     completed_g: int,
+    expected_ema_parameter_names: set[str],
+    trainer_state: Mapping[str, Any],
 ) -> None:
     expected_ranks = set(range(STAGE2_WORLD_SIZE))
     if set(rank_ema_states) != expected_ranks or set(rank_rng_states) != expected_ranks:
         raise RuntimeError("Stage-2 checkpoint requires EMA/RNG state for all 8 ranks")
     for rank in range(STAGE2_WORLD_SIZE):
-        _validate_ema_state(rank_ema_states[rank], rank=rank, completed_g=completed_g)
-        validate_stage2_rng_state(rank_rng_states[rank], expected_rank=rank)
+        _validate_ema_state(
+            rank_ema_states[rank],
+            rank=rank,
+            completed_g=completed_g,
+            expected_parameter_names=expected_ema_parameter_names,
+        )
+        validate_stage2_rng_state(
+            rank_rng_states[rank],
+            expected_rank=rank,
+            expected_dedicated_names=set(STAGE2_DEDICATED_RNG_NAMES),
+        )
+    reference_global_shapes = {
+        name: tuple(shape)
+        for name, shape in rank_ema_states[0]["global_shapes"].items()
+    }
+    for rank in range(1, STAGE2_WORLD_SIZE):
+        candidate = {
+            name: tuple(shape)
+            for name, shape in rank_ema_states[rank]["global_shapes"].items()
+        }
+        if candidate != reference_global_shapes:
+            raise RuntimeError("Stage-2 EMA global shapes differ across ranks")
+    for name, global_shape in reference_global_shapes.items():
+        local_numel = sum(
+            math.prod(tuple(rank_ema_states[rank]["local_shapes"][name]))
+            for rank in range(STAGE2_WORLD_SIZE)
+        )
+        if local_numel != math.prod(global_shape):
+            raise RuntimeError(
+                f"Stage-2 EMA local shards do not partition {name!r}: "
+                f"local_numel={local_numel}, global_numel={math.prod(global_shape)}"
+            )
+    rank0_dedicated = rank_rng_states[0]["dedicated"]
+    loader_states = trainer_state["dataloader_generator_states"]
+    for role in STAGE2_ROLE_NAMES:
+        checkpoint_loader = rank0_dedicated[f"{role}_loader"]["state"]
+        if not torch.equal(checkpoint_loader, loader_states[role]):
+            raise RuntimeError(f"Stage-2 rank0 {role} DataLoader RNG copies disagree")
 
 
 def _validate_prepared_payloads(
@@ -1514,6 +2017,10 @@ def _validate_prepared_payloads(
         rank_ema_states=rank_ema_states,
         rank_rng_states=rank_rng_states,
         completed_g=completed_g,
+        expected_ema_parameter_names={
+            spec.raw_parameter_name for spec in generator_schema.values()
+        },
+        trainer_state=trainer_state,
     )
     return raw_g, raw_f, ema, _validate_topology(topology)
 
@@ -1548,6 +2055,7 @@ def save_stage2_checkpoint_from_payloads(
     root: str | os.PathLike[str],
     *,
     trainer_state: Mapping[str, Any],
+    metrics_lineage_snapshot: bytes | None = None,
     generator_raw: Mapping[str, torch.Tensor],
     fake_score_raw: Mapping[str, torch.Tensor],
     generator_ema: Mapping[str, torch.Tensor] | None,
@@ -1573,6 +2081,7 @@ def save_stage2_checkpoint_from_payloads(
     io_rng = capture_rng_state(include_cuda=io_include_cuda)
     temporary: Path | None = None
     renamed = False
+    quarantined_uncommitted: Path | None = None
     try:
         raw_g, raw_f, ema, audited_topology = _validate_prepared_payloads(
             trainer_state=trainer_state,
@@ -1587,10 +2096,14 @@ def save_stage2_checkpoint_from_payloads(
             rank_rng_states=rank_rng_states,
             topology=topology,
         )
-        if not isinstance(resolved_config, Mapping) or not isinstance(
-            provenance, Mapping
-        ):
-            raise TypeError("resolved_config/provenance must be mappings")
+        if not isinstance(resolved_config, Mapping):
+            raise TypeError("resolved_config must be a mapping")
+        provenance = validate_stage2_provenance(
+            provenance,
+            add_code_version=True,
+        )
+        if not isinstance(metrics_lineage_snapshot, bytes):
+            raise TypeError("metrics_lineage_snapshot must be exact bytes")
         # Encode now: invalid/non-finite JSON must fail before a directory exists.
         canonical_json_sha256(dict(resolved_config))
         canonical_json_sha256(dict(provenance))
@@ -1605,7 +2118,22 @@ def save_stage2_checkpoint_from_payloads(
             raise RuntimeError(f"Stage-2 checkpoint root became a symlink: {root_path}")
         destination = checkpoint_directory(root_path.resolve(), completed_g)
         if destination.exists() or destination.is_symlink():
-            raise FileExistsError(destination)
+            marker = destination / "_SUCCESS"
+            if destination.is_symlink() or not destination.is_dir():
+                raise RuntimeError(
+                    f"Stage-2 checkpoint destination is not a regular directory: {destination}"
+                )
+            if marker.exists() or marker.is_symlink():
+                # Complete (or marker-corrupt) checkpoints are immutable.
+                raise FileExistsError(destination)
+            quarantine_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.uncommitted.", dir=destination.parent
+                )
+            )
+            quarantined_uncommitted = quarantine_root / "payload"
+            os.replace(destination, quarantined_uncommitted)
+            _fsync_directory(destination.parent)
         parent = destination.parent
         temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=parent))
         if failure_injector is not None:
@@ -1646,6 +2174,10 @@ def save_stage2_checkpoint_from_payloads(
             temporary / "optimizer_fake_score.pt", dict(fake_score_optimizer_state)
         )
         atomic_torch_save(temporary / "trainer_state.pt", dict(trainer_state))
+        atomic_write_bytes(
+            temporary / "metrics_lineage.jsonl",
+            metrics_lineage_snapshot,
+        )
         for rank in range(STAGE2_WORLD_SIZE):
             atomic_torch_save(
                 temporary / f"ema_state_rank{rank:05d}.pt",
@@ -1657,6 +2189,10 @@ def save_stage2_checkpoint_from_payloads(
             )
         atomic_write_json(temporary / "resolved_config.json", dict(resolved_config))
         atomic_write_json(temporary / "provenance.json", dict(provenance))
+        _validate_metrics_lineage_snapshot(
+            temporary / "metrics_lineage.jsonl",
+            trainer_state=trainer_state,
+        )
         if failure_injector is not None:
             failure_injector("after_files")
 
@@ -1692,6 +2228,9 @@ def save_stage2_checkpoint_from_payloads(
         if failure_injector is not None:
             failure_injector("after_success_marker")
         validate_stage2_checkpoint(destination)
+        if quarantined_uncommitted is not None:
+            shutil.rmtree(quarantined_uncommitted.parent)
+            _fsync_directory(parent)
         return destination
     finally:
         if temporary is not None and not renamed and temporary.exists():
@@ -1744,7 +2283,8 @@ def _validate_manifest_and_files(
     manifest = _read_manifest(directory / "checkpoint_manifest.json")
     if (
         manifest["schema"] != STAGE2_CHECKPOINT_SCHEMA
-        or int(manifest["schema_version"]) != STAGE2_CHECKPOINT_SCHEMA_VERSION
+        or type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != STAGE2_CHECKPOINT_SCHEMA_VERSION
     ):
         raise RuntimeError("unsupported Stage-2 checkpoint manifest schema")
     completed_g = _plain_int(
@@ -1754,10 +2294,17 @@ def _validate_manifest_and_files(
     )
     if completed_g != expected_completed_g:
         raise RuntimeError("checkpoint directory and manifest G clocks disagree")
-    if (
-        manifest["completed_fake_updates"] != 5 * completed_g
-        or manifest["completed_cycles"] != completed_g
-    ):
+    completed_f = _plain_int(
+        manifest["completed_fake_updates"],
+        "manifest.completed_fake_updates",
+        minimum=1,
+    )
+    completed_cycles = _plain_int(
+        manifest["completed_cycles"],
+        "manifest.completed_cycles",
+        minimum=1,
+    )
+    if completed_f != 5 * completed_g or completed_cycles != completed_g:
         raise RuntimeError("checkpoint manifest F/G/cycle clocks disagree")
     if manifest["next_substep"] != "F1":
         raise RuntimeError("checkpoint manifest next_substep must be F1")
@@ -1793,7 +2340,12 @@ def _validate_manifest_and_files(
         or ema["initialized"] != expected_initialized
         or ema["canonical_artifact"]
         != ("generator_ema.safetensors" if expected_initialized else None)
-        or ema["last_completed_generator_update"] != completed_g
+        or _plain_int(
+            ema["last_completed_generator_update"],
+            "manifest.ema.last_completed_generator_update",
+            minimum=1,
+        )
+        != completed_g
     ):
         raise RuntimeError("checkpoint EMA manifest disagrees with completed G")
     entries = manifest["files"]
@@ -1852,6 +2404,7 @@ def validate_stage2_checkpoint(
     *,
     expected_contract_hash: str | None = None,
     expected_topology: Mapping[str, Any] | None = None,
+    expected_phase_b_mode: str | None = None,
     expected_generator_parameter_names: Sequence[str] | None = None,
     expected_fake_score_parameter_names: Sequence[str] | None = None,
 ) -> dict[str, Any]:
@@ -1887,6 +2440,21 @@ def validate_stage2_checkpoint(
             expected_contract_hash or manifest["config"]["contract_hash"]
         ),
     )
+    _validate_metrics_lineage_snapshot(
+        path / "metrics_lineage.jsonl",
+        trainer_state=trainer,
+    )
+    if expected_phase_b_mode is not None:
+        if expected_phase_b_mode not in {"disabled", "dmd_dfd", "dmd_only"}:
+            raise ValueError("expected_phase_b_mode is invalid")
+        checkpoint_mode = trainer["phase_state"]["phase_b_mode"]
+        if (
+            completed_g > STAGE2_PHASE_A_GENERATOR_UPDATES
+            and checkpoint_mode != expected_phase_b_mode
+        ):
+            raise RuntimeError(
+                "Stage-2 post-A24 checkpoint belongs to a different Phase-B arm"
+            )
     if (
         trainer["completed_generator_updates"] != completed_g
         or trainer["completed_fake_updates"] != manifest["completed_fake_updates"]
@@ -1903,16 +2471,7 @@ def validate_stage2_checkpoint(
         or canonical_json_sha256(provenance) != manifest["provenance_sha256"]
     ):
         raise RuntimeError("checkpoint provenance self binding mismatch")
-    for rank in range(STAGE2_WORLD_SIZE):
-        _validate_ema_state(
-            _torch_load_cpu(path / f"ema_state_rank{rank:05d}.pt"),
-            rank=rank,
-            completed_g=completed_g,
-        )
-        validate_stage2_rng_state(
-            _torch_load_cpu(path / f"rng_state_rank{rank:05d}.pt"),
-            expected_rank=rank,
-        )
+    validate_stage2_provenance(provenance)
     generator_state = _torch_load_cpu(path / "optimizer_generator.pt")
     fake_state = _torch_load_cpu(path / "optimizer_fake_score.pt")
     generator_names = tuple(
@@ -1920,6 +2479,21 @@ def validate_stage2_checkpoint(
     )
     fake_names = tuple(
         expected_fake_score_parameter_names or _optimizer_names(fake_state)
+    )
+    rank_ema_states = {
+        rank: _torch_load_cpu(path / f"ema_state_rank{rank:05d}.pt")
+        for rank in range(STAGE2_WORLD_SIZE)
+    }
+    rank_rng_states = {
+        rank: _torch_load_cpu(path / f"rng_state_rank{rank:05d}.pt")
+        for rank in range(STAGE2_WORLD_SIZE)
+    }
+    _validate_rank_state_maps(
+        rank_ema_states=rank_ema_states,
+        rank_rng_states=rank_rng_states,
+        completed_g=completed_g,
+        expected_ema_parameter_names=set(generator_names),
+        trainer_state=trainer,
     )
     validate_stage2_full_optimizer_state(
         generator_state,
@@ -1970,6 +2544,23 @@ class Stage2CheckpointPayload:
 
 
 @dataclass(frozen=True)
+class Stage2GeneratorEMACheckpointPayload:
+    """Inference-only view of a committed, initialized Generator EMA.
+
+    The loader for this view verifies every manifest-listed byte, but it never
+    deserializes optimizer, rank-local EMA, trainer, or RNG pickle payloads.
+    This keeps the inference gate memory-bounded even for a full 8-rank H100
+    checkpoint while retaining the same fail-closed publication envelope.
+    """
+
+    directory: Path
+    manifest: Mapping[str, Any]
+    resolved_config: Mapping[str, Any]
+    provenance: Mapping[str, Any]
+    generator_ema: OrderedDict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
 class Stage2DistributedCheckpointPayload:
     """Per-rank resume view produced by collective checkpoint loading.
 
@@ -1992,12 +2583,124 @@ class Stage2DistributedCheckpointPayload:
     provenance: Mapping[str, Any]
 
 
+def load_stage2_generator_ema_checkpoint(
+    directory: str | os.PathLike[str],
+    *,
+    expected_contract_hash: str,
+    expected_launch_hash: str,
+    expected_topology: Mapping[str, Any] | None = None,
+    expected_resolved_config: Mapping[str, Any] | None = None,
+    expected_generator_schema: Mapping[str, LoraTensorSpec] | None = None,
+) -> Stage2GeneratorEMACheckpointPayload:
+    """Load only the canonical Generator EMA behind a complete checkpoint.
+
+    ``expected_contract_hash`` and ``expected_launch_hash`` bind the caller's
+    resolved experiment to the manifest. ``resolved_config.json`` and all
+    other payload bytes are, in turn, bound to that same self-hashed manifest.
+    Passing ``expected_resolved_config`` adds an exact canonical-JSON equality
+    check. Optimizer, trainer, per-rank EMA, and RNG files are hash-scanned as
+    ordinary bytes and are deliberately never passed to :func:`torch.load`.
+    """
+
+    candidate = Path(directory).expanduser()
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise RuntimeError(
+            f"Stage-2 checkpoint is not a regular directory: {candidate}"
+        )
+    path = candidate.resolve()
+    completed_g = checkpoint_generator_updates(path)
+    if not (path / "_SUCCESS").is_file():
+        raise RuntimeError(f"incomplete uncommitted Stage-2 checkpoint: {path}")
+    manifest = _validate_manifest_and_files(
+        path,
+        expected_completed_g=completed_g,
+        require_success_marker=True,
+    )
+    expected_contract = _sha256(expected_contract_hash, "expected_contract_hash")
+    expected_launch = _sha256(expected_launch_hash, "expected_launch_hash")
+    if manifest["config"]["contract_hash"] != expected_contract:
+        raise RuntimeError("Stage-2 checkpoint contract hash mismatch")
+    if manifest["config"]["launch_hash"] != expected_launch:
+        raise RuntimeError("Stage-2 checkpoint launch hash mismatch")
+    if expected_topology is not None and manifest["topology"] != _validate_topology(
+        expected_topology
+    ):
+        raise RuntimeError("Stage-2 checkpoint topology differs from this launch")
+    if (
+        completed_g < STAGE2_EMA_START_GENERATOR_UPDATE
+        or manifest["ema"]["initialized"] is not True
+        or manifest["ema"]["canonical_artifact"] != "generator_ema.safetensors"
+    ):
+        raise RuntimeError(
+            "Stage-2 Generator EMA inference requires an initialized G>=40 checkpoint"
+        )
+
+    with (path / "resolved_config.json").open("r", encoding="utf-8") as handle:
+        resolved_config = json.load(handle)
+    if not isinstance(resolved_config, Mapping):
+        raise TypeError("Stage-2 resolved_config.json must contain a mapping")
+    # Reject non-canonical/non-finite JSON even though its raw bytes were
+    # already authenticated by the manifest.
+    canonical_json_sha256(resolved_config)
+    if expected_resolved_config is not None and canonical_json_sha256(
+        dict(resolved_config)
+    ) != canonical_json_sha256(dict(expected_resolved_config)):
+        raise RuntimeError("Stage-2 resolved config differs from this launch")
+
+    with (path / "provenance.json").open("r", encoding="utf-8") as handle:
+        provenance = json.load(handle)
+    if (
+        not isinstance(provenance, Mapping)
+        or canonical_json_sha256(dict(provenance)) != manifest["provenance_sha256"]
+    ):
+        raise RuntimeError("checkpoint provenance self binding mismatch")
+    provenance = validate_stage2_provenance(provenance)
+
+    generator_ema_entry = next(
+        item
+        for item in manifest["files"]
+        if item["name"] == "generator_ema.safetensors"
+    )
+    generator_ema = _load_authenticated_safetensors_snapshot(
+        path / "generator_ema.safetensors",
+        expected_size=generator_ema_entry["size"],
+        expected_sha256=generator_ema_entry["sha256"],
+    )
+    if expected_generator_schema is not None:
+        generator_ema = validate_stage2_adapter_state(
+            generator_ema,
+            expected_schema=expected_generator_schema,
+            role="generator_ema",
+        )
+    else:
+        if not generator_ema:
+            raise RuntimeError("Stage-2 canonical Generator EMA is empty")
+        for name, tensor in generator_ema.items():
+            if not isinstance(name, str) or not name or name != name.strip():
+                raise RuntimeError("Stage-2 canonical Generator EMA has an invalid key")
+            if tensor.device.type != "cpu" or tensor.dtype != torch.float32:
+                raise TypeError(
+                    f"Stage-2 Generator EMA {name} must be canonical CPU FP32"
+                )
+            if tensor.numel() and not bool(torch.isfinite(tensor).all().item()):
+                raise ValueError(f"Stage-2 Generator EMA {name} is non-finite")
+
+    return Stage2GeneratorEMACheckpointPayload(
+        directory=path,
+        manifest=manifest,
+        resolved_config=dict(resolved_config),
+        provenance=provenance,
+        generator_ema=generator_ema,
+    )
+
+
 def load_stage2_checkpoint(
     directory: str | os.PathLike[str],
     *,
     expected_contract_hash: str | None = None,
     expected_world_size: int = STAGE2_WORLD_SIZE,
     expected_topology: Mapping[str, Any] | None = None,
+    expected_phase_b_mode: str | None = None,
     expected_generator_parameter_names: Sequence[str] | None = None,
     expected_fake_score_parameter_names: Sequence[str] | None = None,
 ) -> Stage2CheckpointPayload:
@@ -2012,6 +2715,7 @@ def load_stage2_checkpoint(
         candidate,
         expected_contract_hash=expected_contract_hash,
         expected_topology=expected_topology,
+        expected_phase_b_mode=expected_phase_b_mode,
         expected_generator_parameter_names=expected_generator_parameter_names,
         expected_fake_score_parameter_names=expected_fake_score_parameter_names,
     )
@@ -2050,6 +2754,7 @@ def load_stage2_checkpoint_collective(
     directory: str | os.PathLike[str],
     *,
     expected_contract_hash: str,
+    expected_phase_b_mode: str,
     expected_world_size: int = STAGE2_WORLD_SIZE,
     expected_topology: Mapping[str, Any] | None = None,
     expected_generator_parameter_names: Sequence[str] | None = None,
@@ -2076,6 +2781,7 @@ def load_stage2_checkpoint_collective(
                     expected_contract_hash=expected_contract_hash,
                     expected_world_size=expected_world_size,
                     expected_topology=expected_topology,
+                    expected_phase_b_mode=expected_phase_b_mode,
                     expected_generator_parameter_names=expected_generator_parameter_names,
                     expected_fake_score_parameter_names=expected_fake_score_parameter_names,
                 )
@@ -2132,7 +2838,11 @@ def load_stage2_checkpoint_collective(
             )
             completed_g = int(small["trainer_state"]["completed_generator_updates"])
             _validate_ema_state(local_ema, rank=rank, completed_g=completed_g)
-            validate_stage2_rng_state(local_rng, expected_rank=rank)
+            validate_stage2_rng_state(
+                local_rng,
+                expected_rank=rank,
+                expected_dedicated_names=set(STAGE2_DEDICATED_RNG_NAMES),
+            )
             raw_g = (
                 full_rank0.generator_raw
                 if rank == 0
@@ -2194,8 +2904,12 @@ def _checkpoint_candidates(root: Path) -> list[tuple[int, Path]]:
             raise RuntimeError(
                 f"Stage-2 checkpoint candidate is not a directory: {child}"
             )
-        if not (child / "_SUCCESS").is_file():
-            raise RuntimeError(f"incomplete uncommitted Stage-2 checkpoint: {child}")
+        marker = child / "_SUCCESS"
+        if not marker.exists() and not marker.is_symlink():
+            # A crash after atomic rename but before marker publication leaves
+            # this exact shape. It is not a checkpoint and must not prevent
+            # recovery from the previous complete cycle.
+            continue
         step = int(match.group(1))
         validate_stage2_checkpoint(child)
         candidates.append((step, child))
@@ -2310,6 +3024,7 @@ def save_stage2_checkpoint(
     root: str | os.PathLike[str],
     *,
     trainer_state: Mapping[str, Any],
+    metrics_lineage_snapshot: bytes | None = None,
     resolved_config: Mapping[str, Any] | Any,
     generator_module: torch.nn.Module,
     fake_score_module: torch.nn.Module,
@@ -2346,11 +3061,57 @@ def save_stage2_checkpoint(
     ops = _collectives(collectives)
     rank = int(ops.get_rank())
     io_rng = capture_rng_state(include_cuda=io_include_cuda)
+    local_rng_state: Mapping[str, Any] | None = None
     try:
+        # Persist the exact entry state before any LoRA/DCP/EMA gather. The same
+        # snapshot is restored in ``finally`` so checkpoint I/O is transparent
+        # to both default and explicit RNG streams.
+        local_rng_state = _consensus_call(
+            "rank-local Stage-2 entry RNG capture",
+            lambda: capture_stage2_rng_state(
+                rank=rank,
+                dedicated_generators=dedicated_generators,
+                rank0_control_generators=rank0_control_generators,
+                include_cuda=io_include_cuda,
+            ),
+            ops,
+        )
+        validate_stage2_rng_state(
+            local_rng_state,
+            expected_rank=rank,
+            expected_dedicated_names=set(STAGE2_DEDICATED_RNG_NAMES),
+        )
         validate_stage2_trainer_state(trainer_state)
         completed_g = int(trainer_state["completed_generator_updates"])
         completed_f = int(trainer_state["completed_fake_updates"])
         _validate_topology(topology)
+
+        def audit_runtime_boundary() -> None:
+            pending_gradients = [
+                f"{role}.{name}"
+                for role, module in (
+                    ("generator", generator_module),
+                    ("fake_score", fake_score_module),
+                )
+                for name, parameter in module.named_parameters()
+                if parameter.grad is not None
+            ]
+            if pending_gradients:
+                raise RuntimeError(
+                    "Stage-2 checkpoint boundary contains pending gradients: "
+                    f"{pending_gradients[:8]}"
+                )
+            loader_states = trainer_state["dataloader_generator_states"]
+            for role in STAGE2_ROLE_NAMES:
+                generator = dedicated_generators.get(f"{role}_loader")
+                if generator is None or not torch.equal(
+                    generator.get_state().detach().cpu(), loader_states[role]
+                ):
+                    raise RuntimeError(
+                        f"Stage-2 {role} DataLoader RNG copies disagree at save entry"
+                    )
+
+        _consensus_call("live cycle-boundary audit", audit_runtime_boundary, ops)
         raw_generator = gather_stage2_lora_state_dict(
             generator_module,
             expected_schema=generator_schema,
@@ -2389,7 +3150,14 @@ def save_stage2_checkpoint(
 
         def audit_local_ema_clock() -> Mapping[str, Any]:
             state = generator_ema.state_dict()
-            return _validate_ema_state(state, rank=rank, completed_g=completed_g)
+            return _validate_ema_state(
+                state,
+                rank=rank,
+                completed_g=completed_g,
+                expected_parameter_names={
+                    spec.raw_parameter_name for spec in generator_schema.values()
+                },
+            )
 
         local_ema_state = _consensus_call(
             "rank-local Generator EMA clock audit", audit_local_ema_clock, ops
@@ -2407,17 +3175,6 @@ def save_stage2_checkpoint(
             if expected_ema_initialized
             else None
         )
-        local_rng_state = _consensus_call(
-            "rank-local Stage-2 RNG capture",
-            lambda: capture_stage2_rng_state(
-                rank=rank,
-                dedicated_generators=dedicated_generators,
-                rank0_control_generators=rank0_control_generators,
-                include_cuda=io_include_cuda,
-            ),
-            ops,
-        )
-
         gather_fn = gather_rank_object_fn or dist.gather_object
         gathered_rank_payloads: list[Any] | None = [None] * 8 if rank == 0 else None
         _consensus_call(
@@ -2434,6 +3191,10 @@ def save_stage2_checkpoint(
         def publish_rank_zero() -> str | None:
             if rank != 0:
                 return None
+            if not isinstance(metrics_lineage_snapshot, bytes):
+                raise TypeError(
+                    "rank0 requires the exact Stage-2 metrics lineage snapshot"
+                )
             assert gathered_rank_payloads is not None
             by_rank: dict[int, tuple[Mapping[str, Any], Mapping[str, Any]]] = {}
             for payload in gathered_rank_payloads:
@@ -2466,6 +3227,7 @@ def save_stage2_checkpoint(
             destination = save_stage2_checkpoint_from_payloads(
                 root,
                 trainer_state=trainer_state,
+                metrics_lineage_snapshot=metrics_lineage_snapshot,
                 generator_raw=raw_generator,
                 fake_score_raw=raw_fake_score,
                 generator_ema=ema_adapter,
@@ -2496,16 +3258,28 @@ def save_stage2_checkpoint(
     finally:
         # Includes collective gathering and rank-local serialization, not just
         # rank-0 filesystem writes.
-        restore_rng_state(io_rng, require_cuda_topology=io_include_cuda)
+        if local_rng_state is None:
+            restore_rng_state(io_rng, require_cuda_topology=io_include_cuda)
+        else:
+            restore_stage2_rng_state(
+                local_rng_state,
+                rank=rank,
+                dedicated_generators=dedicated_generators,
+                rank0_control_generators=rank0_control_generators,
+                require_cuda_topology=io_include_cuda,
+            )
 
 
 __all__ = [
     "STAGE2_CHECKPOINT_MILESTONES",
     "STAGE2_CHECKPOINT_SCHEMA",
+    "STAGE2_DEDICATED_RNG_NAMES",
     "STAGE2_EMA_START_GENERATOR_UPDATE",
+    "STAGE2_PROVENANCE_SCHEMA",
     "Stage2CheckpointPayload",
     "Stage2CollectiveOps",
     "Stage2DistributedCheckpointPayload",
+    "Stage2GeneratorEMACheckpointPayload",
     "apply_stage2_checkpoint_retention",
     "audit_stage2_lora_optimizer",
     "build_stage2_trainer_state",
@@ -2519,6 +3293,7 @@ __all__ = [
     "gather_stage2_optimizer_state",
     "load_stage2_checkpoint",
     "load_stage2_checkpoint_collective",
+    "load_stage2_generator_ema_checkpoint",
     "restore_stage2_optimizer_state",
     "restore_stage2_rng_state",
     "save_stage2_checkpoint",
@@ -2527,6 +3302,7 @@ __all__ = [
     "validate_stage2_checkpoint",
     "validate_stage2_cycle_boundary",
     "validate_stage2_full_optimizer_state",
+    "validate_stage2_provenance",
     "validate_stage2_rng_state",
     "validate_stage2_trainer_state",
 ]

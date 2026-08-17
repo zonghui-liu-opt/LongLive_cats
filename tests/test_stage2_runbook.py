@@ -2,31 +2,38 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import sys
 
 from omegaconf import OmegaConf
 
 from utils.stage2_config import resolve_stage2_config
 
 PROJECT_ROOT = Path(__file__).parents[1]
+TASK = PROJECT_ROOT / "TASK-stage2-self-forcing-dmd-dfd.md"
 RUNBOOK = PROJECT_ROOT / "docs" / "STAGE2_H100_QUICK_DEPLOY_ZH.md"
+FULL_RUNBOOK = PROJECT_ROOT / "docs" / "STAGE2_H100_TRAINING_INFERENCE_RUNBOOK_ZH.md"
 CONFIG = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats.yaml"
 PREPARE = PROJECT_ROOT / "prepare_stage2.sh"
 PRECOMPUTE = PROJECT_ROOT / "precompute_stage2_i2v_cache_h100_8gpu.sh"
-CONTRACT_HASH = "dae3f4075f073351f27126d86a61be38d3c370fd5399a381788a0f51d959a5ea"
+CONTRACT_HASH = "a7365f2ec45f74c3918ec05725b5d19b488fa4447a409cc6b5db4ccb114dd6c6"
 
 
-def test_stage2_runbook_exposes_only_the_five_pretrain_checks():
+def test_stage2_runbook_exposes_only_the_six_pretrain_checks():
     text = RUNBOOK.read_text(encoding="utf-8")
 
     required = (
         "ACTION_SIDECAR_600",
         "ATTEST_STAGE2_TEACHER=1",
+        "STAGE2_WORK_ROOT",
+        "STAGE2_H100_TRAINING_INFERENCE_RUNBOOK_ZH.md",
+        "run_stage2_h100.sh",
         "bash prepare_stage2.sh",
         "CHECK_1_TEACHER_PASS",
         "CHECK_2_GENERATOR_PASS",
         "CHECK_3_CONFIG_PASS",
         "CHECK_4_DATA_PASS",
         "CHECK_5_ROLE_INIT_PASS",
+        "CHECK_6_FSDP2_ACCUMULATION_PASS",
         "STAGE2_PRETRAIN_PASS",
     )
     assert all(item in text for item in required)
@@ -36,6 +43,94 @@ def test_stage2_runbook_exposes_only_the_five_pretrain_checks():
     assert "checkpoint_stage2_" not in text
     assert "configs/train_i2v_stage2.yaml" not in text
     assert len(text.splitlines()) < 60
+    assert "docs/STAGE2_H100_TRAINING_INFERENCE_RUNBOOK_ZH.md" in TASK.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_full_stage2_runbook_covers_exact_release_lifecycle():
+    text = FULL_RUNBOOK.read_text(encoding="utf-8")
+    required = (
+        "head_tilt_and_wink=198",
+        "jump=202",
+        "play_with_a_cat_wand=200",
+        "checkpoint_model_003075",
+        "CHECK_6_FSDP2_ACCUMULATION_PASS",
+        "--stage2-smoke C0",
+        "--stage2-smoke C1",
+        "--stage2-smoke C2",
+        "microbatch_size_per_device = 1",
+        "gradient_accumulation_steps = 8",
+        "checkpoint_stage2_g000280",
+        "checkpoint_stage2_g000240",
+        "formal_matched_b0",
+        'phase_b_mode = "dmd_only"',
+        "phase_b_dfd_probability_max = 0.0",
+        "immutable ancestry anchor",
+        "metrics_lineage.jsonl",
+        "--require-complete",
+        "infer_stage2_baseline.sh",
+        "STAGE2_BASELINE_INFERENCE_ARTIFACTS=PASS",
+        "git status --porcelain=v1 --untracked-files=all",
+        "abs(error_seconds) <= max(0.1, 0.05 * step_seconds_max)",
+        "SIGKILL",
+        "run_stage2_h100.sh help",
+    )
+    assert all(item in text for item in required)
+    assert text.count("```") % 2 == 0
+    assert "200/200/200" not in text
+    assert "checkpoint_model_003750" not in text
+    assert (
+        text.count('test -z "$(git status --porcelain=v1 --untracked-files=all)"') >= 2
+    )
+
+
+def test_documented_b0_transform_is_a_resolvable_same_contract_resume(tmp_path):
+    baseline_config = OmegaConf.load(CONFIG)
+    baseline = resolve_stage2_config(baseline_config)
+    anchor = tmp_path / "checkpoint_stage2_g000240"
+    anchor.mkdir()
+
+    b0_config = OmegaConf.load(CONFIG)
+    b0_config.checkpoints.init_from_stage1 = None
+    b0_config.checkpoints.resume_stage2 = str(anchor.resolve(strict=True))
+    b0_config.training.phase_b_mode = "dmd_only"
+    b0_config.training.phase_b_dfd_probability_max = 0.0
+    b0 = resolve_stage2_config(b0_config)
+
+    assert b0.initialization_mode == "resume_stage2"
+    assert b0.resume_stage2_checkpoint == str(anchor.resolve())
+    assert b0.phase_b_mode == "dmd_only"
+    assert b0.phase_b_dfd_probability_max == 0.0
+    assert b0.contract_hash() == baseline.contract_hash() == CONTRACT_HASH
+
+
+def test_stage2_release_work_root_defaults_outside_the_checkout():
+    text = PREPARE.read_text(encoding="utf-8")
+    assert "/stage2_runs/LongLive-2.0_stage2_new" in text
+    assert "LongLive-2.0/checkpoints/stage2_new" not in text
+
+
+def test_stage2_isolated_release_entrypoints_bootstrap_the_checkout():
+    commands = (
+        [sys.executable, "-I", "-B", "train.py", "--help"],
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "tests/stage2_fsdp2_accumulation_gate.py",
+            "--help",
+        ],
+    )
+    for command in commands:
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_stage2_runtime_asset_environment_reaches_the_resolver(monkeypatch):
@@ -75,11 +170,11 @@ def test_stage2_runtime_asset_environment_reaches_the_resolver(monkeypatch):
         resolved.negative_conditioning_manifest
         == paths["LONG_LIVE_STAGE2_NEGATIVE_MANIFEST"]
     )
-    assert resolved.generator_stage1_step == 3750
+    assert resolved.generator_stage1_step == 3075
     assert resolved.contract_hash() == CONTRACT_HASH
 
 
-def test_prepare_stage2_runs_exactly_the_five_pretrain_gates_without_training():
+def test_prepare_stage2_runs_exactly_the_six_pretrain_gates_without_training():
     text = PREPARE.read_text(encoding="utf-8")
 
     for marker in (
@@ -88,6 +183,7 @@ def test_prepare_stage2_runs_exactly_the_five_pretrain_gates_without_training():
         "CHECK_3_CONFIG_PASS",
         "CHECK_4_DATA_PASS",
         "CHECK_5_ROLE_INIT_PASS",
+        "CHECK_6_FSDP2_ACCUMULATION_PASS",
         "STAGE2_PRETRAIN_PASS",
     ):
         assert text.count(marker) == 1
@@ -99,19 +195,24 @@ def test_prepare_stage2_runs_exactly_the_five_pretrain_gates_without_training():
         "upgrade-source-manifest",
         "prepare-negative",
         "scripts/preflight_stage2_roles.py",
+        "tests/stage2_fsdp2_accumulation_gate.py",
+        "--require-h100",
     ):
         assert command in text
 
-    assert "expected_step=3750" in text
+    assert "expected_step=3075" in text
+    assert "ATTEST_STAGE2_TEACHER" in text
     assert "wan_native_transformer" in text
     assert "negative_conditioning_manifest.json" in text
     assert "init_only_audit_not_training_checkpoint" in text
     assert "--stage2-smoke" not in text
     assert "train.py" not in text
     assert "--no-auto-resume" not in text
-    assert "stage1_step3075" not in text
+    assert "stage1_step3750" not in text
     assert "git " not in text
     assert "STAGE2_PRETRAIN_INNER" not in text
+    assert 'cd -- "$SOURCE_REPO"' in text
+    assert "rm -rf" not in text
 
     completed = subprocess.run(
         ["bash", "-n", str(PREPARE)],

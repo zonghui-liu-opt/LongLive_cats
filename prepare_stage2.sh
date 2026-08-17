@@ -3,9 +3,9 @@ set -Eeuo pipefail
 
 trap 'echo "STAGE2_PRETRAIN_CHECK_FAILED (line ${LINENO})" >&2' ERR
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_pretrain_check}"
-cd "$REPO_ROOT"
+SOURCE_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SOURCE_REPO
+STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new}"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
@@ -15,25 +15,25 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 STAGE2_PYTHON="${STAGE2_PYTHON:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python}"
 STAGE2_TORCHRUN="${STAGE2_TORCHRUN:-$(dirname "$STAGE2_PYTHON")/torchrun}"
-STAGE2_CONFIG="configs/train_i2v_stage2_600cats.yaml"
+STAGE2_CONFIG="${STAGE2_CONFIG:-$SOURCE_REPO/configs/train_i2v_stage2_600cats.yaml}"
 
 ARCH_ROOT="${ARCH_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}"
 TEACHER_CKPT="${TEACHER_CKPT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts}"
-TEACHER_PROVENANCE_RECORD="${TEACHER_PROVENANCE_RECORD:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/merge_manifest.json}"
+TEACHER_PROVENANCE_RECORD="${TEACHER_PROVENANCE_RECORD:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts/merge_manifest.json}"
 STAGE1_BASE="${STAGE1_BASE:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage1/converted_causal_base.pt}"
-STAGE1_CKPT="${STAGE1_CKPT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/results/stage1_600cats_3750steps}"
+STAGE1_CKPT="${STAGE1_CKPT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/results/stage1_600cats_phaseA10epochs_phaseB20epochs/checkpoint_model_003075}"
 METADATA_600="${METADATA_600:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/metadata_600clips_480x832_buckets.csv}"
 STAGE1_CACHE_MANIFEST="${STAGE1_CACHE_MANIFEST:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/cache_480x832_buckets/ar_stage1_i2v_600cats/cache_manifest.json}"
-ACTION_SIDECAR_600="${ACTION_SIDECAR_600:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/action_labels_600.csv}"
+ACTION_SIDECAR_600="${ACTION_SIDECAR_600:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/action_labels_600cats.csv}"
 OPERATOR_ID="${OPERATOR_ID:-l00832862}"
 
 ASSET_DIR="$STAGE2_WORK_ROOT/assets"
 LOG_DIR="$STAGE2_WORK_ROOT/logs"
 RUN_DIR="$STAGE2_WORK_ROOT/run"
 TEACHER_MANIFEST="${TEACHER_MANIFEST:-$ASSET_DIR/real_score_teacher.manifest.json}"
-G_MERGED="${G_MERGED:-$ASSET_DIR/stage1_step3750_ema_merged.pt}"
+G_MERGED="${G_MERGED:-$ASSET_DIR/stage1_step3075_ema_merged.pt}"
 G_MANIFEST="${G_MANIFEST:-${G_MERGED%.pt}.manifest.json}"
-STAGE2_CACHE_DIR="${STAGE2_CACHE_DIR:-$STAGE2_WORK_ROOT/f25_600_v1}"
+STAGE2_CACHE_DIR="${STAGE2_CACHE_DIR:-$STAGE2_WORK_ROOT/stage2_600cats_f25_v1}"
 F25_BASE="$STAGE2_CACHE_DIR/cache_manifest.json"
 F25_SUCCESS="$STAGE2_CACHE_DIR/_F25_SUCCESS.json"
 F25_ATTESTED="${F25_ATTESTED:-$STAGE2_CACHE_DIR/cache_manifest.attested.json}"
@@ -46,10 +46,25 @@ VAE_CKPT="$ARCH_ROOT/Wan2.2_VAE.pth"
 T5_CKPT="$ARCH_ROOT/models_t5_umt5-xxl-enc-bf16.pth"
 TOKENIZER_DIR="$ARCH_ROOT/google/umt5-xxl"
 
-mkdir -p "$ASSET_DIR" "$LOG_DIR" "$RUN_DIR"
-
 [[ -x "$STAGE2_PYTHON" ]] || { echo "不可执行：$STAGE2_PYTHON" >&2; exit 1; }
 [[ -x "$STAGE2_TORCHRUN" ]] || { echo "不可执行：$STAGE2_TORCHRUN" >&2; exit 1; }
+STAGE2_WORK_ROOT_REAL="$("$STAGE2_PYTHON" -I -B -c \
+  'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' \
+  "$STAGE2_WORK_ROOT")"
+case "$STAGE2_WORK_ROOT_REAL/" in
+  "$SOURCE_REPO/"*)
+    echo "STAGE2_WORK_ROOT 必须位于 Git checkout 外：$STAGE2_WORK_ROOT_REAL" >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$ASSET_DIR" "$LOG_DIR" "$RUN_DIR"
+cd -- "$SOURCE_REPO"
+
+[[ "${ATTEST_STAGE2_TEACHER:-0}" == "1" ]] || {
+  echo "确认该双向合并权重就是 Stage-2 teacher 后，执行：export ATTEST_STAGE2_TEACHER=1" >&2
+  exit 1
+}
+
 for path in \
   "$ARCH_ROOT" "$TEACHER_CKPT" \
   "$TEACHER_PROVENANCE_RECORD" "$STAGE1_BASE" "$STAGE1_CKPT" \
@@ -57,22 +72,6 @@ for path in \
   "$VAE_CKPT" "$T5_CKPT" "$TOKENIZER_DIR"; do
   [[ -e "$path" ]] || { echo "缺少：$path" >&2; exit 1; }
 done
-
-[[ "${ATTEST_STAGE2_TEACHER:-0}" == "1" ]] || {
-  echo "确认该双向合并权重就是 Stage-2 teacher 后，执行：export ATTEST_STAGE2_TEACHER=1" >&2
-  exit 1
-}
-
-"$STAGE2_PYTHON" -B - <<'PY'
-import torch
-
-assert torch.cuda.device_count() == 8, f"需要 8 张 GPU，实际 {torch.cuda.device_count()}"
-names = [torch.cuda.get_device_name(i) for i in range(8)]
-assert all("H100" in name for name in names), names
-assert all(torch.cuda.get_device_properties(i).total_memory >= 79 * 1024**3 for i in range(8))
-assert torch.cuda.is_bf16_supported()
-print("8xH100 BF16 environment: OK")
-PY
 
 # 1. real-score teacher manifest
 provenance_fields="$("$STAGE2_PYTHON" -I -B - \
@@ -152,7 +151,8 @@ assert result["provenance"]["conversion_command"] == ["none"]
 PY
 echo "CHECK_1_TEACHER_PASS"
 
-# 2. Stage-1 step3750 EMA Generator
+
+# 2. Stage-1 step3075 EMA Generator
 if [[ ! -e "$G_MERGED" && ! -e "$G_MANIFEST" ]]; then
   CUDA_VISIBLE_DEVICES=0 "$STAGE2_PYTHON" -I -B scripts/merge_lora_generator.py \
     --base-checkpoint "$STAGE1_BASE" \
@@ -170,7 +170,7 @@ import sys
 from pathlib import Path
 from utils.stage2_role_manifest import validate_stage2_generator_manifest
 validate_stage2_generator_manifest(
-    Path(sys.argv[1]), expected_checkpoint_path=Path(sys.argv[2]), expected_step=3750
+    Path(sys.argv[1]), expected_checkpoint_path=Path(sys.argv[2]), expected_step=3075
 )
 PY
 echo "CHECK_2_GENERATOR_PASS"
@@ -196,19 +196,101 @@ from omegaconf import OmegaConf
 from utils.stage2_config import resolve_stage2_config
 
 resolved = resolve_stage2_config(OmegaConf.load(sys.argv[1]))
+
+# ---- 先做全部校验，全部通过后才落盘 ----
+assert resolved.generator_stage1_step == 3075, \
+    f"generator_stage1_step mismatch: expected 3075, got {resolved.generator_stage1_step}"
+
+assert resolved.init_generator_checkpoint == os.environ["LONG_LIVE_STAGE2_GENERATOR_BASE"], \
+    f"init_generator_checkpoint mismatch: resolved={resolved.init_generator_checkpoint!r}, env={os.environ['LONG_LIVE_STAGE2_GENERATOR_BASE']!r}"
+
+assert resolved.init_generator_manifest == os.environ["LONG_LIVE_STAGE2_GENERATOR_MANIFEST"], \
+    f"init_generator_manifest mismatch: resolved={resolved.init_generator_manifest!r}, env={os.environ['LONG_LIVE_STAGE2_GENERATOR_MANIFEST']!r}"
+
+assert resolved.init_real_score_checkpoint == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_BASE"], \
+    f"init_real_score_checkpoint mismatch: resolved={resolved.init_real_score_checkpoint!r}, env={os.environ['LONG_LIVE_STAGE2_REAL_SCORE_BASE']!r}"
+
+assert resolved.init_real_score_manifest == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST"], \
+    f"init_real_score_manifest mismatch: resolved={resolved.init_real_score_manifest!r}, env={os.environ['LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST']!r}"
+
+assert resolved.source_cache_manifest == os.environ["LONG_LIVE_STAGE2_SOURCE_MANIFEST"], \
+    f"source_cache_manifest mismatch: resolved={resolved.source_cache_manifest!r}, env={os.environ['LONG_LIVE_STAGE2_SOURCE_MANIFEST']!r}"
+
+assert resolved.negative_conditioning_manifest == os.environ["LONG_LIVE_STAGE2_NEGATIVE_MANIFEST"], \
+    f"negative_conditioning_manifest mismatch: resolved={resolved.negative_conditioning_manifest!r}, env={os.environ['LONG_LIVE_STAGE2_NEGATIVE_MANIFEST']!r}"
+
+# ---- 校验全部通过，写入 resolved_config.json ----
 payload = resolved.to_dict()
 payload["contract_sha256"] = resolved.contract_hash()
 payload["launch_sha256"] = resolved.launch_hash()
 Path(sys.argv[2]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-assert resolved.generator_stage1_step == 3750
-assert resolved.init_generator_checkpoint == os.environ["LONG_LIVE_STAGE2_GENERATOR_BASE"]
-assert resolved.init_generator_manifest == os.environ["LONG_LIVE_STAGE2_GENERATOR_MANIFEST"]
-assert resolved.init_real_score_checkpoint == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_BASE"]
-assert resolved.init_real_score_manifest == os.environ["LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST"]
-assert resolved.source_cache_manifest == os.environ["LONG_LIVE_STAGE2_SOURCE_MANIFEST"]
-assert resolved.negative_conditioning_manifest == os.environ["LONG_LIVE_STAGE2_NEGATIVE_MANIFEST"]
 PY
 echo "CHECK_3_CONFIG_PASS"
+
+# 3.5 清理与本次 launch_hash 不一致的过期产物，让下游守卫自然触发重跑
+#     只处理 launch 级绑定的两类产物：
+#       a) $FINAL_CACHE_MANIFEST（仅该文件；同目录 F25 缓存不含 launch 绑定，保留复用）
+#       b) $ROLE_INIT_DIR（整目录；manifest 缺失/损坏/hash 不一致/COMPLETE 缺失均视为过期）
+CURRENT_LAUNCH_HASH="$("$STAGE2_PYTHON" -B -c \
+  'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["launch_sha256"])' \
+  "$RUN_DIR/resolved_config.json")"
+[[ "$CURRENT_LAUNCH_HASH" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "launch_sha256 非法：$CURRENT_LAUNCH_HASH" >&2
+  exit 1
+}
+echo "[prune] mode=archive current launch_hash=$CURRENT_LAUNCH_HASH"
+
+prune_stale() {
+  local target="$1" reason="$2"
+  local target_real
+  target_real="$("$STAGE2_PYTHON" -I -B -c \
+    'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' \
+    "$target")"
+  if [[ "$target_real" == "$STAGE2_WORK_ROOT_REAL" ]]; then
+    echo "拒绝归档整个 STAGE2_WORK_ROOT：$target_real" >&2
+    exit 1
+  fi
+  case "$target_real/" in
+    "$STAGE2_WORK_ROOT_REAL/"*) ;;
+    *)
+      echo "拒绝归档工作根目录外的过期产物：$target_real" >&2
+      exit 1
+      ;;
+  esac
+  local backup="${target_real}.stale_$(date +%Y%m%d_%H%M%S)_$$"
+  echo "[prune] 归档过期产物 ${target_real} -> ${backup}（${reason}）"
+  mv -- "$target_real" "$backup"
+}
+
+if [[ -e "$FINAL_CACHE_MANIFEST" ]]; then
+  FINAL_CACHE_HASH="$("$STAGE2_PYTHON" -B -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8"))["provenance"]["config_launch_sha256"])
+except Exception:
+    print("MISSING")
+' "$FINAL_CACHE_MANIFEST")"
+  if [[ "$FINAL_CACHE_HASH" != "$CURRENT_LAUNCH_HASH" ]]; then
+    prune_stale "$FINAL_CACHE_MANIFEST" \
+      "manifest launch_hash=$FINAL_CACHE_HASH != current"
+  fi
+fi
+
+if [[ -e "$ROLE_INIT_DIR" ]]; then
+  ROLE_INIT_HASH="$("$STAGE2_PYTHON" -B -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8"))["config"]["launch_hash"])
+except Exception:
+    print("MISSING")
+' "$ROLE_INIT_DIR/role_init_manifest.json")"
+  if [[ "$ROLE_INIT_HASH" != "$CURRENT_LAUNCH_HASH" ]]; then
+    prune_stale "$ROLE_INIT_DIR" "manifest launch_hash=$ROLE_INIT_HASH != current"
+  elif [[ ! -f "$ROLE_INIT_DIR/ROLE_INIT_COMPLETE" ]]; then
+    prune_stale "$ROLE_INIT_DIR" "缺少 ROLE_INIT_COMPLETE，视为半成品"
+  fi
+fi
+echo "CHECK_3P5_PRUNE_PASS"
 
 # 4. F25 + 文本语义证明 + negative + 600 条正式审计
 if [[ ! -f "$F25_BASE" || ! -f "$F25_SUCCESS" ]]; then
@@ -291,7 +373,7 @@ from utils.stage2_action_contract import STAGE2_EXPECTED_ACTION_COUNTS
 
 with open(sys.argv[1], "r", encoding="utf-8-sig", newline="") as handle:
     reader = csv.DictReader(handle)
-    assert reader.fieldnames == ["video", "action_id"]
+    assert reader.fieldnames == ["video", "action_id"], reader.fieldnames
     rows = list(reader)
 assert len(rows) == 600, len(rows)
 counts = Counter(row["action_id"].strip() for row in rows)
@@ -300,7 +382,10 @@ for action_id in sorted(counts):
     print(action_id)
 PY
 )
-[[ "${#ACTION_IDS[@]}" == "3" ]]
+if [[ "${#ACTION_IDS[@]}" != "3" ]]; then
+  echo "ACTION_IDS 数量异常：期望 3 个，实际 ${#ACTION_IDS[@]} 个" >&2
+  exit 1
+fi
 
 if [[ ! -e "$FINAL_CACHE_MANIFEST" ]]; then
   "$STAGE2_PYTHON" -I -B scripts/audit_stage2_i2v_cache.py audit \
@@ -334,9 +419,11 @@ validate_stage2_i2v_runtime_bindings(
     config_launch_sha256=resolved.launch_hash(),
     expected_num_samples=600,
 )
-assert manifest["actions"]["counts"] == STAGE2_EXPECTED_ACTION_COUNTS
+assert manifest["actions"]["counts"] == STAGE2_EXPECTED_ACTION_COUNTS, \
+    f"action counts mismatch: manifest={manifest['actions']['counts']}, expected={STAGE2_EXPECTED_ACTION_COUNTS}"
 PY
 echo "CHECK_4_DATA_PASS"
+
 
 # 5. 8xH100 角色初始化；只初始化，不训练
 if [[ ! -e "$ROLE_INIT_DIR" ]]; then
@@ -361,8 +448,9 @@ from omegaconf import OmegaConf
 from utils.stage1_io import canonical_json_sha256
 from utils.stage2_config import resolve_stage2_config
 
-path = Path(sys.argv[1])
 resolved = resolve_stage2_config(OmegaConf.load(sys.argv[2]))
+
+path = Path(sys.argv[1])
 record = json.loads(path.read_text(encoding="utf-8"))
 body = dict(record)
 recorded_hash = body.pop("manifest_sha256")
@@ -402,4 +490,12 @@ assert (path.parent / "ROLE_INIT_COMPLETE").stat().st_size == 0
 assert not (path.parent / "_SUCCESS").exists()
 PY
 echo "CHECK_5_ROLE_INIT_PASS"
+
+# 6. real FSDP2 gradient-accumulation parity；只跑 tiny 参数门禁，不启动训练
+"$STAGE2_TORCHRUN" \
+  --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+  --no-python "$STAGE2_PYTHON" -I -B \
+  tests/stage2_fsdp2_accumulation_gate.py --require-h100 \
+  2>&1 | tee "$LOG_DIR/fsdp2_accumulation_gate.log"
+echo "CHECK_6_FSDP2_ACCUMULATION_PASS"
 echo "STAGE2_PRETRAIN_PASS"

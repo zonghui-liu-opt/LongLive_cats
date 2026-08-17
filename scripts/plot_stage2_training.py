@@ -21,9 +21,10 @@ from utils.jsonl_logger import latest_run_id  # noqa: E402
 from utils.stage2_metrics import (  # noqa: E402
     STAGE2_METRICS_SCHEMA,
     STAGE2_TIMING_FIELDS,
-    load_stage2_metrics,
+    load_stage2_metrics_snapshot,
     stage2_records_for_latest_lineage,
     validate_stage2_metric_record,
+    validate_stage2_run_start,
 )
 
 _BRANCH_COLORS = {"dmd": "#1f77b4", "dfd": "#d95f02"}
@@ -70,6 +71,7 @@ def _latest_run_start(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 raise ValueError(
                     "latest run_start does not use the Stage-2 metric schema."
                 )
+            validate_stage2_run_start(record)
             return dict(record)
     raise AssertionError("latest run_start disappeared")
 
@@ -91,25 +93,10 @@ def _latest_run_end(
 
 
 def _phase_markers(run_start: Mapping[str, Any]) -> tuple[tuple[str, int], ...]:
-    raw = run_start.get("phase_boundaries", ())
-    if raw is None:
-        return ()
-    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
-        raise ValueError("run_start.phase_boundaries must be a list.")
-    markers: list[tuple[str, int]] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, Mapping):
-            raise ValueError(f"phase_boundaries[{index}] must be an object.")
-        label = str(item.get("label", "")).strip()
-        update = item.get("generator_update")
-        if (
-            not label
-            or isinstance(update, bool)
-            or not isinstance(update, int)
-            or update < 0
-        ):
-            raise ValueError(f"phase_boundaries[{index}] is invalid.")
-        markers.append((label, update))
+    derived = validate_stage2_run_start(run_start)
+    markers = [("Phase A end", int(derived["phase_a_generator_updates"]))]
+    if int(derived["phase_b_generator_updates"]):
+        markers.append(("Phase B end", int(derived["total_generator_updates"])))
     return tuple(markers)
 
 
@@ -196,27 +183,12 @@ def _role(records: Sequence[dict[str, Any]], role: str) -> list[dict[str, Any]]:
 
 
 def _terminal_counts(run_start: Mapping[str, Any]) -> dict[str, int]:
-    raw = run_start.get("terminal_counts")
-    if not isinstance(raw, Mapping):
-        raise ValueError("run_start.terminal_counts is required for Stage-2 plots.")
-    expected_keys = {"fake_score_updates", "generator_updates", "cycles"}
-    if set(raw) != expected_keys:
-        raise ValueError(
-            "run_start.terminal_counts keys must be " + ", ".join(sorted(expected_keys))
-        )
-    result = {}
-    for key in sorted(expected_keys):
-        value = raw[key]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"terminal_counts.{key} must be non-negative integer.")
-        result[key] = value
-    if result["fake_score_updates"] != 5 * result["generator_updates"]:
-        raise ValueError(
-            "terminal_counts must encode exactly five F updates per G update."
-        )
-    if result["cycles"] != result["generator_updates"]:
-        raise ValueError("terminal_counts.cycles must equal generator_updates.")
-    return result
+    derived = validate_stage2_run_start(run_start)
+    return {
+        "fake_score_updates": int(derived["total_fake_updates"]),
+        "generator_updates": int(derived["total_generator_updates"]),
+        "cycles": int(derived["total_cycles"]),
+    }
 
 
 def _validate_plot_records(
@@ -266,7 +238,7 @@ def _validate_complete_structure(
 def _write_html_index(
     *,
     path: Path,
-    jsonl_path: Path,
+    metrics_jsonl_sha256: str,
     run_start: Mapping[str, Any],
     run_end: Mapping[str, Any] | None,
     figures: Sequence[Path],
@@ -298,7 +270,7 @@ def _write_html_index(
         "completed_cycles": counts["cycles"],
         "config_contract_sha256": run_start.get("config_contract_sha256"),
         "config_launch_sha256": run_start.get("config_launch_sha256"),
-        "metrics_jsonl_sha256": _sha256(jsonl_path),
+        "metrics_jsonl_sha256": metrics_jsonl_sha256,
     }
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Stage-2 training metrics</title>
@@ -564,7 +536,6 @@ def _plot_time_breakdown(
             field=field,
             label=labels[field],
             rolling_window=rolling_window,
-            raw=False,
         )
     enriched = []
     for record in records:
@@ -759,7 +730,8 @@ def plot_stage2_training(
     if not formats or any(value not in {"png", "svg"} for value in formats):
         raise ValueError("formats must contain png and/or svg.")
     jsonl_path = Path(jsonl_path).expanduser().resolve()
-    records = load_stage2_metrics(jsonl_path)
+    snapshot = load_stage2_metrics_snapshot(jsonl_path)
+    records = snapshot.records
     run_start = _latest_run_start(records)
     train_steps = stage2_records_for_latest_lineage(records, record_type="train_step")
     cycles = stage2_records_for_latest_lineage(records, record_type="cycle_summary")
@@ -903,7 +875,7 @@ def plot_stage2_training(
     index = output_dir / "index.html"
     _write_html_index(
         path=index,
-        jsonl_path=jsonl_path,
+        metrics_jsonl_sha256=snapshot.sha256,
         run_start=run_start,
         run_end=run_end,
         figures=written,

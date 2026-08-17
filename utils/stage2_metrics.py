@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
-from collections.abc import Mapping, Sequence
 
 from utils.jsonl_logger import (
     JsonlLogger,
+    JsonlSnapshot,
     lineage_run_ids,
+    read_jsonl_snapshot,
     read_jsonl_tolerant,
 )
 
 STAGE2_METRICS_SCHEMA = "longlive_stage2_metrics/v1"
 STAGE2_METRICS_SCHEMA_VERSION = 1
+STAGE2_TIMING_CLOSURE_ABS_SECONDS = 0.1
+STAGE2_TIMING_CLOSURE_REL_FRACTION = 0.05
 STAGE2_METRIC_RECORD_TYPES = frozenset(
     {
         "train_step",
@@ -67,6 +73,181 @@ STAGE2_ROLE_THROUGHPUT_FIELDS = {
         "real_score_tokens_per_second",
     ),
 }
+
+
+def _canonical_sha256(value: Any) -> str:
+    def semantic_json_value(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {key: semantic_json_value(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [semantic_json_value(child) for child in item]
+        if isinstance(item, float) and item.is_integer():
+            return int(item)
+        return item
+
+    payload = json.dumps(
+        semantic_json_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be an object.")
+    return value
+
+
+def _sha256_string(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 hex digest.")
+    return value
+
+
+def _derived_integer(derived: Mapping[str, Any], key: str) -> int:
+    if key not in derived:
+        raise ValueError(f"resolved_config.derived is missing {key!r}.")
+    return _plain_nonnegative_int(derived[key], f"resolved_config.derived.{key}")
+
+
+def validate_stage2_run_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate redundant run metadata against authoritative resolved config.
+
+    The resolved launch payload is the source of truth.  Human-friendly
+    terminal, phase, topology, and workload summaries are retained in JSONL,
+    but they must be exact projections of that payload rather than a second
+    independently editable contract.
+    """
+
+    metadata = _mapping(metadata, "Stage-2 run metadata")
+    resolved = _mapping(metadata.get("resolved_config"), "resolved_config")
+    _mapping(resolved.get("config"), "resolved_config.config")
+    derived = _mapping(resolved.get("derived"), "resolved_config.derived")
+
+    if derived.get("metrics_schema") != STAGE2_METRICS_SCHEMA:
+        raise ValueError(
+            "resolved_config.derived.metrics_schema must equal "
+            f"{STAGE2_METRICS_SCHEMA!r}."
+        )
+
+    expected_world_size = _derived_integer(derived, "expected_world_size")
+    fake_per_generator = _derived_integer(derived, "fake_updates_per_generator_update")
+    phase_a_generator = _derived_integer(derived, "phase_a_generator_updates")
+    phase_a_fake = _derived_integer(derived, "phase_a_fake_updates")
+    phase_b_generator = _derived_integer(derived, "phase_b_generator_updates")
+    phase_b_fake = _derived_integer(derived, "phase_b_fake_updates")
+    total_fake = _derived_integer(derived, "total_fake_updates")
+    total_generator = _derived_integer(derived, "total_generator_updates")
+    total_cycles = _derived_integer(derived, "total_cycles")
+    if fake_per_generator != 5:
+        raise ValueError(
+            "resolved_config must encode exactly five fake-score updates per "
+            "generator update."
+        )
+    if (
+        phase_a_fake != 5 * phase_a_generator
+        or phase_b_fake != 5 * phase_b_generator
+        or total_generator != phase_a_generator + phase_b_generator
+        or total_fake != phase_a_fake + phase_b_fake
+        or total_cycles != total_generator
+    ):
+        raise ValueError(
+            "resolved_config Stage-2 phase/terminal arithmetic is invalid."
+        )
+
+    world_size = _plain_nonnegative_int(metadata.get("world_size"), "world_size")
+    if world_size != expected_world_size:
+        raise ValueError("world_size disagrees with resolved_config.derived.")
+
+    topology = _mapping(metadata.get("topology"), "topology")
+    topology_projection = {
+        key: derived.get(key)
+        for key in (
+            "fsdp_backend",
+            "sharding_strategy",
+            "microbatch_size_per_device",
+            "gradient_accumulation_steps",
+            "global_batch_size",
+        )
+    }
+    if dict(topology) != topology_projection:
+        raise ValueError("topology disagrees with resolved_config.derived.")
+
+    role_hashes = _mapping(metadata.get("role_hashes"), "role_hashes")
+    expected_roles = {"generator", "real_score", "fake_score"}
+    if set(role_hashes) != expected_roles:
+        raise ValueError(
+            "role_hashes must contain exactly generator, real_score, and fake_score."
+        )
+    for role, digest in role_hashes.items():
+        _sha256_string(digest, f"role_hashes.{role}")
+
+    terminal = _mapping(metadata.get("terminal_counts"), "terminal_counts")
+    expected_terminal = {
+        "fake_score_updates": total_fake,
+        "generator_updates": total_generator,
+        "cycles": total_cycles,
+    }
+    if dict(terminal) != expected_terminal:
+        raise ValueError("terminal_counts disagree with resolved_config.derived.")
+
+    boundaries = metadata.get("phase_boundaries")
+    if not isinstance(boundaries, Sequence) or isinstance(boundaries, (str, bytes)):
+        raise TypeError("phase_boundaries must be a list.")
+    expected_boundaries = [
+        {"label": "Phase A end", "generator_update": phase_a_generator}
+    ]
+    if phase_b_generator:
+        expected_boundaries.append(
+            {"label": "Phase B end", "generator_update": total_generator}
+        )
+    if list(boundaries) != expected_boundaries:
+        raise ValueError("phase_boundaries disagree with resolved_config.derived.")
+
+    workload = _mapping(metadata.get("workload"), "workload")
+    patch_tokens = _derived_integer(derived, "patch_tokens_per_frame")
+    score_frames = _derived_integer(derived, "score_input_frames")
+    future_frames = _derived_integer(derived, "future_latent_frames")
+    sink_frames = _derived_integer(derived, "global_sink_frames")
+    generated_frames = _derived_integer(derived, "generated_episode_frames")
+    expected_workload = {
+        "patch_tokens_per_frame": patch_tokens,
+        "score_input_frames": score_frames,
+        "loss_future_frames": future_frames,
+        "sink_in_score_compute": True,
+        "sink_in_loss": False,
+    }
+    if dict(workload) != expected_workload:
+        raise ValueError("workload disagrees with resolved_config.derived.")
+    if (
+        score_frames != sink_frames + generated_frames
+        or future_frames != generated_frames
+    ):
+        raise ValueError("resolved_config workload frame accounting is inconsistent.")
+
+    if not isinstance(metadata.get("dry_run"), bool):
+        raise TypeError("run metadata dry_run must be bool.")
+    smoke_mode = metadata.get("smoke_mode")
+    if smoke_mode not in {None, "C0", "C1", "C2"}:
+        raise ValueError("run metadata smoke_mode must be null or C0/C1/C2.")
+
+    _sha256_string(metadata.get("config_contract_sha256"), "config_contract_sha256")
+    launch_hash = _sha256_string(
+        metadata.get("config_launch_sha256"), "config_launch_sha256"
+    )
+    expected_launch_hash = _canonical_sha256(resolved)
+    if launch_hash != expected_launch_hash:
+        raise ValueError(
+            "config_launch_sha256 does not fingerprint resolved_config exactly."
+        )
+    return dict(derived)
 
 
 def _plain_nonnegative_int(value: Any, label: str) -> int:
@@ -178,6 +359,16 @@ def _validate_timing(fields: Mapping[str, Any], *, role: str) -> None:
         _required(fields, "timing_closure_error_seconds", role=role),
         "timing_closure_error_seconds",
     )
+    closure_limit = max(
+        STAGE2_TIMING_CLOSURE_ABS_SECONDS,
+        STAGE2_TIMING_CLOSURE_REL_FRACTION * maximum,
+    )
+    if abs(closure) > closure_limit + 1.0e-12:
+        raise ValueError(
+            "timing closure error exceeds max(0.1 seconds, "
+            "0.05 * step_seconds_max): "
+            f"abs({closure}) > {closure_limit}."
+        )
     if not math.isclose(
         sum(parts) + closure,
         maximum,
@@ -461,6 +652,20 @@ def validate_stage2_metric_record(record_type: str, fields: Mapping[str, Any]) -
             raise ValueError("run_end.status=smoke_complete requires dry_run=true.")
 
 
+def validate_stage2_run_start(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one persisted Stage-2 ``run_start`` and return its derived data."""
+
+    if record.get("record_type") != "run_start":
+        raise ValueError("Stage-2 run metadata must come from a run_start record.")
+    if record.get("schema") != STAGE2_METRICS_SCHEMA:
+        raise ValueError("run_start does not use the Stage-2 metric schema.")
+    if record.get("schema_version") != STAGE2_METRICS_SCHEMA_VERSION:
+        raise ValueError("run_start uses an unsupported Stage-2 schema_version.")
+    _nonempty_string(record.get("run_id"), "run_start.run_id")
+    _plain_nonnegative_int(record.get("resume_from_step"), "run_start.resume_from_step")
+    return validate_stage2_run_metadata(record)
+
+
 class Stage2MetricsLogger:
     """Rank-zero Stage-2 writer with validated dual-clock records."""
 
@@ -477,16 +682,43 @@ class Stage2MetricsLogger:
         enabled: bool = True,
         run_metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        resume_boundary = _plain_nonnegative_int(
+            resume_from_logical_substep, "resume_from_logical_substep"
+        )
+        if parent_run_id is None:
+            if resume_boundary != 0:
+                raise ValueError(
+                    "a cold Stage-2 run must start at logical_substep_id 0."
+                )
+        elif resume_boundary % 6:
+            raise ValueError(
+                "a resumed Stage-2 child must start at a complete 5F -> 1G "
+                "cycle boundary (a multiple of six logical substeps)."
+            )
+        metadata = _mapping(run_metadata, "Stage-2 run metadata")
+        derived = validate_stage2_run_metadata(metadata)
+        self._resume_boundary = resume_boundary
+        self._next_train_logical_substep = resume_boundary
+        self._dry_run = bool(metadata["dry_run"])
+        self._terminal_counts = {
+            "completed_fake_updates": int(derived["total_fake_updates"]),
+            "completed_generator_updates": int(derived["total_generator_updates"]),
+            "completed_cycles": int(derived["total_cycles"]),
+        }
+        self._terminal_logical_substeps = (
+            self._terminal_counts["completed_fake_updates"]
+            + self._terminal_counts["completed_generator_updates"]
+        )
         self._writer = JsonlLogger(
             path,
             experiment_id=experiment_id,
             run_id=run_id,
             parent_run_id=parent_run_id,
-            resume_from_step=resume_from_logical_substep,
+            resume_from_step=resume_boundary,
             checkpoint_next_attempt_index=checkpoint_next_attempt_index,
             fsync_every_steps=fsync_every_steps,
             enabled=enabled,
-            run_metadata=run_metadata,
+            run_metadata=metadata,
             schema=STAGE2_METRICS_SCHEMA,
             schema_version=STAGE2_METRICS_SCHEMA_VERSION,
             supported_record_types=STAGE2_METRIC_RECORD_TYPES,
@@ -502,7 +734,46 @@ class Stage2MetricsLogger:
 
     def append(self, record_type: str, fields: Mapping[str, Any]) -> int:
         validate_stage2_metric_record(record_type, fields)
-        return self._writer.append_record(record_type, fields)
+        logical = _plain_nonnegative_int(
+            fields.get("logical_substep_id"), "logical_substep_id"
+        )
+        terminal_no_work_finalize = (
+            record_type == "run_end"
+            and fields.get("status") == "complete"
+            and fields.get("dry_run") is False
+            and self._resume_boundary == self._terminal_logical_substeps
+            and self._next_train_logical_substep == self._resume_boundary
+            and logical == self._resume_boundary - 1
+            and all(
+                fields.get(key) == expected
+                for key, expected in self._terminal_counts.items()
+            )
+        )
+        if logical < self._resume_boundary and not terminal_no_work_finalize:
+            raise ValueError(
+                f"record logical_substep_id={logical} is before this run's resume "
+                f"boundary {self._resume_boundary}."
+            )
+        if fields.get("dry_run") is not self._dry_run:
+            raise ValueError("record dry_run disagrees with run_start metadata.")
+        if record_type == "train_step" and logical != self._next_train_logical_substep:
+            raise ValueError(
+                "train_step must use the next logical_substep_id in the contiguous "
+                "F1..F5 -> G sequence: "
+                f"expected={self._next_train_logical_substep}, actual={logical}."
+            )
+        if (
+            record_type == "nonfinite_attempt"
+            and logical != self._next_train_logical_substep
+        ):
+            raise ValueError(
+                "nonfinite_attempt must target the next logical_substep_id: "
+                f"expected={self._next_train_logical_substep}, actual={logical}."
+            )
+        attempt_index = self._writer.append_record(record_type, fields)
+        if record_type == "train_step":
+            self._next_train_logical_substep += 1
+        return attempt_index
 
     def close(self) -> None:
         self._writer.close()
@@ -522,14 +793,6 @@ def stage2_records_for_latest_lineage(
 ) -> list[dict[str, Any]]:
     ordered_lineage = lineage_run_ids(records, run_id=run_id)
     lineage = set(ordered_lineage)
-    for record in records:
-        if str(record.get("run_id", "")) not in lineage:
-            continue
-        if (
-            record.get("schema") != STAGE2_METRICS_SCHEMA
-            or int(record.get("schema_version", -1)) != STAGE2_METRICS_SCHEMA_VERSION
-        ):
-            raise ValueError("latest lineage contains a non-Stage-2 metric schema.")
     # At each child run_start, everything in the ancestor at or after the
     # child's next logical substep is an uncommitted stale suffix.  Remove that
     # suffix even when the child has no record of the same optional type (for
@@ -542,12 +805,125 @@ def stage2_records_for_latest_lineage(
                 raise ValueError(f"Stage-2 run {owner} has multiple run_start records.")
             run_starts[owner] = record
 
+    semantic_projection: dict[str, Any] | None = None
+    for depth, owner in enumerate(ordered_lineage):
+        if owner not in run_starts:
+            raise ValueError(f"Stage-2 lineage run {owner} has no run_start record.")
+        start = run_starts[owner]
+        derived = validate_stage2_run_start(start)
+        boundary = _plain_nonnegative_int(
+            start.get("resume_from_step"), f"run_start[{owner}].resume_from_step"
+        )
+        if depth == 0:
+            if start.get("parent_run_id") not in (None, ""):
+                raise ValueError("Stage-2 lineage root unexpectedly declares a parent.")
+            if boundary != 0:
+                raise ValueError(
+                    "Stage-2 lineage root must begin at logical substep 0."
+                )
+        elif boundary % 6:
+            raise ValueError(
+                "a resumed Stage-2 child must start at a complete 5F -> 1G "
+                "cycle boundary."
+            )
+
+        projection = {
+            "config_contract_sha256": start.get("config_contract_sha256"),
+            "world_size": start.get("world_size"),
+            "topology": start.get("topology"),
+            "role_hashes": start.get("role_hashes"),
+            "terminal_counts": start.get("terminal_counts"),
+            "phase_boundaries": start.get("phase_boundaries"),
+            "workload": start.get("workload"),
+            "metrics_schema": derived.get("metrics_schema"),
+        }
+        if semantic_projection is None:
+            semantic_projection = projection
+        elif projection != semantic_projection:
+            raise ValueError(
+                "Stage-2 child run changes the parent lineage's resolved training "
+                "contract."
+            )
+
+        parent_id = start.get("parent_run_id")
+        expected_parent = None if depth == 0 else ordered_lineage[depth - 1]
+        normalized_parent = None if parent_id in (None, "") else str(parent_id)
+        if normalized_parent != expected_parent:
+            raise ValueError(f"Stage-2 run {owner} declares the wrong parent_run_id.")
+
+        terminal_counts = {
+            "completed_fake_updates": int(derived["total_fake_updates"]),
+            "completed_generator_updates": int(derived["total_generator_updates"]),
+            "completed_cycles": int(derived["total_cycles"]),
+        }
+        terminal_logical_substeps = (
+            terminal_counts["completed_fake_updates"]
+            + terminal_counts["completed_generator_updates"]
+        )
+        owner_has_train_steps_at_or_after_boundary = any(
+            str(candidate.get("run_id", "")) == owner
+            and candidate.get("record_type") == "train_step"
+            and isinstance(candidate.get("logical_substep_id"), int)
+            and not isinstance(candidate.get("logical_substep_id"), bool)
+            and int(candidate["logical_substep_id"]) >= boundary
+            for candidate in records
+        )
+
+        for record in records:
+            if str(record.get("run_id", "")) != owner:
+                continue
+            current_type = record.get("record_type")
+            if current_type == "run_start":
+                continue
+            if current_type not in STAGE2_METRIC_RECORD_TYPES:
+                raise ValueError(
+                    f"Stage-2 lineage contains unsupported record_type {current_type!r}."
+                )
+            if (
+                record.get("schema") != STAGE2_METRICS_SCHEMA
+                or record.get("schema_version") != STAGE2_METRICS_SCHEMA_VERSION
+            ):
+                raise ValueError("latest lineage contains a non-Stage-2 metric schema.")
+            if record.get("parent_run_id") != start.get("parent_run_id"):
+                raise ValueError(
+                    f"Stage-2 record in run {owner} has wrong parent_run_id."
+                )
+            if record.get("resume_from_step") != boundary:
+                raise ValueError(
+                    f"Stage-2 record in run {owner} has wrong resume_from_step."
+                )
+            logical = _plain_nonnegative_int(
+                record.get("logical_substep_id"),
+                f"{current_type}.logical_substep_id",
+            )
+            terminal_no_work_finalize = (
+                current_type == "run_end"
+                and record.get("status") == "complete"
+                and record.get("dry_run") is False
+                and start.get("dry_run") is False
+                and boundary == terminal_logical_substeps
+                and logical == boundary - 1
+                and not owner_has_train_steps_at_or_after_boundary
+                and all(
+                    record.get(key) == expected
+                    for key, expected in terminal_counts.items()
+                )
+            )
+            if logical < boundary and not terminal_no_work_finalize:
+                raise ValueError(
+                    f"Stage-2 child record in run {owner} appears before its resume "
+                    f"boundary {boundary}."
+                )
+            if record.get("dry_run") is not start.get("dry_run"):
+                raise ValueError(
+                    f"Stage-2 record in run {owner} disagrees with run_start dry_run."
+                )
+            validate_stage2_metric_record(str(current_type), record)
+
     # ``attempt_index`` is intentionally not the identity: it remains globally
     # monotonic while ``logical_substep_id`` names the resumable logical point.
     selected: dict[int | tuple[int, int], tuple[int, int, dict[str, Any]]] = {}
     for depth, owner in enumerate(ordered_lineage):
-        if owner not in run_starts:
-            raise ValueError(f"Stage-2 lineage run {owner} has no run_start record.")
         if depth:
             boundary = _plain_nonnegative_int(
                 run_starts[owner].get("resume_from_step"),
@@ -558,6 +934,7 @@ def stage2_records_for_latest_lineage(
                 for identity, value in selected.items()
                 if (identity[0] if isinstance(identity, tuple) else identity) < boundary
             }
+        owner_identities: set[int | tuple[int, int]] = set()
         for sequence, record in enumerate(records):
             if (
                 str(record.get("run_id", "")) == owner
@@ -576,12 +953,32 @@ def stage2_records_for_latest_lineage(
                     identity = (logical, int(record["attempt_number_for_substep"]))
                 else:
                     identity = logical
+                if identity in owner_identities:
+                    raise ValueError(
+                        f"Stage-2 run {owner} repeats {record_type} identity "
+                        f"{identity!r}."
+                    )
+                owner_identities.add(identity)
                 selected[identity] = (depth, sequence, dict(record))
-    return [selected[key][2] for key in sorted(selected)]
+    result = [selected[key][2] for key in sorted(selected)]
+    if record_type == "train_step":
+        logical_ids = [int(record["logical_substep_id"]) for record in result]
+        if logical_ids != list(range(len(logical_ids))):
+            raise ValueError(
+                "Stage-2 train_step lineage must be one contiguous "
+                "F1..F5 -> G sequence starting at logical substep 0."
+            )
+    return result
 
 
 def load_stage2_metrics(path: str | Path) -> list[dict[str, Any]]:
     return read_jsonl_tolerant(path)
+
+
+def load_stage2_metrics_snapshot(path: str | Path) -> JsonlSnapshot:
+    """Load records and SHA-256 from one Stage-2 JSONL byte snapshot."""
+
+    return read_jsonl_snapshot(path)
 
 
 __all__ = [
@@ -593,7 +990,10 @@ __all__ = [
     "STAGE2_TIMING_FIELDS",
     "Stage2MetricsLogger",
     "load_stage2_metrics",
+    "load_stage2_metrics_snapshot",
     "stage2_records_for_latest_lineage",
     "validate_stage2_clock",
     "validate_stage2_metric_record",
+    "validate_stage2_run_metadata",
+    "validate_stage2_run_start",
 ]

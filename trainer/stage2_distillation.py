@@ -8,20 +8,20 @@ and cycle-boundary checkpoints into the one legal state transition sequence.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
 import copy
-from dataclasses import dataclass
-from datetime import timedelta
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import random
 import time
-from typing import Any
 import uuid
+from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
+from dataclasses import dataclass
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -95,6 +95,8 @@ class Trainer:
         self.logger = None
         self.resume_payload = None
         self._last_cycle_smoke_probe = None
+        self._smoke_parent_probe_consumed = False
+        self._active_logical_substep = None
 
     def _initialize_distributed(self) -> None:
         if not dist.is_available():
@@ -259,13 +261,23 @@ class Trainer:
             else None
         )
         if explicit is not None:
-            explicit_path = Path(explicit).expanduser().resolve()
-            if discovered is not None and explicit_path != Path(discovered).resolve():
+            explicit_candidate = Path(explicit).expanduser()
+            if explicit_candidate.is_symlink():
                 raise RuntimeError(
-                    "Explicit Stage-2 resume checkpoint differs from the newest "
-                    f"checkpoint in --logdir: explicit={explicit_path}, latest={discovered}."
+                    "Explicit Stage-2 resume checkpoint cannot be a symlink: "
+                    f"{explicit_candidate}"
                 )
-            selected = explicit_path
+            explicit_path = explicit_candidate.resolve()
+            if discovered is None:
+                selected = explicit_path
+            else:
+                discovered_path = Path(discovered).resolve()
+                if explicit_path != discovered_path:
+                    self._assert_checkpoint_descends_from_anchor(
+                        discovered_path,
+                        explicit_path,
+                    )
+                selected = discovered_path
         else:
             selected = Path(discovered).resolve() if discovered is not None else None
         if self.options.smoke_mode in {"C1", "C2"} and selected is None:
@@ -274,6 +286,121 @@ class Trainer:
                 "checkpoint from the preceding smoke cycle."
             )
         return selected
+
+    def _assert_checkpoint_descends_from_anchor(
+        self,
+        descendant: Path,
+        anchor: Path,
+    ) -> None:
+        """Prove an auto-resume child reaches one exact explicit parent.
+
+        ``checkpoints.resume_stage2`` is an immutable ancestry anchor for the
+        matched B0/B1 fork, not a request to keep reloading A24 forever.  Every
+        edge is bound by both the canonical parent path and the parent's
+        self-hashed manifest.  Intermediate children must remain in this
+        launch's output directory; an unrelated local run therefore cannot be
+        silently preferred merely because it has a larger G clock.
+        """
+
+        from utils.stage1_io import canonical_json_sha256
+        from utils.stage2_checkpoint import validate_stage2_checkpoint
+
+        output_root = self.options.output_dir.resolve()
+        cursor = descendant.resolve()
+        anchor = anchor.resolve()
+        if cursor.parent != output_root:
+            raise RuntimeError(
+                "Newest Stage-2 checkpoint is outside --logdir and cannot be "
+                f"proved as a local child: latest={cursor}, logdir={output_root}."
+            )
+
+        expected_manifest_sha256: str | None = None
+        visited: set[Path] = set()
+        while True:
+            if cursor in visited:
+                raise RuntimeError(
+                    f"Stage-2 checkpoint ancestry contains a cycle at {cursor}."
+                )
+            visited.add(cursor)
+            if cursor != anchor and cursor.parent != output_root:
+                raise RuntimeError(
+                    "Stage-2 checkpoint ancestry left --logdir before reaching "
+                    f"the explicit anchor: checkpoint={cursor}, anchor={anchor}."
+                )
+
+            manifest = validate_stage2_checkpoint(
+                cursor,
+                expected_contract_hash=self.resolved.contract_hash(),
+                expected_topology=self._checkpoint_topology(),
+                expected_phase_b_mode=self.resolved.phase_b_mode,
+            )
+            actual_manifest_sha256 = manifest["manifest_sha256"]
+            if (
+                expected_manifest_sha256 is not None
+                and actual_manifest_sha256 != expected_manifest_sha256
+            ):
+                raise RuntimeError(
+                    "Stage-2 checkpoint ancestry parent manifest hash drifted: "
+                    f"checkpoint={cursor}, expected={expected_manifest_sha256}, "
+                    f"actual={actual_manifest_sha256}."
+                )
+            if cursor == anchor:
+                return
+
+            provenance_path = cursor / "provenance.json"
+            if provenance_path.is_symlink() or not provenance_path.is_file():
+                raise RuntimeError(
+                    "Stage-2 checkpoint ancestry has no regular provenance: "
+                    f"{provenance_path}."
+                )
+            with provenance_path.open("r", encoding="utf-8") as handle:
+                provenance = json.load(handle)
+            if (
+                not isinstance(provenance, Mapping)
+                or canonical_json_sha256(dict(provenance))
+                != manifest["provenance_sha256"]
+            ):
+                raise RuntimeError(
+                    "Stage-2 checkpoint ancestry provenance changed after "
+                    f"validation: {cursor}."
+                )
+            lineage = provenance.get("lineage")
+            if not isinstance(lineage, Mapping):
+                raise RuntimeError(
+                    f"Stage-2 checkpoint ancestry is missing lineage: {cursor}."
+                )
+            parent_value = lineage.get("parent_checkpoint")
+            parent_manifest_sha256 = lineage.get("parent_checkpoint_manifest_sha256")
+            if not isinstance(parent_value, str) or not parent_value:
+                raise RuntimeError(
+                    "Stage-2 local checkpoint does not descend from the explicit "
+                    f"anchor: child={cursor}, anchor={anchor}."
+                )
+            parent_candidate = Path(parent_value).expanduser()
+            parent_path = parent_candidate.resolve()
+            if (
+                not parent_candidate.is_absolute()
+                or parent_candidate != parent_path
+                or parent_candidate.is_symlink()
+            ):
+                raise RuntimeError(
+                    "Stage-2 checkpoint ancestry parent path is not one canonical "
+                    f"absolute directory: {parent_value!r}."
+                )
+            if (
+                not isinstance(parent_manifest_sha256, str)
+                or len(parent_manifest_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in parent_manifest_sha256
+                )
+            ):
+                raise RuntimeError(
+                    "Stage-2 checkpoint ancestry parent manifest hash is invalid: "
+                    f"{cursor}."
+                )
+            expected_manifest_sha256 = parent_manifest_sha256
+            cursor = parent_path
 
     def _build_data_runtime(self) -> None:
         from utils.stage2_i2v_data import Stage2I2VCacheDataset
@@ -345,6 +472,7 @@ class Trainer:
             expected_contract_hash=self.resolved.contract_hash(),
             expected_world_size=self.world_size,
             expected_topology=self._checkpoint_topology(),
+            expected_phase_b_mode=self.resolved.phase_b_mode,
         )
 
     def _checkpoint_topology(self) -> dict[str, Any]:
@@ -556,6 +684,323 @@ class Trainer:
         for name, value in snapshot["dedicated_generators"].items():
             self.dedicated_generators[name].set_state(value.clone())
         restore_rng_state(snapshot["global_rng"], require_cuda_topology=True)
+
+    @staticmethod
+    def _tensor_sha256(value: torch.Tensor) -> str:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError("Stage-2 probe tensor identity requires a Tensor")
+        tensor = value.detach().to(device="cpu").contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    @classmethod
+    def _attempt_state_sha256(cls, value: Any) -> str:
+        """Hash nested RNG/sampler state without serialization side effects."""
+
+        digest = hashlib.sha256()
+
+        def update(item: Any) -> None:
+            if isinstance(item, torch.Tensor):
+                digest.update(b"tensor:")
+                digest.update(cls._tensor_sha256(item).encode("ascii"))
+            elif isinstance(item, np.ndarray):
+                array = np.ascontiguousarray(item)
+                digest.update(b"ndarray:")
+                digest.update(str(array.dtype).encode("ascii"))
+                digest.update(str(tuple(array.shape)).encode("ascii"))
+                digest.update(array.tobytes())
+            elif isinstance(item, np.generic):
+                update(item.item())
+            elif isinstance(item, Mapping):
+                digest.update(b"mapping{")
+                for key in sorted(item, key=lambda candidate: repr(candidate)):
+                    update(key)
+                    update(item[key])
+                digest.update(b"}")
+            elif isinstance(item, (tuple, list)):
+                digest.update(b"tuple[" if isinstance(item, tuple) else b"list[")
+                for child in item:
+                    update(child)
+                digest.update(b"]")
+            elif isinstance(item, (str, int, float, bool)) or item is None:
+                digest.update(type(item).__name__.encode("ascii"))
+                digest.update(b":")
+                digest.update(repr(item).encode("utf-8"))
+            else:
+                raise TypeError(
+                    "Unsupported Stage-2 probe state value: " f"{type(item).__name__}"
+                )
+
+        update(value)
+        return digest.hexdigest()
+
+    def _next_f1_state_projection(self) -> dict[str, Any]:
+        return {
+            "next_substep": self.state.next_substep,
+            "current_role": self.state.current_role,
+            "completed_fake_updates": self.state.completed_f,
+            "completed_generator_updates": self.state.completed_g,
+            "completed_cycles": self.state.cycle,
+            "successful_attempts": self.state.successful_attempts,
+            "nonfinite_attempts": self.state.nonfinite_attempts,
+            "nonfinite_attempts_by_role": dict(self.state.nonfinite_attempts_by_role),
+        }
+
+    def _capture_next_f1_probe(self) -> dict[str, Any]:
+        """Predict the next F1 draws, then restore every mutable stream exactly."""
+
+        from utils.stage1_io import canonical_json_sha256
+        from utils.stage2_sampler import partition_stage2_global_batch
+        from utils.stage2_score_math import sample_stage2_score_timesteps
+
+        state_projection = self._next_f1_state_projection()
+        if (
+            state_projection["next_substep"] != "F1"
+            or state_projection["current_role"] != "fake_score"
+        ):
+            raise RuntimeError(
+                "Stage-2 next-state probe is legal only at a committed F1 boundary"
+            )
+        snapshot = self._snapshot_attempt()
+        before_sha256 = self._attempt_state_sha256(snapshot)
+        local_envelope: dict[str, Any] | None = None
+        try:
+
+            def predict_sampler():
+                global_batch = self.samplers.fake_score.next_global_batch()
+                local_microbatches = partition_stage2_global_batch(
+                    global_batch,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    microbatch_size_per_device=(
+                        self.resolved.microbatch_size_per_device
+                    ),
+                    gradient_accumulation_steps=(
+                        self.resolved.gradient_accumulation_steps
+                    ),
+                    spatial_shapes=self.dataset.spatial_shapes,
+                )
+                return global_batch, local_microbatches
+
+            global_batch, local_microbatches = self._runtime_world_checked(
+                "predict next F1 sampler batch",
+                predict_sampler,
+            )
+            exits = self.exit_rng.draw(
+                "fake_score",
+                accumulation_steps=self.resolved.gradient_accumulation_steps,
+                num_denoising_steps=self.resolved.num_denoising_steps,
+                mode=self.resolved.exit_sampling,
+                device=self.device,
+                synchronize_ranks=True,
+            )
+
+            def predict_explicit_streams() -> list[dict[str, Any]]:
+                micro_probes: list[dict[str, Any]] = []
+                for sample_ids in local_microbatches:
+                    spatial_shapes = {
+                        tuple(self.dataset.spatial_shapes[index])
+                        for index in sample_ids
+                    }
+                    if len(spatial_shapes) != 1:
+                        raise RuntimeError(
+                            "Stage-2 next F1 probe microbatch mixes spatial shapes"
+                        )
+                    height, width = next(iter(spatial_shapes))
+                    future_shape = (
+                        len(sample_ids),
+                        self.resolved.generated_episode_frames,
+                        self.resolved.latent_channels,
+                        int(height),
+                        int(width),
+                    )
+                    rollout_noise = torch.randn(
+                        future_shape,
+                        device=self.device,
+                        dtype=torch.bfloat16,
+                        generator=self.dedicated_generators["fake_score_rollout"],
+                    )
+                    timesteps = sample_stage2_score_timesteps(
+                        batch_size=len(sample_ids),
+                        device=self.device,
+                        generator=self.dedicated_generators["fake_score_timestep"],
+                    )
+                    score_noise = torch.randn(
+                        future_shape,
+                        device=self.device,
+                        dtype=torch.float32,
+                        generator=self.dedicated_generators["fake_score_noise"],
+                    )
+                    micro_probes.append(
+                        {
+                            "sample_ids": list(sample_ids),
+                            "spatial_shape": [int(height), int(width)],
+                            "rollout_noise_sha256": self._tensor_sha256(rollout_noise),
+                            "score_uniform_integers": (
+                                timesteps.uniform_integer.detach()
+                                .to(device="cpu")
+                                .tolist()
+                            ),
+                            "score_frame_timestep_sha256": self._tensor_sha256(
+                                timesteps.frame_timestep
+                            ),
+                            "score_noise_sha256": self._tensor_sha256(score_noise),
+                        }
+                    )
+                    del rollout_noise, timesteps, score_noise
+                return micro_probes
+
+            micro_probes = self._runtime_world_checked(
+                "predict next F1 explicit RNG streams",
+                predict_explicit_streams,
+            )
+            fake_sampler_state = snapshot["samplers"]["fake_score"]
+            local_envelope = {
+                "common": {
+                    "state": state_projection,
+                    "sampler": {
+                        "state_sha256": self._attempt_state_sha256(fake_sampler_state),
+                        "completed_batches": fake_sampler_state["completed_batches"],
+                        "stream_epoch": fake_sampler_state["stream_epoch"],
+                        "batch_cursor": fake_sampler_state["batch_cursor"],
+                        "extra_slot_cursor": fake_sampler_state["extra_slot_cursor"],
+                        "global_batch_ids": list(global_batch),
+                    },
+                    "exit_schedule": list(exits),
+                },
+                "rank": {
+                    "rank": self.rank,
+                    "attempt_state_sha256": before_sha256,
+                    "stream_state_sha256": {
+                        "fake_score_loader": self._tensor_sha256(
+                            snapshot["dataloader_generators"]["fake_score"]
+                        ),
+                        "fake_score_exit": self._tensor_sha256(
+                            snapshot["exit_rng"]["fake_score"]
+                        ),
+                        "fake_score_rollout": self._tensor_sha256(
+                            snapshot["dedicated_generators"]["fake_score_rollout"]
+                        ),
+                        "fake_score_timestep": self._tensor_sha256(
+                            snapshot["dedicated_generators"]["fake_score_timestep"]
+                        ),
+                        "fake_score_noise": self._tensor_sha256(
+                            snapshot["dedicated_generators"]["fake_score_noise"]
+                        ),
+                    },
+                    "microbatches": micro_probes,
+                },
+            }
+        finally:
+            self._restore_attempt(snapshot)
+
+        after_sha256 = self._attempt_state_sha256(self._snapshot_attempt())
+        state_restored = before_sha256 == after_sha256
+        if dist.is_available() and dist.is_initialized():
+            state_restored = self._world_consensus(state_restored)
+        if not state_restored:
+            raise RuntimeError("Stage-2 next F1 probe changed sampler or RNG state")
+        if local_envelope is None:
+            raise RuntimeError("Stage-2 next F1 probe produced no local payload")
+
+        if dist.is_available() and dist.is_initialized():
+            gathered: list[dict[str, Any] | None] = [None] * self.world_size
+            dist.all_gather_object(gathered, local_envelope)
+            envelopes = [item for item in gathered if item is not None]
+            if len(envelopes) != self.world_size:
+                raise RuntimeError(
+                    "Stage-2 next F1 probe did not gather every rank payload"
+                )
+        else:
+            envelopes = [local_envelope]
+        if not envelopes:
+            raise RuntimeError("Stage-2 next F1 probe gathered no rank payloads")
+        common = envelopes[0]["common"]
+        common_sha256 = canonical_json_sha256(common)
+        if any(
+            canonical_json_sha256(item["common"]) != common_sha256 for item in envelopes
+        ):
+            raise RuntimeError(
+                "Stage-2 next F1 sampler/exit prediction differs across ranks"
+            )
+        rank_payloads = sorted(
+            (item["rank"] for item in envelopes), key=lambda item: item["rank"]
+        )
+        ranks = [item["rank"] for item in rank_payloads]
+        expected_ranks = (
+            list(range(self.world_size))
+            if dist.is_available() and dist.is_initialized()
+            else [self.rank]
+        )
+        if ranks != expected_ranks:
+            raise RuntimeError(
+                "Stage-2 next F1 probe rank payloads are incomplete or duplicated: "
+                f"expected={expected_ranks}, actual={ranks}"
+            )
+        probe = {
+            "schema": "longlive_stage2_next_f1_probe/v1",
+            **common,
+            "rank_payloads": rank_payloads,
+        }
+        canonical_json_sha256(probe)
+        return probe
+
+    @staticmethod
+    def _probe_difference(expected: Any, actual: Any, path: str = "probe") -> str:
+        if type(expected) is not type(actual):
+            return f"{path}: type {type(expected).__name__} != {type(actual).__name__}"
+        if isinstance(expected, Mapping):
+            if set(expected) != set(actual):
+                return f"{path}: keys {sorted(expected)} != {sorted(actual)}"
+            for key in sorted(expected):
+                difference = Trainer._probe_difference(
+                    expected[key], actual[key], f"{path}.{key}"
+                )
+                if difference:
+                    return difference
+            return ""
+        if isinstance(expected, list):
+            if len(expected) != len(actual):
+                return f"{path}: length {len(expected)} != {len(actual)}"
+            for index, (left, right) in enumerate(zip(expected, actual)):
+                difference = Trainer._probe_difference(left, right, f"{path}[{index}]")
+                if difference:
+                    return difference
+            return ""
+        return "" if expected == actual else f"{path}: {expected!r} != {actual!r}"
+
+    def _verify_parent_next_f1_probe(self) -> None:
+        smoke_mode = getattr(self.options, "smoke_mode", None)
+        if smoke_mode not in {"C1", "C2"}:
+            return
+        if getattr(self, "_smoke_parent_probe_consumed", False):
+            return
+        if self.state.next_substep != "F1" or self.state.current_role != "fake_score":
+            raise RuntimeError(f"Stage-2 smoke {smoke_mode} did not resume at F1")
+        parent_smoke_probe = (
+            None
+            if self.resume_payload is None
+            else self.resume_payload.provenance.get("smoke_probe")
+        )
+        expected = (
+            None
+            if not isinstance(parent_smoke_probe, Mapping)
+            else parent_smoke_probe.get("next_f1_probe")
+        )
+        if not isinstance(expected, Mapping):
+            raise RuntimeError(
+                f"Stage-2 smoke {smoke_mode} parent has no next F1 probe"
+            )
+        actual = self._capture_next_f1_probe()
+        difference = self._probe_difference(dict(expected), actual)
+        if difference:
+            raise RuntimeError(
+                f"Stage-2 smoke {smoke_mode} next F1 probe mismatch: " f"{difference}"
+            )
+        self._smoke_parent_probe_consumed = True
 
     def _negative_conditioning(self, batch_size: int) -> dict[str, torch.Tensor]:
         negative = self.dataset.negative_conditioning
@@ -1260,17 +1705,35 @@ class Trainer:
         return float(tensor.item())
 
     def _validate_smoke_cycle(
-        self, step_fields: Sequence[Mapping[str, Any]]
+        self,
+        step_fields: Sequence[Mapping[str, Any]],
+        *,
+        nonfinite_attempts: int,
     ) -> dict[str, Any] | None:
         if not self.options.dry_run:
             return None
         if len(step_fields) != 6:
             raise RuntimeError("Stage-2 smoke must contain exactly 5F+1G train steps.")
+        if (
+            isinstance(nonfinite_attempts, bool)
+            or not isinstance(nonfinite_attempts, int)
+            or nonfinite_attempts < 0
+        ):
+            raise RuntimeError(
+                "Stage-2 smoke cycle nonfinite_attempts must be an integer >= 0."
+            )
+        if nonfinite_attempts:
+            raise RuntimeError(
+                "Stage-2 H100 smoke acceptance gate failed: "
+                "failures=['nonfinite_attempts'], "
+                f"measurements={{'nonfinite_attempts': {nonfinite_attempts}}}."
+            )
         if getattr(self, "device", torch.device("cpu")).type != "cuda":
             return {
                 "smoke_mode": self.options.smoke_mode,
                 "status": "PASS_CPU_TEST_SEAM",
                 "live_allocated_gib_max": 0.0,
+                "nonfinite_attempts": nonfinite_attempts,
             }
         total_gib = min(float(item["gpu_memory_total_gib_min"]) for item in step_fields)
         max_allocated = max(
@@ -1298,6 +1761,7 @@ class Trainer:
             dist.all_reduce(live, op=dist.ReduceOp.MAX)
         live_max = float(live.item())
         checks = {
+            "nonfinite_attempts": nonfinite_attempts,
             "allocated_fraction": max_allocated / total_gib,
             "reserved_fraction": max_reserved / total_gib,
             "cuda_free_gib_min": cuda_free,
@@ -1355,6 +1819,7 @@ class Trainer:
         role = self.state.current_role
         substep = self.state.next_substep
         logical = self.state.successful_attempts
+        self._verify_parent_next_f1_probe()
         position = self.schedule.next_generator_position(self.state.completed_g)
         probability = position.dfd_probability if role == "generator" else 0.0
         if role == "generator" and self.options.smoke_mode == "C1":
@@ -1658,13 +2123,74 @@ class Trainer:
             "smoke_mode": self.options.smoke_mode,
         }
 
-    def _build_logger(self, resume_payload: Any) -> None:
-        from utils.stage2_metrics import Stage2MetricsLogger
-
+    def _metric_output_path(self) -> Path:
         metric_path = Path(self.resolved.jsonl_path)
         if not metric_path.is_absolute():
             metric_path = self.options.output_dir / metric_path
-        metric_path = metric_path.expanduser().resolve()
+        return metric_path.expanduser().resolve()
+
+    def _prepare_metrics_lineage(self, resume_payload: Any) -> None:
+        """Import or authenticate the immutable JSONL prefix in a checkpoint."""
+
+        self.metric_path = self._metric_output_path()
+        if resume_payload is None:
+            return
+        entries = {entry["name"]: entry for entry in resume_payload.manifest["files"]}
+        entry = entries.get("metrics_lineage.jsonl")
+        if not isinstance(entry, Mapping):
+            raise RuntimeError(
+                "Stage-2 resume checkpoint has no bound metrics lineage snapshot."
+            )
+        source = resume_payload.directory / "metrics_lineage.jsonl"
+        if source.is_symlink() or not source.is_file():
+            raise RuntimeError(
+                f"Stage-2 metrics lineage snapshot is not a regular file: {source}"
+            )
+        snapshot = source.read_bytes()
+        if (
+            len(snapshot) != entry["size"]
+            or hashlib.sha256(snapshot).hexdigest() != entry["sha256"]
+        ):
+            raise RuntimeError(
+                "Stage-2 metrics lineage snapshot changed after checkpoint load."
+            )
+
+        destination = self.metric_path
+        checkpoint_directory = Path(resume_payload.directory).resolve()
+        if (
+            destination == source.resolve()
+            or checkpoint_directory == destination
+            or checkpoint_directory in destination.parents
+        ):
+            raise RuntimeError(
+                "Stage-2 metrics output cannot mutate the immutable resume "
+                f"checkpoint: {destination}"
+            )
+        if destination.is_symlink() or (
+            destination.exists() and not destination.is_file()
+        ):
+            raise RuntimeError(
+                f"Stage-2 metrics destination is not a regular file: {destination}"
+            )
+        if destination.exists():
+            existing = destination.read_bytes()
+            if not existing.startswith(snapshot):
+                raise RuntimeError(
+                    "Existing Stage-2 JSONL does not contain the checkpoint's "
+                    "exact authenticated metrics prefix. Refusing to overwrite "
+                    f"or splice {destination}."
+                )
+            return
+
+        from utils.stage1_io import atomic_write_bytes
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(destination, snapshot)
+
+    def _build_logger(self, resume_payload: Any) -> None:
+        from utils.stage2_metrics import Stage2MetricsLogger
+
+        metric_path = getattr(self, "metric_path", self._metric_output_path())
         lineage = (
             None
             if resume_payload is None
@@ -1720,6 +2246,98 @@ class Trainer:
             "smoke_probe": self._last_cycle_smoke_probe,
         }
 
+    def _assert_live_checkpoint_quiescence(self) -> dict[str, bool]:
+        """Prove that no partial substep state can enter a committed checkpoint."""
+
+        active = getattr(self, "_active_logical_substep", None)
+        if active is not None:
+            raise RuntimeError(
+                "Stage-2 checkpoint attempted while a logical substep is active: "
+                f"{active}"
+            )
+        leaked_gradients: list[str] = []
+        for role in ("generator", "real_score", "fake_score"):
+            module = getattr(self.model, role)
+            leaked_gradients.extend(
+                f"{role}.{name}"
+                for name, parameter in module.named_parameters()
+                if parameter.grad is not None
+            )
+        if leaked_gradients:
+            raise RuntimeError(
+                "Stage-2 checkpoint boundary retained parameter gradients: "
+                f"{leaked_gradients[:8]}"
+            )
+
+        # Batches, the sampled branch, and the per-attempt rollout/KV state are
+        # deliberately local to `_run_one_logical_substep`.  The active marker
+        # spans that entire call.  Also reject any future refactor that stores
+        # one of those objects on Trainer and accidentally extends its lifetime.
+        pending_runtime = []
+        for name, value in vars(self).items():
+            lowered = name.lower()
+            if name == "_active_logical_substep":
+                continue
+            matches_pending_name = any(
+                token in lowered
+                for token in (
+                    "pending_batch",
+                    "active_batch",
+                    "pending_branch",
+                    "active_branch",
+                    "rollout_state",
+                    "active_transaction",
+                    "pending_transaction",
+                )
+            )
+            is_empty = (
+                value is None
+                or value is False
+                or (isinstance(value, (tuple, list, dict)) and len(value) == 0)
+            )
+            if matches_pending_name and not is_empty:
+                pending_runtime.append(name)
+        if pending_runtime:
+            raise RuntimeError(
+                "Stage-2 checkpoint boundary retained attempt-local runtime state: "
+                f"{sorted(pending_runtime)}"
+            )
+        return {
+            "pending_gradients": False,
+            "pending_batch": False,
+            "pending_branch": False,
+            "pending_rollout_kv": False,
+            "pending_transaction": False,
+        }
+
+    def _run_tracked_logical_substep(self) -> dict[str, Any]:
+        if getattr(self, "_active_logical_substep", None) is not None:
+            raise RuntimeError("Stage-2 logical substeps cannot be nested")
+        self._active_logical_substep = {
+            "role": self.state.current_role,
+            "cycle_substep": self.state.next_substep,
+            "logical_substep_id": self.state.successful_attempts,
+        }
+        try:
+            return self._run_one_logical_substep()
+        finally:
+            self._active_logical_substep = None
+
+    def _snapshot_checkpoint_metrics_lineage(self) -> dict[str, Any]:
+        snapshot = self.metric_path.read_bytes()
+        if not snapshot or not snapshot.endswith(b"\n"):
+            raise RuntimeError(
+                "Stage-2 checkpoint requires a non-empty, newline-terminated "
+                "metrics lineage snapshot."
+            )
+        self._checkpoint_metrics_lineage_snapshot = snapshot
+        return {
+            "run_id": self.logger.run_id,
+            # The snapshot is taken before checkpoint_event; reserve exactly
+            # that post-publication attempt in the checkpoint cursor.
+            "next_attempt_index": self.logger.next_attempt_index + 1,
+        }
+
     def _save_checkpoint(self) -> dict[str, Any]:
         from utils.stage2_checkpoint import (
             build_stage2_trainer_state,
@@ -1727,13 +2345,10 @@ class Trainer:
         )
 
         self.state.assert_checkpointable(self.schedule)
+        self._assert_live_checkpoint_quiescence()
         lineage = self._runtime_rank0_checked(
             "snapshot Stage-2 JSONL lineage",
-            lambda: {
-                "run_id": self.logger.run_id,
-                # Reserve the checkpoint_event appended only after _SUCCESS.
-                "next_attempt_index": self.logger.next_attempt_index + 1,
-            },
+            self._snapshot_checkpoint_metrics_lineage,
         )
         trainer_state = build_stage2_trainer_state(
             completed_generator_updates=self.state.completed_g,
@@ -1768,6 +2383,11 @@ class Trainer:
         destination = save_stage2_checkpoint(
             self.options.output_dir,
             trainer_state=trainer_state,
+            metrics_lineage_snapshot=(
+                self._checkpoint_metrics_lineage_snapshot
+                if self.is_main_process
+                else None
+            ),
             resolved_config=self.resolved,
             generator_module=self.model.generator,
             fake_score_module=self.model.fake_score,
@@ -1836,7 +2456,7 @@ class Trainer:
         start_cycle = self.state.cycle
         cycle_nonfinite_start = self.state.nonfinite_attempts
         while self.state.completed_g < self.resolved.total_generator_updates:
-            result = self._run_one_logical_substep()
+            result = self._run_tracked_logical_substep()
             cycle_elapsed.append(float(result.get("total_elapsed", result["elapsed"])))
             cycle_retry_elapsed.append(float(result.get("retry_seconds", 0.0)))
             cycle_step_fields.append(result.get("fields", {}))
@@ -1845,7 +2465,22 @@ class Trainer:
                 or self.state.next_substep != "F1"
             ):
                 continue
-            smoke_probe = self._validate_smoke_cycle(cycle_step_fields)
+            cycle_nonfinite_attempts = (
+                self.state.nonfinite_attempts - cycle_nonfinite_start
+            )
+            smoke_probe = self._validate_smoke_cycle(
+                cycle_step_fields,
+                nonfinite_attempts=cycle_nonfinite_attempts,
+            )
+            if smoke_probe is not None:
+                smoke_probe = {
+                    **smoke_probe,
+                    "parent_next_f1_probe_consumed": bool(
+                        getattr(self, "_smoke_parent_probe_consumed", False)
+                    ),
+                }
+                if self.options.smoke_mode in {"C0", "C1"}:
+                    smoke_probe["next_f1_probe"] = self._capture_next_f1_probe()
             self._last_cycle_smoke_probe = smoke_probe
             cycle_fields = {
                 **self._metric_clock("G", self.state.successful_attempts - 1),
@@ -1864,9 +2499,7 @@ class Trainer:
                     self.resolved.global_batch_size / cycle_elapsed[5]
                 ),
                 "successful_substeps": 6,
-                "nonfinite_attempts": (
-                    self.state.nonfinite_attempts - cycle_nonfinite_start
-                ),
+                "nonfinite_attempts": cycle_nonfinite_attempts,
                 "retry_seconds": sum(cycle_retry_elapsed),
                 "dry_run": self.options.dry_run,
                 "smoke_mode": self.options.smoke_mode,
@@ -1948,6 +2581,10 @@ class Trainer:
             self._world_checked(
                 "restore Stage-2 RNG state last",
                 lambda: self._restore_rng_last(resume_payload),
+            )
+            self._rank0_checked(
+                "prepare Stage-2 JSONL checkpoint lineage",
+                lambda: self._prepare_metrics_lineage(resume_payload),
             )
             self._world_checked(
                 "build Stage-2 JSONL logger",

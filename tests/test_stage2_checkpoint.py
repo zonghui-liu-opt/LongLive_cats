@@ -1,4 +1,5 @@
 import copy
+from functools import lru_cache
 import random
 
 import numpy as np
@@ -18,22 +19,30 @@ from utils.stage2_checkpoint import (
     restore_stage2_rng_state,
     validate_stage2_cycle_boundary,
     validate_stage2_full_optimizer_state,
+    validate_stage2_rng_state,
     validate_stage2_trainer_state,
 )
+from utils.stage2_sampler import build_stage2_role_samplers
+
+
+@lru_cache(maxsize=None)
+def _cached_sampler_state(completed_f: int, completed_g: int) -> dict:
+    actions = ("a", "b", "c")
+    streams = build_stage2_role_samplers(
+        [action for action in actions for _ in range(200)],
+        [(30, 52)] * 600,
+        action_order=actions,
+        base_seed=17,
+    )
+    for _ in range(completed_f):
+        streams.fake_score.next_global_batch()
+    for _ in range(completed_g):
+        streams.generator.next_global_batch()
+    return streams.state_dict()
 
 
 def _sampler_state(completed_f: int, completed_g: int) -> dict:
-    return {
-        "schema": "longlive_stage2_sampler_streams/v2",
-        "fake_score": {
-            "role": "fake_score",
-            "completed_batches": completed_f,
-        },
-        "generator": {
-            "role": "generator",
-            "completed_batches": completed_g,
-        },
-    }
+    return copy.deepcopy(_cached_sampler_state(completed_f, completed_g))
 
 
 def _loader_states() -> dict[str, torch.Tensor]:
@@ -268,6 +277,31 @@ def test_rank_rng_rejects_missing_control_without_partial_generator_mutation():
     assert torch.equal(dedicated["score"].get_state(), before)
 
 
+def test_rank0_structural_rng_audit_never_instantiates_foreign_cuda(
+    monkeypatch,
+):
+    state = capture_stage2_rng_state(
+        rank=7,
+        dedicated_generators={"score": torch.Generator().manual_seed(9)},
+        rank0_control_generators=None,
+        include_cuda=False,
+    )
+    state["dedicated"]["score"]["device"] = "cuda:7"
+    original_generator = torch.Generator
+    constructed_devices = []
+
+    def guarded_generator(*args, **kwargs):
+        device = kwargs.get("device", args[0] if args else "cpu")
+        constructed_devices.append(str(device))
+        if str(device).startswith("cuda"):
+            raise AssertionError("foreign CUDA generator was instantiated")
+        return original_generator(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "Generator", guarded_generator)
+    validate_stage2_rng_state(state, expected_rank=7)
+    assert not any(device.startswith("cuda") for device in constructed_devices)
+
+
 class TinyRole(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -330,9 +364,50 @@ def test_optimizer_state_is_role_exact_fp32_and_step_exact():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lr", 123.0),
+        ("betas", (0.9, 0.9)),
+        ("eps", 1.0),
+        ("weight_decay", 99.0),
+    ],
+)
+def test_optimizer_state_rejects_any_adamw_hyperparameter_drift(field, value):
+    state = _tiny_optimizer_state()
+    state["param_groups"][0][field] = value
+    with pytest.raises(ValueError, match=field):
+        validate_stage2_full_optimizer_state(
+            state,
+            role="generator",
+            expected_parameter_names=("lora_A", "lora_B"),
+            expected_completed_updates=5,
+        )
+
+
+def test_fake_score_optimizer_uses_its_distinct_locked_learning_rate():
+    state = _tiny_optimizer_state()
+    state["param_groups"][0]["lr"] = 4e-7
+    assert (
+        validate_stage2_full_optimizer_state(
+            state,
+            role="fake_score",
+            expected_parameter_names=("lora_A", "lora_B"),
+            expected_completed_updates=5,
+        )
+        is state
+    )
+
+
 def test_optimizer_restore_interface_broadcasts_then_audits_local_moments():
     module = TinyRole()
-    optimizer = torch.optim.AdamW([module.lora_A, module.lora_B], lr=2e-6)
+    optimizer = torch.optim.AdamW(
+        [module.lora_A, module.lora_B],
+        lr=2e-6,
+        betas=(0.0, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
     state = _tiny_optimizer_state(step=5)
     schema = {
         "lora_A.weight": LoraTensorSpec("lora_A", (2, 3), torch.float32),
@@ -389,7 +464,13 @@ def test_optimizer_restore_interface_broadcasts_then_audits_local_moments():
 
 def test_local_optimizer_audit_rejects_non_lora_and_role_state():
     module = TinyRole()
-    optimizer = torch.optim.AdamW([module.lora_A, module.lora_B], lr=2e-6)
+    optimizer = torch.optim.AdamW(
+        [module.lora_A, module.lora_B],
+        lr=2e-6,
+        betas=(0.0, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
     assert audit_stage2_lora_optimizer(module, optimizer, role="generator") == (
         "lora_A",
         "lora_B",

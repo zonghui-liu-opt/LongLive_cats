@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,19 +9,21 @@ import torch
 from torch import nn
 
 import wan_5b.modules.causal_model as causal_model_module
+from pipeline.stage2_rollout import (
+    STAGE2_K2_SHIFT5_TIMESTEPS,
+    STAGE2_K4_SHIFT5_TIMESTEPS,
+    Stage2ExitRNGStreams,
+    Stage2RolloutPipeline,
+    Stage2SinkPrefixSnapshot,
+    draw_stage2_exit_schedule,
+)
+from utils.stage2_config import load_stage2_config
+from utils.stage2_inference import tensor_identity_sha256
 from wan_5b.modules.causal_model import (
     CausalWanModel,
     CausalWanSelfAttention,
     MultiShotT2VCrossAttention,
 )
-
-from pipeline.stage2_rollout import (
-    STAGE2_K4_SHIFT5_TIMESTEPS,
-    Stage2ExitRNGStreams,
-    Stage2RolloutPipeline,
-    draw_stage2_exit_schedule,
-)
-from utils.stage2_config import load_stage2_config
 
 FRAME_TOKENS = 390
 
@@ -32,16 +35,17 @@ class _FakeScheduler:
         self.steps = []
 
     def set_timesteps(self, count, *, device, shift):
-        assert count == 4
         assert shift == 5.0
-        self.timesteps = torch.tensor(
-            STAGE2_K4_SHIFT5_TIMESTEPS, dtype=torch.float32, device=device
-        )
-        self.sigmas = torch.tensor(
-            [1.0, 0.937, 0.833, 0.624, 0.0],
-            dtype=torch.float32,
-            device=device,
-        )
+        if count == 4:
+            timetable = STAGE2_K4_SHIFT5_TIMESTEPS
+            sigmas = [1.0, 0.937, 0.833, 0.624, 0.0]
+        elif count == 2:
+            timetable = STAGE2_K2_SHIFT5_TIMESTEPS
+            sigmas = [1.0, 0.833, 0.0]
+        else:
+            raise AssertionError(count)
+        self.timesteps = torch.tensor(timetable, dtype=torch.float32, device=device)
+        self.sigmas = torch.tensor(sigmas, dtype=torch.float32, device=device)
 
     def step(self, flow, timestep, sample, *, return_dict):
         assert return_dict is False
@@ -101,6 +105,10 @@ class _FakeGenerator(nn.Module):
                 "before": before,
                 "prompt": float(conditional_dict["prompt_embeds"].flatten()[0]),
                 "flow_sigma": float(torch.as_tensor(flow_sigma).detach().cpu()),
+                "runtime_local_attn_size": self.model.local_attn_size,
+                "runtime_max_attention_size": self.model.max_attention_size,
+                "runtime_sink_size": self.model.sink_size,
+                "runtime_global_sink_size": self.model.global_sink_size,
             }
         )
         flow = noisy_image_or_video * self.scale
@@ -124,13 +132,13 @@ class _FakeGenerator(nn.Module):
                     local_start = old_local
                     local_end = old_local + token_count
                 else:
-                    sink = FRAME_TOKENS
+                    sink = self.model.global_sink_size * FRAME_TOKENS
                     history = capacity - sink - token_count
                     cache["k"][:, sink : sink + history].copy_(
-                        cache["k"][:, old_local - history : old_local]
+                        cache["k"][:, old_local - history : old_local].clone()
                     )
                     cache["v"][:, sink : sink + history].copy_(
-                        cache["v"][:, old_local - history : old_local]
+                        cache["v"][:, old_local - history : old_local].clone()
                     )
                     local_start = sink + history
                     local_end = capacity
@@ -145,7 +153,7 @@ class _FakeGenerator(nn.Module):
         return flow, x0
 
 
-def _pipeline(generator=None, schedulers=None):
+def _pipeline(generator=None, schedulers=None, *, spec=None):
     generator = generator or _FakeGenerator()
     schedulers = [] if schedulers is None else schedulers
 
@@ -154,7 +162,10 @@ def _pipeline(generator=None, schedulers=None):
         schedulers.append(scheduler)
         return scheduler
 
-    return Stage2RolloutPipeline(generator, scheduler_factory=factory), schedulers
+    return (
+        Stage2RolloutPipeline(generator, spec=spec, scheduler_factory=factory),
+        schedulers,
+    )
 
 
 def _inputs(*, prompt=3.0, batch=2):
@@ -175,6 +186,34 @@ def test_real_unipc_k4_shift5_is_the_single_runtime_timetable():
     # UniPC's exact sigma is the solver source of truth; integer display
     # timesteps are not a lossless substitute for x0 reconstruction.
     assert float(scheduler.sigmas[0]) != timetable[0] / 1000.0
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "expected_timetable"),
+    [
+        ("baseline_c8w16k4s1", STAGE2_K4_SHIFT5_TIMESTEPS),
+        ("c4w8k2s1", STAGE2_K2_SHIFT5_TIMESTEPS),
+    ],
+)
+def test_real_unipc_native_timetable_and_terminal_fp32_x0_identity(
+    profile_name, expected_timetable
+):
+    pipeline = Stage2RolloutPipeline(_FakeGenerator(), spec=profile_name)
+    scheduler, timetable = pipeline._new_scheduler(torch.device("cpu"))
+    assert timetable == expected_timetable
+    assert len(scheduler.sigmas) == len(timetable) + 1
+    assert float(scheduler.sigmas[-1]) == 0.0
+
+    sample = torch.randn(2, 3, generator=torch.Generator().manual_seed(17))
+    terminal_x0 = None
+    terminal_step = None
+    for timestep, sigma in zip(scheduler.timesteps, scheduler.sigmas[:-1]):
+        flow = sample * 0.25 + 0.1
+        terminal_x0 = sample - sigma * flow
+        terminal_step = scheduler.step(flow, timestep, sample, return_dict=False)[0]
+        sample = terminal_step
+    assert terminal_x0 is not None and terminal_step is not None
+    assert torch.equal(terminal_step, terminal_x0)
 
 
 def test_rollout_contract_is_built_only_from_the_resolved_stage2_config():
@@ -295,17 +334,41 @@ def test_nccl_exit_broadcast_rejects_cpu_tensor_before_collective(monkeypatch):
     ],
 )
 def test_rollout_constructor_cannot_bypass_locked_window_and_token_contract(override):
-    with pytest.raises(ValueError, match="C8/W16/H8/S1"):
+    with pytest.raises(ValueError, match="named spec|390 tokens/frame"):
         Stage2RolloutPipeline(_FakeGenerator(), **override)
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    [
+        "stress_c8w24k4s1",
+        "lower_c8w8k4s1",
+        "c8w16k4s4",
+        "c8w16k4s8",
+    ],
+)
+def test_deployment_only_profiles_cannot_enter_training_rollout(profile_name):
+    pipeline, _ = _pipeline(spec=profile_name)
+    initial, noise, conditioning = _inputs(batch=1)
+    with pytest.raises(RuntimeError, match="deployment-only"):
+        pipeline.rollout(
+            initial_latent=initial,
+            noise=noise,
+            conditional_dict=conditioning,
+            exit_step=0,
+            requires_grad=True,
+        )
 
 
 def test_rollout_generates_24_new_latents_and_only_clean_forwards_commit_kv():
     generator = _FakeGenerator()
     pipeline, schedulers = _pipeline(generator)
-    assert generator.model.local_attn_size == 17
-    assert generator.model.max_attention_size == 17 * FRAME_TOKENS
-    assert generator.model.sink_size == 1
-    assert generator.model.global_sink_size == 1
+    original_runtime = (
+        generator.model.local_attn_size,
+        generator.model.max_attention_size,
+        generator.model.sink_size,
+        generator.model.global_sink_size,
+    )
     initial, noise, conditioning = _inputs()
     result, state = pipeline.rollout(
         initial_latent=initial,
@@ -362,6 +425,24 @@ def test_rollout_generates_24_new_latents_and_only_clean_forwards_commit_kv():
     assert result.cache_audit["conditional_cache_branches"] == 1
     assert result.cache_audit["noisy_forward_calls"] == 9
     assert result.cache_audit["generator_forward_calls"] == 13
+    assert result.rollout_mode == "random_exit"
+    assert len(result.chunk_trace) == 3
+    assert len(result.initial_latent_sha256_per_sample) == 2
+    assert result.generated_latent_sha256_per_sample == ()
+    assert result.prefix_snapshot is None
+    assert all(call["runtime_local_attn_size"] == 17 for call in generator.calls)
+    assert all(
+        call["runtime_max_attention_size"] == 17 * FRAME_TOKENS
+        for call in generator.calls
+    )
+    assert all(call["runtime_sink_size"] == 1 for call in generator.calls)
+    assert all(call["runtime_global_sink_size"] == 1 for call in generator.calls)
+    assert (
+        generator.model.local_attn_size,
+        generator.model.max_attention_size,
+        generator.model.sink_size,
+        generator.model.global_sink_size,
+    ) == original_runtime
     assert all(
         cache["k"].grad_fn is None and cache["v"].grad_fn is None
         for cache in state.self_kv
@@ -391,6 +472,308 @@ def test_fake_score_rollout_is_fresh_and_graph_free():
     assert result.cache_audit["noisy_forward_calls"] == 3
 
 
+def test_generate_full_episode_is_bitwise_the_baseline_exit3_kernel():
+    initial, noise, conditioning = _inputs(batch=1)
+    deploy_pipeline, deploy_schedulers = _pipeline()
+    deploy, _ = deploy_pipeline.generate_full_episode(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning,
+    )
+    exit_pipeline, exit_schedulers = _pipeline()
+    training_exit, _ = exit_pipeline.rollout(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning,
+        exit_step=3,
+        requires_grad=False,
+    )
+
+    assert torch.equal(deploy.latents, training_exit.latents)
+    assert deploy.rollout_mode == "full_denoising"
+    assert training_exit.rollout_mode == "random_exit"
+    assert deploy.exit_step == 3
+    assert deploy.requires_grad is False
+    assert len(deploy.generated_latent_sha256_per_sample) == 1
+    assert deploy.initial_latent_sha256_per_sample == (
+        tensor_identity_sha256(initial[0]),
+    )
+    assert deploy.generated_latent_sha256_per_sample == (
+        tensor_identity_sha256(deploy.latents[0]),
+    )
+    assert deploy.chunk_timesteps == (STAGE2_K4_SHIFT5_TIMESTEPS,) * 3
+    assert deploy.cache_audit["generator_forward_calls"] == 16
+    assert len(deploy_schedulers) == len(exit_schedulers) == 3
+    assert [scheduler.steps for scheduler in deploy_schedulers] == [
+        [999, 937, 833],
+        [999, 937, 833],
+        [999, 937, 833],
+    ]
+    assert [trace["chunk_index"] for trace in deploy.chunk_trace] == [0, 1, 2]
+    assert [trace["rope_frame_start"] for trace in deploy.chunk_trace] == [1, 9, 17]
+    assert [trace["cache_before_global_end_index"] for trace in deploy.chunk_trace] == [
+        1 * FRAME_TOKENS,
+        9 * FRAME_TOKENS,
+        17 * FRAME_TOKENS,
+    ]
+    assert [trace["cache_after_global_end_index"] for trace in deploy.chunk_trace] == [
+        9 * FRAME_TOKENS,
+        17 * FRAME_TOKENS,
+        25 * FRAME_TOKENS,
+    ]
+    assert [trace["cache_after_local_end_index"] for trace in deploy.chunk_trace] == [
+        9 * FRAME_TOKENS,
+        17 * FRAME_TOKENS,
+        17 * FRAME_TOKENS,
+    ]
+    assert all(trace["fresh_scheduler"] is True for trace in deploy.chunk_trace)
+    assert all(trace["noisy_self_kv_commits"] == 0 for trace in deploy.chunk_trace)
+    assert all(trace["clean_self_kv_commits"] == 1 for trace in deploy.chunk_trace)
+    assert all(
+        len(trace["clean_latent_sha256_per_sample"]) == 1
+        for trace in deploy.chunk_trace
+    )
+    json.dumps(
+        {
+            "cache_audit": deploy.cache_audit,
+            "chunk_trace": deploy.chunk_trace,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "profile_name",
+        "chunk_frames",
+        "capacity_frames",
+        "denoising_steps",
+        "expected_calls",
+    ),
+    [
+        ("baseline_c8w16k4s1", 8, 17, 4, 16),
+        ("stress_c8w24k4s1", 8, 25, 4, 16),
+        ("lower_c8w8k4s1", 8, 9, 4, 16),
+        ("c4w12k4s1", 4, 13, 4, 31),
+        ("c4w8k4s1", 4, 9, 4, 31),
+        ("c4w8k2s1", 4, 9, 2, 19),
+    ],
+)
+def test_named_s1_profiles_share_one_full_deploy_path(
+    profile_name,
+    chunk_frames,
+    capacity_frames,
+    denoising_steps,
+    expected_calls,
+):
+    generator = _FakeGenerator()
+    pipeline, schedulers = _pipeline(generator, spec=profile_name)
+    initial, noise, conditioning = _inputs(batch=1)
+    result, state = pipeline.generate_full_episode(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning,
+    )
+
+    chunks = 24 // chunk_frames
+    assert result.latents.shape == noise.shape
+    assert result.latents.requires_grad is False
+    assert len(schedulers) == chunks
+    assert len(result.chunk_trace) == chunks
+    assert len(generator.calls) == expected_calls
+    assert result.cache_audit["generator_forward_calls"] == expected_calls
+    assert result.cache_audit["capacity_frames"] == capacity_frames
+    assert result.cache_audit["global_end_index"] == 25 * FRAME_TOKENS
+    assert result.cache_audit["local_end_index"] == capacity_frames * FRAME_TOKENS
+    assert result.cache_audit["profile"]["name"] == profile_name
+    assert state.self_kv[0]["k"].shape[1] == capacity_frames * FRAME_TOKENS
+    assert [trace["rope_frame_start"] for trace in result.chunk_trace] == list(
+        range(1, 25, chunk_frames)
+    )
+    assert all(
+        trace["timestep_count"] == denoising_steps for trace in result.chunk_trace
+    )
+    assert all(
+        call["runtime_max_attention_size"] == capacity_frames * FRAME_TOKENS
+        for call in generator.calls
+    )
+    assert all(call["runtime_sink_size"] == 1 for call in generator.calls)
+    assert generator.model.local_attn_size == 16
+    assert generator.model.max_attention_size == 0
+    assert generator.model.sink_size == 0
+    assert generator.model.global_sink_size == 0
+
+
+@pytest.mark.parametrize(
+    ("target_profile", "sink_frames"),
+    [("c8w16k4s4", 4), ("c8w16k4s8", 8)],
+)
+def test_episode1_prefix_snapshot_restores_detached_s4_s8_episode2(
+    target_profile, sink_frames
+):
+    generator = _FakeGenerator()
+    baseline, _ = _pipeline(generator)
+    target, target_schedulers = _pipeline(generator, spec=target_profile)
+    initial, noise, conditioning_a = _inputs(prompt=3.0, batch=2)
+    noise[1].add_(0.5)
+    result_a, state_a = baseline.generate_full_episode(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning_a,
+        capture_prefix_sink_frames=sink_frames,
+    )
+
+    reference, _ = _pipeline()
+    reference_a, _ = reference.generate_full_episode(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning_a,
+    )
+    assert torch.equal(result_a.latents, reference_a.latents)
+    assert result_a.cache_audit["capacity_frames"] == 17
+    snapshot = result_a.prefix_snapshot
+    assert isinstance(snapshot, Stage2SinkPrefixSnapshot)
+    assert snapshot.target_sink_frames == sink_frames
+    assert snapshot.clean_latents.shape[1] == sink_frames - 1
+    assert len(snapshot.clean_latent_sha256_per_sample) == 2
+    assert len(set(snapshot.clean_latent_sha256_per_sample)) == 2
+    assert torch.equal(
+        snapshot.clean_latents,
+        result_a.latents[:, : sink_frames - 1],
+    )
+    assert snapshot.clean_latents.requires_grad is False
+    assert snapshot.clean_latents.grad_fn is None
+    assert all(
+        layer.k.requires_grad is False
+        and layer.v.requires_grad is False
+        and layer.k.grad_fn is None
+        and layer.v.grad_fn is None
+        and layer.k.shape[1] == sink_frames * FRAME_TOKENS
+        for layer in snapshot.layers
+    )
+    assert result_a.chunk_trace[0]["captured_prefix_sink_frames"] == sink_frames
+    assert result_a.chunk_trace[1]["captured_prefix_sink_frames"] == 0
+
+    state_b = target.reset_for_new_episode(
+        state_a,
+        prefix_snapshot=snapshot,
+    )
+    assert state_b is not state_a
+    assert state_b.profile_name == target_profile
+    assert state_b.episode_index == 1
+    assert state_b.episode_complete is False
+    for cache, layer in zip(state_b.self_kv, snapshot.layers):
+        assert cache["k"].shape[1] == (sink_frames + 16) * FRAME_TOKENS
+        assert torch.equal(cache["k"][:, : target.sink_tokens], layer.k)
+        assert torch.equal(cache["v"][:, : target.sink_tokens], layer.v)
+        assert torch.count_nonzero(cache["k"][:, target.sink_tokens :]) == 0
+        assert torch.count_nonzero(cache["v"][:, target.sink_tokens :]) == 0
+        assert int(cache["global_end_index"].item()) == target.sink_tokens
+        assert int(cache["local_end_index"].item()) == target.sink_tokens
+    assert all(cache["is_init"] is False for cache in state_b.cross_kv)
+    assert all(torch.count_nonzero(cache["k"]) == 0 for cache in state_b.cross_kv)
+
+    calls_before_b = len(generator.calls)
+    conditioning_b = {"prompt_embeds": torch.full((2, 2, 3), 9.0, dtype=torch.bfloat16)}
+    result_b, state_b = target.generate_full_episode(
+        initial_latent=initial,
+        noise=noise + 1,
+        conditional_dict=conditioning_b,
+        state=state_b,
+    )
+    b_calls = generator.calls[calls_before_b:]
+    assert len(target_schedulers) == 3
+    assert len(b_calls) == 15
+    assert result_b.cache_audit["sink_preload_forward_calls"] == 0
+    assert result_b.cache_audit["generator_forward_calls"] == 15
+    assert result_b.cache_audit["capacity_frames"] == sink_frames + 16
+    assert result_b.cache_audit["global_end_index"] == (sink_frames + 24) * FRAME_TOKENS
+    assert result_b.cache_audit["local_end_index"] == (sink_frames + 16) * FRAME_TOKENS
+    assert result_b.chunk_trace[0]["rope_frame_start"] == sink_frames
+    assert b_calls[0]["current_start"] == sink_frames * FRAME_TOKENS
+    assert all(call["prompt"] == 9.0 for call in b_calls)
+    assert all(call["runtime_sink_size"] == sink_frames for call in b_calls)
+    assert all(
+        call["runtime_max_attention_size"] == (sink_frames + 16) * FRAME_TOKENS
+        for call in b_calls
+    )
+    assert state_b.episode_complete is True
+    assert generator.model.local_attn_size == 16
+    assert generator.model.max_attention_size == 0
+    assert generator.model.sink_size == 0
+    assert generator.model.global_sink_size == 0
+
+    calls_before_baseline = len(generator.calls)
+    baseline.generate_full_episode(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning_a,
+    )
+    later_baseline_calls = generator.calls[calls_before_baseline:]
+    assert all(call["runtime_sink_size"] == 1 for call in later_baseline_calls)
+    assert all(
+        call["runtime_max_attention_size"] == 17 * FRAME_TOKENS
+        for call in later_baseline_calls
+    )
+
+
+def test_multi_sink_profiles_fail_closed_without_a_prefix_snapshot():
+    target, _ = _pipeline(spec="c8w16k4s4")
+    initial, noise, conditioning = _inputs(batch=1)
+    with pytest.raises(RuntimeError, match="cannot start a fresh episode"):
+        target.generate_full_episode(
+            initial_latent=initial,
+            noise=noise,
+            conditional_dict=conditioning,
+        )
+
+
+def test_attention_runtime_is_restored_when_scheduler_validation_fails():
+    class _BadScheduler(_FakeScheduler):
+        def set_timesteps(self, count, *, device, shift):
+            super().set_timesteps(count, device=device, shift=shift)
+            self.timesteps[0] = 998
+
+    generator = _FakeGenerator()
+    original_runtime = (
+        generator.model.local_attn_size,
+        generator.model.max_attention_size,
+        generator.model.sink_size,
+        generator.model.global_sink_size,
+    )
+    pipeline = Stage2RolloutPipeline(
+        generator,
+        scheduler_factory=_BadScheduler,
+    )
+    initial, noise, conditioning = _inputs(batch=1)
+    with pytest.raises(RuntimeError, match="timetable drifted"):
+        pipeline.generate_full_episode(
+            initial_latent=initial,
+            noise=noise,
+            conditional_dict=conditioning,
+        )
+    assert (
+        generator.model.local_attn_size,
+        generator.model.max_attention_size,
+        generator.model.sink_size,
+        generator.model.global_sink_size,
+    ) == original_runtime
+
+
+def test_rollout_rejects_scheduler_instance_reuse_between_chunks():
+    scheduler = _FakeScheduler()
+    pipeline = Stage2RolloutPipeline(
+        _FakeGenerator(),
+        scheduler_factory=lambda: scheduler,
+    )
+    initial, noise, conditioning = _inputs(batch=1)
+    with pytest.raises(RuntimeError, match="distinct UniPC scheduler"):
+        pipeline.generate_full_episode(
+            initial_latent=initial,
+            noise=noise,
+            conditional_dict=conditioning,
+        )
+
+
 def test_episode_reset_keeps_sink_clears_local_and_cross_and_restarts_rope():
     generator = _FakeGenerator()
     pipeline, _ = _pipeline(generator)
@@ -408,7 +791,7 @@ def test_episode_reset_keeps_sink_clears_local_and_cross_and_restarts_rope():
         for cache in state.self_kv
     ]
     calls_before = len(generator.calls)
-    pipeline.reset_for_new_episode(state)
+    assert pipeline.reset_for_new_episode(state) is state
     for cache, (sink_k, sink_v) in zip(state.self_kv, sink_before):
         assert torch.equal(cache["k"][:, :FRAME_TOKENS], sink_k)
         assert torch.equal(cache["v"][:, :FRAME_TOKENS], sink_v)
@@ -494,7 +877,11 @@ def test_rollout_refuses_partial_reset_changed_sink_and_shape_fallbacks():
             requires_grad=True,
             state=state,
         )
-    pipeline.reset_for_new_episode(state)
+    state.self_kv[0]["global_end_index"].sub_(FRAME_TOKENS)
+    with pytest.raises(RuntimeError, match="cache cursor mismatch"):
+        pipeline.reset_for_new_episode(state)
+    state.self_kv[0]["global_end_index"].add_(FRAME_TOKENS)
+    assert pipeline.reset_for_new_episode(state) is state
     changed = initial.clone()
     changed[:, :, :, 0, 0] += 1
     with pytest.raises(RuntimeError, match="sink changed"):
@@ -573,6 +960,147 @@ def test_real_causal_attention_last_chunk_sees_sink_history8_and_current8(
     assert torch.equal(last_keys[9:], torch.full((8,), 4.0))
     assert int(cache["global_end_index"].item()) == 25
     assert int(cache["local_end_index"].item()) == 17
+
+
+@pytest.mark.parametrize(
+    ("window_frames", "expected_local_markers"),
+    [
+        (12, [5.0] * 4 + [6.0] * 4 + [7.0] * 4),
+        (8, [6.0] * 4 + [7.0] * 4),
+    ],
+)
+def test_real_causal_attention_c4_preserves_exact_named_history(
+    monkeypatch,
+    window_frames,
+    expected_local_markers,
+):
+    capacity = 1 + window_frames
+    attention = CausalWanSelfAttention(
+        dim=1,
+        num_heads=1,
+        local_attn_size=capacity,
+        sink_size=1,
+        qk_norm=False,
+    )
+    attention.global_sink_size = 1
+    attention.max_attention_size = capacity
+    with torch.no_grad():
+        for projection in (attention.q, attention.k, attention.v, attention.o):
+            projection.weight.fill_(1)
+            projection.bias.zero_()
+    monkeypatch.setattr(
+        causal_model_module,
+        "causal_rope_apply",
+        lambda value, *_args, **_kwargs: value,
+    )
+    attended = []
+
+    def capture_attention(query, key, value):
+        attended.append(key.detach().clone())
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(causal_model_module, "attention", capture_attention)
+    cache = {
+        "k": torch.zeros(1, capacity, 1, 1),
+        "v": torch.zeros(1, capacity, 1, 1),
+        "global_end_index": torch.tensor([0], dtype=torch.long),
+        "local_end_index": torch.tensor([0], dtype=torch.long),
+        "pinned_start": torch.tensor([-1], dtype=torch.long),
+        "pinned_len": torch.tensor([0], dtype=torch.long),
+    }
+    cursor = 0
+    for frames, marker in [(1, 1.0)] + [(4, float(value)) for value in range(2, 8)]:
+        causal_model_module._CURRENT_GRID_META.clear()
+        values = torch.full((1, frames, 1), marker)
+        _, update = attention(
+            values,
+            seq_lens=torch.tensor([frames]),
+            grid_sizes=torch.tensor([[frames, 1, 1]]),
+            freqs=None,
+            block_mask=None,
+            kv_cache=cache,
+            current_start=cursor,
+            cache_start=cursor,
+        )
+        CausalWanModel._apply_cache_updates(SimpleNamespace(), [cache], [(0, update)])
+        cursor += frames
+
+    final_keys = attended[-1][0, :, 0, 0]
+    assert torch.equal(final_keys[:1], torch.tensor([1.0]))
+    assert torch.equal(final_keys[1:], torch.tensor(expected_local_markers))
+    assert int(cache["global_end_index"].item()) == 25
+    assert int(cache["local_end_index"].item()) == capacity
+
+
+@pytest.mark.parametrize("sink_frames", [4, 8])
+def test_real_causal_attention_preserves_restored_multi_sink_prefix(
+    monkeypatch, sink_frames
+):
+    capacity = sink_frames + 16
+    attention = CausalWanSelfAttention(
+        dim=1,
+        num_heads=1,
+        local_attn_size=capacity,
+        sink_size=sink_frames,
+        qk_norm=False,
+    )
+    attention.global_sink_size = sink_frames
+    attention.max_attention_size = capacity
+    with torch.no_grad():
+        for projection in (attention.q, attention.k, attention.v, attention.o):
+            projection.weight.fill_(1)
+            projection.bias.zero_()
+    monkeypatch.setattr(
+        causal_model_module,
+        "causal_rope_apply",
+        lambda value, *_args, **_kwargs: value,
+    )
+    attended = []
+
+    def capture_attention(query, key, value):
+        attended.append(key.detach().clone())
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(causal_model_module, "attention", capture_attention)
+    cache = {
+        "k": torch.zeros(1, capacity, 1, 1),
+        "v": torch.zeros(1, capacity, 1, 1),
+        "global_end_index": torch.tensor([sink_frames], dtype=torch.long),
+        "local_end_index": torch.tensor([sink_frames], dtype=torch.long),
+        "pinned_start": torch.tensor([-1], dtype=torch.long),
+        "pinned_len": torch.tensor([0], dtype=torch.long),
+    }
+    prefix = torch.arange(1, sink_frames + 1, dtype=torch.float32)
+    cache["k"][0, :sink_frames, 0, 0].copy_(prefix)
+    cache["v"][0, :sink_frames, 0, 0].copy_(prefix)
+    cursor = sink_frames
+    for marker in (5.0, 6.0, 7.0):
+        causal_model_module._CURRENT_GRID_META.clear()
+        values = torch.full((1, 8, 1), marker)
+        _, update = attention(
+            values,
+            seq_lens=torch.tensor([8]),
+            grid_sizes=torch.tensor([[8, 1, 1]]),
+            freqs=None,
+            block_mask=None,
+            kv_cache=cache,
+            current_start=cursor,
+            cache_start=cursor,
+        )
+        CausalWanModel._apply_cache_updates(SimpleNamespace(), [cache], [(0, update)])
+        cursor += 8
+
+    assert [keys.shape[1] for keys in attended] == [
+        sink_frames + 8,
+        capacity,
+        capacity,
+    ]
+    final_keys = attended[-1][0, :, 0, 0]
+    assert torch.equal(final_keys[:sink_frames], prefix)
+    assert torch.equal(final_keys[sink_frames : sink_frames + 8], torch.full((8,), 6.0))
+    assert torch.equal(final_keys[sink_frames + 8 :], torch.full((8,), 7.0))
+    assert int(cache["global_end_index"].item()) == sink_frames + 24
+    assert int(cache["local_end_index"].item()) == capacity
 
 
 def test_stage2_cross_attention_cache_is_real_and_legacy_bypass_is_unchanged(

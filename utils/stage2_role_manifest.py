@@ -607,7 +607,7 @@ def validate_stage2_generator_manifest(
     manifest_path: str | os.PathLike[str],
     *,
     expected_checkpoint_path: str | os.PathLike[str],
-    expected_step: int = 3750,
+    expected_step: int = 3075,
 ) -> dict[str, Any]:
     """Accept only the enriched Stage-1 EMA-merge v2 provenance contract."""
 
@@ -634,7 +634,7 @@ def validate_stage2_generator_manifest(
     if value.get("schema_version") != STAGE1_MERGE_MANIFEST_VERSION:
         raise ValueError(
             "Stage-2 requires longlive_stage1_merge_manifest schema_version=2; "
-            "regenerate the Stage-1 step3750 merge manifest"
+            "regenerate the Stage-1 step3075 merge manifest"
         )
     if value.get("checkpoint_format") != "longlive_stage1_causal_ema_merged":
         raise ValueError("generator checkpoint_format mismatch")

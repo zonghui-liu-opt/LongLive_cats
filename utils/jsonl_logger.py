@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -55,7 +56,11 @@ def _scan_jsonl_bytes(
         try:
             value = json.loads(content.decode("utf-8", errors="strict"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            if index == last_nonempty:
+            # A crash-truncated tail is distinguishable from a durable bad
+            # record: only the final non-empty byte sequence without a line
+            # terminator is disposable.  Once a producer wrote ``\n``, that
+            # line is a complete JSONL record and corruption must be surfaced.
+            if index == last_nonempty and not line.endswith((b"\n", b"\r")):
                 return records, prefix_bytes
             raise ValueError(
                 f"Invalid JSONL record at {path}:{index + 1}; only a truncated "
@@ -68,13 +73,27 @@ def _scan_jsonl_bytes(
     return records, None
 
 
+@dataclass(frozen=True)
+class JsonlSnapshot:
+    """Records and SHA-256 derived from one immutable byte snapshot."""
+
+    records: list[dict[str, Any]]
+    sha256: str
+
+
+def read_jsonl_snapshot(path: str | os.PathLike[str]) -> JsonlSnapshot:
+    """Parse and fingerprint exactly the same bytes from ``path``."""
+
+    path = Path(path)
+    raw = path.read_bytes() if path.exists() else b""
+    records, _truncate_before = _scan_jsonl_bytes(path, raw)
+    return JsonlSnapshot(records=records, sha256=hashlib.sha256(raw).hexdigest())
+
+
 def read_jsonl_tolerant(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
     """Read JSONL while allowing only the final non-empty line to be truncated."""
-    path = Path(path)
-    if not path.exists():
-        return []
-    records, _truncate_before = _scan_jsonl_bytes(path, path.read_bytes())
-    return records
+
+    return read_jsonl_snapshot(path).records
 
 
 def _repair_jsonl_tail_for_append(path: Path) -> None:

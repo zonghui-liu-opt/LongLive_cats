@@ -1,8 +1,8 @@
 # LongLive‑2.0：猫咪 TI2V 4‑Step Self‑Forcing DMD/DFD Stage‑2
 
-> 状态：检查点A已获用户检查通过；中文H100指南与发布前终审已完成，等待内网8×H100准备门禁结果；尚未进入trainer/训练闭环
+> 状态：本地训练、checkpoint/resume、可视化、baseline推理、技术trace与通用压缩/sink接口均已实现并完成严格终审；新版8×H100 C0/C1/C2、正式训练、绘图与真实推理仍待内网执行
 >
-> 最后确认日期：2026‑08‑10
+> 最后确认日期：2026‑08‑16
 >
 > 目标硬件：内网单机 8×H100；本地只完成代码、单测、静态与轻量集成验证
 > 本文是 Stage‑2 的实现规格。不得用未记录的新假设替换已确认决策。
@@ -11,16 +11,16 @@
 
 - [x] 开始前完整阅读本文、`git status --short`、Stage‑1 配置/训练/指标实现、现有 DMD trainer、causal/bidirectional Wan wrapper、训练/推理 pipeline 与相关测试。
 - [x] 保留工作区所有既有修改和未跟踪数据；不得恢复、覆盖、删除或顺手整理无关文件。当前 `results/` 属于用户数据。
-- [ ] 复用现有 LongLive‑2.0 模型、FSDP、LoRA、scheduler、checkpoint、Stage‑1 JSONL 和推理基础设施；可以为正确性拆分接口，但不得复制第二套大体相同的系统。
-- [ ] 每次只实现一个最小可验证步骤；先运行该步骤测试并记录证据，再勾选并继续。
-- [ ] 先复用现有代码，再做最小扩展, 不要重复造轮子.
-- [ ] 所有 shape、frame count、LoRA target/count、hash、role、时钟、cache、phase、RNG、checkpoint 与非有限状态不一致均 fail-fast；禁止 silent fallback。
-- [ ] 代码事实若与本文冲突且会改变研究方案，停止实现并恢复一问一答；仅事实性文件映射可更新本文后继续。
-- [ ] 不在本地伪造 H100 profile、正式训练成功或视觉质量结论；不提交、不推送，除非用户另行授权。
+- [x] 复用现有 LongLive‑2.0 模型、FSDP、LoRA、scheduler、checkpoint、Stage‑1 JSONL 和推理基础设施；可以为正确性拆分接口，但不得复制第二套大体相同的系统。
+- [x] 每次只实现一个最小可验证步骤；先运行该步骤测试并记录证据，再勾选并继续。
+- [x] 先复用现有代码，再做最小扩展, 不要重复造轮子.
+- [x] 所有 shape、frame count、LoRA target/count、hash、role、时钟、cache、phase、RNG、checkpoint 与非有限状态不一致均 fail-fast；禁止 silent fallback。
+- [x] 代码事实若与本文冲突且会改变研究方案，停止实现并恢复一问一答；仅事实性文件映射可更新本文后继续。
+- [x] 不在本地伪造 H100 profile、正式训练成功或视觉质量结论；不提交、不推送，除非用户另行授权。
 
 ## 1. 目标与完成结果
 
-以 Stage‑1 step 3750 EMA causal generator 为起点，训练一个适合端侧部署的 Stage‑2 baseline：
+以用户实测表现更好的 Stage‑1 step 3075 EMA causal generator 为唯一初始化起点，训练一个适合端侧部署的 Stage‑2 baseline：
 
 ```text
 输入：原始单张首帧 + 当前动作 prompt
@@ -33,12 +33,12 @@
 
 训练使用 Self‑Forcing on-policy rollout、DMD 和短 Phase‑B DFD post-training。代码完成必须同时满足：
 
-- [ ] Generator 始终生成24个新 latent；sink不占输出槽位，score输入严格为 `1+24=25`。
-- [ ] 4-step训练 rollout 与部署使用同一 LongLive‑2.0 UniPC算子、时间表、chunk scheduler reset 和 clean recache语义。
-- [ ] DMD/DFD/fake-score三条梯度路径与下文公式一致，sink严格不进loss。
-- [ ] `5 fake-score updates → 1 generator update`、Phase A/B、EMA与checkpoint使用独立且可审计的成功更新时钟。
+- [x] Generator 始终生成24个新 latent；sink不占输出槽位，score输入严格为 `1+24=25`。
+- [x] 4-step训练 rollout 与部署使用同一 LongLive‑2.0 UniPC算子、时间表、chunk scheduler reset 和 clean recache语义。
+- [x] DMD/DFD/fake-score三条梯度路径与下文公式一致，sink严格不进loss。
+- [x] `5 fake-score updates → 1 generator update`、Phase A/B、EMA与checkpoint使用独立且可审计的成功更新时钟。
 - [ ] 8×H100可在global batch64下通过完整预检，并从原子checkpoint精确恢复。
-- [ ] JSONL与静态图能分别展示Generator loss、fake-score loss、角色/周期吞吐、时间分解、显存、梯度、phase和DMD/DFD分支。
+- [x] JSONL与静态图能分别展示Generator loss、fake-score loss、角色/周期吞吐、时间分解、显存、梯度、phase和DMD/DFD分支。
 - [ ] 使用现有 `testsets/`、seeds `1,2,3,4` 正确产生可人工查看的视频；本任务不自动判断视觉质量。
 
 ## 2. 范围与明确不做
@@ -71,11 +71,11 @@
 
 - Stage‑1 causal TI2V按8帧chunk训练，LoRA为self-attention q/k/v/o与FFN 0/2，rank32，共180个Linear、57,016,320个可训练参数。
 - Stage‑1正式训练loss是conditional-only，等效标准CFG1；用户使用的推理路径是标准CFG5。
-- step3750人工结果：动作能力约恢复到bidirectional teacher水平，但后段出现颜色过饱和与毛发细节下降。
-- 当前本地 `infer_stage1.sh` 的checkpoint列表并不包含3750；内网启动前必须记录真实3750命令、EMA merge来源与hash，不能只凭脚本名推断。
-- `results/stage1_600cats_3750steps/metrics/stage1_train_metrics.jsonl` 只有损坏的尾部摘录：首行不是合法JSON、没有`run_start`，仅余4500-step run的4498–4500记录，且与checkpoint3750不对应。不得据此绘制趋势或宣称质量/收敛结论。
+- 用户人工对比确认step3075权重表现更好，因此Stage‑2 Generator初始化、EMA merge、manifest provenance、配置、测试和产物命名统一锁定step3075。
+- 内网启动必须记录真实`checkpoint_model_003075`命令、EMA merge来源与hash，不能只凭脚本名或目录名推断。
+- 任何其他Stage‑1 checkpoint的损坏/残缺metrics不得用于Stage‑2趋势判断或质量/收敛结论。
 
-### 3.2 当前Stage‑2路径必须修复的P0
+### 3.2 初始审计发现且现已修复的P0
 
 1. 当前I2V路径把initial latent覆盖进24输出的第0槽，实际只有23个新latent。
 2. noncausal wrapper取 `timestep[:,0]`；首帧t=0时会把整个bidirectional score forward误喂成t=0。
@@ -184,7 +184,7 @@ pinned_len       = 0
 | 项目 | 锁定值 |
 |---|---|
 | metadata | `training_sets/metadata_600clips_480x832_buckets.csv` |
-| 样本 | 600；3动作×200 |
+| 样本 | 600；`head_tilt_and_wink=198`、`jump=202`、`play_with_a_cat_wand=200`（以当前内网冻结资产为准） |
 | cache dtype/channels | BF16 / C=48 |
 | latent空间 | 30×52或52×30 |
 | 官方Stage‑1已有cache | F24：slot0是sink，只有slot1..23共23个future；不能直接用于Stage‑2 24-new监督 |
@@ -194,7 +194,7 @@ pinned_len       = 0
 
 内网正式启动前扫描全部600条：
 
-- 600/600记录存在、可读、shape/dtype/channel/orientation合法；动作恰好200/200/200。
+- 600/600记录存在、可读、shape/dtype/channel/orientation合法；三个受限动作恰好为`head_tilt_and_wink=198`、`jump=202`、`play_with_a_cat_wand=200`。
 - Stage‑2训练video latent必须统一F=25；F24只能给出23个future，必须明确拒绝，不能把sink误称为future或静默补帧。
 - `initial_latent` 与 `video_latent[:,0]` 的差异写入manifest，但score输入永远使用显式initial作为sink，不以video0静默替代。
 - `real_future = video_latent[:,1:25]`；必须正好24帧。
@@ -202,13 +202,13 @@ pinned_len       = 0
 - manifest记录每条shape/hash、公共schema hash、数据/config/code版本；T5/VAE不进入正式训练进程。
 - real-score CFG5的negative conditioning必须逐字节复用 `utils/config.py::DEFAULT_NEGATIVE_PROMPT`（当前UTF‑8 SHA256为 `ce96e0324e4b54ce4b6e867f669ca520952e1a34cc116543516b1897f0d3c47e`）。使用与positive cache相同的T5/tokenizer checkpoint、revision、cleaning、special-token与padding设置离线编码一次；manifest同时校验文本、模型、tokenizer、embedding tensor与padding hash，正式trainer不现场加载T5。
 
-当前本地CSV只有header和1条fixture，且schema没有 `action_id`。正式balanced sampler不得用模糊文本聚类或假设“前200/后200”的行顺序。内网预处理必须提供一个冻结、可审计的action label来源：优先读取现有cache manifest中的可靠字段；若不存在，则生成并由操作者确认一个精确sidecar（建议 `video,action_id`，600行，3个受限枚举值）。sidecar/hash写入Stage‑2 manifest，恰好200/200/200才放行；缺失、重复、未知或规则无法唯一分类时停止训练。
+当前本地CSV只有header和1条fixture，且schema没有 `action_id`。正式balanced sampler不得用模糊文本聚类或假设固定行区间。内网预处理必须提供一个冻结、可审计的action label来源：优先读取现有cache manifest中的可靠字段；若不存在，则生成并由操作者确认一个精确sidecar（建议 `video,action_id`，600行，3个受限枚举值）。sidecar/hash写入Stage‑2 manifest，只有`head_tilt_and_wink=198`、`jump=202`、`play_with_a_cat_wand=200`才放行；缺失、重复、未知或规则无法唯一分类时停止训练。
 
 ### 5.2 Balanced sampler与epoch口径
 
 - 每个F optimizer update与每个G optimizer update的effective global batch均为64。
 - 每个global batch按动作组成22/21/21，并轮转多出的一个名额，长期等权。
-- F与G各自拥有独立的balanced sample stream与RNG；两者都对每个动作的200条队列做确定性shuffle并按index构造。checkpoint分别保存F/G的sampler epoch/cursor/generator state，禁止让5倍F消费扰动G的generator-epoch数据语义。
+- F与G各自拥有独立的balanced sample stream与RNG；两者都对三个动作各自198/202/200条队列做确定性shuffle、独立wrap/reshuffle并按index构造。checkpoint分别保存F/G的sampler epoch/cursor/generator state，禁止让5倍F消费扰动G的generator-epoch数据语义。
 - 一个 **generator epoch** 固定定义为 `ceil(600/64)=10` 个成功G updates，不以F update或总loop iteration计数。
 - 每次F/G update使用自己的4或8个accumulation microbatches；不得在G/F间偷共享一份需要梯度的rollout图。
 - DFD real sample必须与on-policy fake来自同一CSV行、同一prompt与initial latent；不得随机配同动作视频。
@@ -217,8 +217,8 @@ pinned_len       = 0
 
 ### 6.1 Generator
 
-- immutable causal full base：Stage‑1 step3750 EMA LoRA严格merge后的完整BF16权重。
-- merge manifest记录Stage‑1 base、raw/EMA adapter、step3750、target schema与SHA256；Stage‑1 trainer state/step/optimizer/RNG不得导入Stage‑2。
+- immutable causal full base：Stage‑1 step3075 EMA LoRA严格merge后的完整BF16权重。
+- merge manifest记录Stage‑1 base、raw/EMA adapter、step3075、target schema与SHA256；Stage‑1 trainer state/step/optimizer/RNG不得导入Stage‑2。
 - fresh Stage‑2 Generator LoRA：
 
 ```yaml
@@ -594,9 +594,9 @@ C4,K2: 1 + 6*(2+1) = 19
 - [x] **结果**：明确当前DMD/Stage‑1相关测试基线、工作区保护范围和所有新配置字段。
 - **主要区域**：新增 `configs/train_i2v_stage2_600cats.yaml`、`utils/stage2_config.py` 与Stage‑2 test骨架；只读对照现有DMD/pipeline/wrapper。
 - **验证**：运行相关现有测试；新增只描述baseline config/计数/公式的失败测试，不改production。
-- **完成证据**：本地Stage‑2配置正反契约103项与相关Stage‑1/DMD回归64项通过；内网Stage‑2为103 passed，相关回归显式排除仅锁定公开Stage‑1 YAML的`test_release_stage1_config_has_one_locked_source_of_truth`后为63 passed，配置契约全部通过。Black、Ruff、py_compile、CLI与whitespace检查通过。path-independent contract hash为`aa4d7be1e05c846df14cee5417a298afe668429f41faa671f3021754a5616c00`。
+- **完成证据**：本地Stage‑2配置正反契约与相关Stage‑1/DMD回归通过；内网准备门禁通过。step3075统一且允许A24同点安全分叉B0/B1后的path-independent contract hash为`a7365f2ec45f74c3918ec05725b5d19b488fa4447a409cc6b5db4ccb114dd6c6`；最终测试数量以当前磁盘态重新验收结果为准，不沿用历史计数。
 - **暂停边界**：本步未接`train.py`/registry，未加载CUDA、模型、权重或600-cache；UniPC测试仅characterize仓库scheduler。内网确认raw配置解析、contract hash和本测试集后，才可开始Step 2。
-- **内网记录**：每次快速部署与实验按[Stage‑2 H100运行手册](docs/STAGE2_H100_QUICK_DEPLOY_ZH.md)追加真实命令、结果和产物路径。
+- **内网记录**：操作者优先使用[Stage‑2 H100简明指导脚本](run_stage2_h100.sh)逐步执行；复杂故障再查[完整训练与推理手册](docs/STAGE2_H100_TRAINING_INFERENCE_RUNBOOK_ZH.md)。每次实验仍须记录真实命令、结果和产物路径。
 
 ### Step 2：角色配置、初始化manifest与独立LoRA
 
@@ -663,39 +663,39 @@ C4,K2: 1 + 6*(2+1) = 19
 - [x] **结果**：F/G/cycle独立记录；Generator/Fake loss、角色/周期吞吐、时间/显存/phase图和HTML。
 - **主要区域**：复用/兼容扩展 `utils/jsonl_logger.py`；新增Stage‑2 metrics helper、`scripts/plot_stage2_training.py`、tests。
 - **验证**：synthetic lineage/nonfinite/resume fixture；全部PNG/SVG/HTML存在且字段/横轴/phase marker正确；Stage‑1 plot tests不变。
-- **检查点B最终本地证据**：最终磁盘态正式`tests/`范围为735 passed、2 subtests passed；14条warning均为既有`torch.jit.script_method`弃用提示。Stage‑2相关Python文件Black/Ruff、py_compile、两个CLI help、contract hash与`git diff --check`通过；两轮只读终审未发现剩余代码P0/P1。
-- **检查点B边界**：未运行或伪造8×H100/NCCL/FSDP2 smoke；未开始Step 12–14、batch推理或正式训练；本节点中文H100指导、commit和push必须等用户检查通过后再做。
+- **检查点B当时的历史证据**：该检查点磁盘态正式`tests/`范围为735 passed、2 subtests passed；后续Steps 12–14继续增加了实现与测试，当前最终证据见Step 14。14条warning均为既有`torch.jit.script_method`弃用提示。
+- **当前外部验证边界**：未运行或伪造8×H100/NCCL/FSDP2训练smoke或正式训练；本地继续完成Step 12–14，不再按旧检查点暂停。
 
 ### Step 12：baseline推理、testsets与技术trace
 
-- [ ] **结果**：单动作96帧、两动作192帧；seeds1–4；CFG1单cache；人工查看索引。
+- [x] **结果**：单动作96帧、两动作192帧；seeds1–4；CFG1单cache；人工查看索引。
 - **主要区域**：Stage‑2 inference config/runner/shell、现有inference helpers/testset loader。
 - **验证**：无模型tiny orchestration测试、frame/cache/reset/hash/文件集合门禁；旧Stage‑1入口回归。
+- **完成证据**：Generator-only EMA loader只读取并严格merge已认证EMA；正式baseline固定56个样本、每rank一次T5/Generator/VAE、同图latent复用。双动作同一`(sample, seed)`只初始化一次RNG并连续生成48个noise slots，A/B分别消费前/后24个；每份video/trace、最终manifest与review index严格绑定checkpoint、四类config/runtime hash、模型资产内容hash和clean Git commit。
 
 ### Step 13：通用压缩/sink接口
 
-- [ ] **结果**：C/W/H/S/K通用配置与capacity断言；C4、K2、episode1-prefix multi-sink可走同一代码路径。
+- [x] **结果**：C/W/H/S/K通用配置与capacity断言；C4、K2、episode1-prefix multi-sink可走同一代码路径。
 - **主要区域**：config resolver、cache allocator、rollout/inference session、tests。
 - **验证**：表中W24/W16/W8、C4W12/C4W8、K2、S4/S8的shape/index/call-count测试；不正式训练变体。
+- **完成证据**：8个canonical named profiles共用唯一episode kernel；K4与原生K2 schedule、capacity、调用计数、训练可用性均fail-closed。S4/S8只在episode2恢复episode1 clean-recache后的detached永久prefix，episode1保持baseline bitwise不变。非baseline仍只代表技术压力测试，不冒充已完成部署适配训练。
 
 ### Step 14：全量本地验收与内网H100 runbook
 
-- [ ] **结果**：相关回归全绿；提供cache scan、preflight、resume、formal train、plot、baseline inference精确命令。
+- [x] **结果**：相关回归全绿；提供cache scan、preflight、resume、formal train、plot、baseline inference精确命令。
 - **主要区域**：tests、shell、中文runbook、本文状态。
 - **验证**：`pytest -q tests/test_stage2_*.py`、仓库正式范围 `pytest -q tests`、shell `bash -n`、CLI `--help`、py_compile/lint、`git diff --check`；不要用会额外收集 `fouroversix/` 可选环境测试的无范围根目录pytest冒充正式回归，不得伪造H100结果。
+- **最终本地证据（2026‑08‑16）**：加入简明H100指导脚本后的当前`tests/test_stage2_*.py`为662 passed；guide/artifact/runbook专项为27 passed；14条warning均为既有TorchScript弃用提示。Phase 15结束时仓库正式`tests/`范围曾为964 passed、2 subtests passed，新增指导脚本后未把该历史计数冒充当前全仓重跑。训练/checkpoint/metrics、推理/runtime与output-root守卫分别通过Black、Ruff、py_compile和针对性diff检查；shell、train/plot/inference CLI均通过。独立最终规格审计为P0=0、P1=0。用户已有CSV的CRLF/trailing-whitespace diff属于受保护的既有工作区数据，未擅自改写；任务代码路径的`git diff --check`单独通过。
 
 ### Step 15：用户在内网执行H100预检和正式训练
 
 - [ ] **结果**：600 cache gate、3-cycle profile、选定microbatch、正式A/B训练、图表与推理产物。
 - **验证**：保存真实manifest/JSONL/plots/checkpoints/trace；用户人工检查视频并决定后续压缩实验。
 
-### 用户指定的三个检查节点（2026‑08‑10，覆盖旧的逐Batch暂停）
+### 连续实施规则（2026‑08‑15）
 
-1. **训练前准备检查点**：完成Steps 1–8及本地正反测试/相关回归后停止。此时不得包含完整trainer、optimizer state machine、正式checkpoint、训练JSONL/plot或训练运行。
-2. **训练闭环检查点**：用户通过上一检查点并完成内网准备门禁后，实现Steps 9–11；包含严格5F→1G、log、权重/checkpoint/resume和可视化，本地验证后停止，交给用户运行H100 smoke。
-3. **推理与其余任务检查点**：smoke通过后实现Steps 12–14及batch推理/技术trace/通用压缩接口，完成剩余文档验收。
-
-每个检查节点先由用户检查本地代码；用户确认后再编写该节点的简洁中文内网指导、提交并上传GitHub `stage-2`。内部Step不再单独等待用户。
+- 先前其他模型制定的分批/检查点暂停规则已由用户取消；上述Steps只作为需求覆盖与验证清单，不再构成停工边界。
+- 本地连续完成训练、可视化、baseline推理、技术trace、通用压缩/sink接口及全部回归；真实H100 smoke、正式训练和视觉质量结论仍由内网证据单独确认，绝不在本地伪造。
 
 ## 16. 全任务验收标准
 
@@ -711,7 +711,7 @@ C4,K2: 1 + 6*(2+1) = 19
 - [x] 状态机恰为5F→1G；A/B、EMA与checkpoint只由成功G时钟推进。
 - [x] resume恢复下一数据、exit、DFD branch、score t/noise和参数状态。
 - [x] Stage‑2 JSONL/plot覆盖loss、吞吐、时间、显存、phase；Stage‑1 logger/plot回归不变。
-- [ ] baseline inference输出96/192帧并正确reset；旧Stage‑1推理不回归。
+- [x] baseline inference输出96/192帧并正确reset；旧Stage‑1推理不回归（本地tiny/CPU与真实接口回归；真实5B视频和人工质量判断仍属于下节H100验收）。
 
 ### 16.2 H100验收
 

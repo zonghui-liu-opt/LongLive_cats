@@ -1,0 +1,19 @@
+schema: longlive_stage2_inference/v1
+stage2_checkpoint: ${oc.env:LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT,/path/to/checkpoint_stage2_g000280}
+source_cache_manifest: ${oc.env:LONG_LIVE_STAGE2_SOURCE_MANIFEST,/path/to/stage2_f25_cache_manifest.attested.json}
+architecture_root: ${oc.env:LONG_LIVE_STAGE2_ARCHITECTURE_ROOT,/path/to/Wan2.2-TI2V-5B}
+t5_checkpoint: ${oc.env:LONG_LIVE_STAGE2_T5_CHECKPOINT,/path/to/models_t5_umt5-xxl-enc-bf16.pth}
+tokenizer_dir: ${oc.env:LONG_LIVE_STAGE2_TOKENIZER_DIR,/path/to/google/umt5-xxl}
+vae_checkpoint: ${oc.env:LONG_LIVE_STAGE2_VAE_CHECKPOINT,/path/to/Wan2.2_VAE.pth}
+single_metadata: testsets/metadata_6cases_480x832.csv
+two_action_metadata: testsets/metadata_8cases_two_actions_continuation_480x832_253frames.csv
+output_root: ${oc.env:LONG_LIVE_STAGE2_INFERENCE_OUTPUT,/path/to/stage2_baseline_inference}
+profiles:
+  - baseline_c8w16k4s1
+seeds: [1, 2, 3, 4]
+runtime:
+  dtype: bfloat16
+  cfg_scale: 1.0
+  fps: 24
+  merge_ema_lora: true
+  batch_size_per_device: 1

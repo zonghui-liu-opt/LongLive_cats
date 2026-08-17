@@ -86,6 +86,17 @@ def test_truncated_tail_is_ignored_but_middle_corruption_is_not(tmp_path):
         read_jsonl_tolerant(path)
 
 
+def test_newline_terminated_invalid_tail_is_not_treated_as_a_truncation(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(
+        '{"record_type":"run_start","run_id":"a"}\nnot-json\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="only a truncated final line"):
+        read_jsonl_tolerant(path)
+
+
 def test_resume_repairs_one_truncated_tail_before_appending_new_run(tmp_path):
     path = tmp_path / "metrics.jsonl"
     with JsonlLogger(

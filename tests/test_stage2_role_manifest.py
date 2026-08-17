@@ -65,7 +65,7 @@ def _teacher_manifest(tmp_path: Path) -> tuple[Path, Path, dict, Path]:
 def _generator_manifest(tmp_path: Path) -> tuple[Path, Path, dict]:
     base = tmp_path / "stage1-base.pt"
     base.write_bytes(b"stage1-base")
-    training = tmp_path / "checkpoint_model_003750"
+    training = tmp_path / "checkpoint_model_003075"
     training.mkdir()
     raw = training / "adapter_raw.safetensors"
     ema = training / "adapter_ema.safetensors"
@@ -84,7 +84,7 @@ def _generator_manifest(tmp_path: Path) -> tuple[Path, Path, dict]:
             "schema": "longlive_stage1_lora_checkpoint",
             "schema_version": "1",
             "kind": kind,
-            "completed_step": "3750",
+            "completed_step": "3075",
             "tensor_count": "360",
             "global_numel": "57016320",
             "dtype": "float32",
@@ -117,7 +117,7 @@ def _generator_manifest(tmp_path: Path) -> tuple[Path, Path, dict]:
         )
     checkpoint_manifest = write_checkpoint_manifest(
         training,
-        completed_step=3750,
+        completed_step=3075,
         world_size=6,
         sequence_parallel_size=3,
         data_parallel_size=2,
@@ -137,7 +137,7 @@ def _generator_manifest(tmp_path: Path) -> tuple[Path, Path, dict]:
         },
         "training_checkpoint": {
             "path": str(training),
-            "completed_step": 3750,
+            "completed_step": 3075,
             "manifest_sha256": checkpoint_manifest["manifest_sha256"],
             "resolved_config_sha256": sha256_file(resolved_config),
             "adapter": ema.name,
@@ -263,7 +263,7 @@ def test_longlive_teacher_rejects_non_bf16_state_before_manifest(tmp_path):
         )
 
 
-def test_generator_manifest_requires_enriched_step3750_provenance(
+def test_generator_manifest_requires_enriched_step3075_provenance(
     tmp_path, monkeypatch
 ):
     checkpoint, path, manifest = _generator_manifest(tmp_path)
@@ -283,7 +283,7 @@ def test_generator_manifest_requires_enriched_step3750_provenance(
         path,
         expected_checkpoint_path=checkpoint,
     )
-    assert audit["source_step"] == 3750
+    assert audit["source_step"] == 3075
     assert audit["adapter"]["target_module_count"] == 180
     assert audit["adapter"]["adapter_tensor_count"] == 360
     assert audit["adapter"]["trainable_parameter_count"] == 57_016_320

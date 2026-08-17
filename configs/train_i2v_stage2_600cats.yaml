@@ -41,9 +41,9 @@ model_contract:
 
 checkpoints:
   init_from_stage1:
-    generator_stage1_step: 3750
-    generator_checkpoint: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_BASE,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3750_ema_merged.pt}
-    generator_manifest: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3750_ema_merged.manifest.json}
+    generator_stage1_step: 3075
+    generator_checkpoint: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_BASE,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3075_ema_merged.pt}
+    generator_manifest: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/stage1_step3075_ema_merged.manifest.json}
     real_score_checkpoint: ${oc.env:LONG_LIVE_STAGE2_REAL_SCORE_BASE,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts}
     real_score_manifest: ${oc.env:LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2/real_score_teacher.manifest.json}
   resume_stage2: null
@@ -51,7 +51,7 @@ checkpoints:
 roles:
   generator:
     backbone: causal
-    base_source: stage1_step3750_ema_merged
+    base_source: stage1_step3075_ema_merged
     trainable: adapter_only
     conditioning_mode: conditional_only
     forward_mode: single_conditional

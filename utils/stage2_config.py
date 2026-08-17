@@ -49,6 +49,12 @@ _CONTRACT_LOCAL_DERIVED_FIELDS = {
     "action_labels_path",
     "negative_conditioning_manifest",
     "jsonl_path",
+    # These are the two task-book-authorized post-A24 matched-arm choices.
+    # They must be excluded from both halves of the contract payload: the
+    # canonical config view below and the duplicated resolved/derived view.
+    "phase_b_mode",
+    "phase_b_dfd_probability_max",
+    "phase_b1_dfd_probabilities",
 }
 
 _TOP_LEVEL_KEYS = {
@@ -653,6 +659,16 @@ def _contract_config_view(config: Mapping[str, Any]) -> dict[str, Any]:
     contract["data"]["action_labels_path"] = None
     contract["data"]["negative_conditioning"]["artifact_manifest"] = "<runtime-asset>"
     contract["logging"]["jsonl_path"] = "<runtime-output>"
+    # Phase B has one task-book-authorized matched-control fork: the B1 arm
+    # mixes DMD/DFD up to p=0.25, while B0 remains DMD-only for the same four
+    # epochs.  Both children must be able to resume the *same* A24 checkpoint,
+    # so only these two post-A24 choices are excluded from the parent research
+    # contract.  ``phase_b_epochs`` and every other training field remain
+    # covered and therefore fail closed on drift.
+    contract["training"]["phase_b_mode"] = "<matched-phase-b-arm>"
+    contract["training"][
+        "phase_b_dfd_probability_max"
+    ] = "<matched-phase-b-probability>"
     return contract
 
 
@@ -836,7 +852,7 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
             "Exactly one of checkpoints.init_from_stage1 and "
             "checkpoints.resume_stage2 must be configured."
         )
-    generator_stage1_step = 3750
+    generator_stage1_step = 3075
     init_generator_checkpoint = None
     init_generator_manifest = None
     init_real_score_checkpoint = None
@@ -850,7 +866,7 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
             init_mapping,
             "generator_stage1_step",
             "checkpoints.init_from_stage1",
-            3750,
+            3075,
         )
         init_generator_checkpoint = _string(
             init_mapping["generator_checkpoint"],
@@ -877,7 +893,7 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
     role_contracts = {
         "generator": {
             "backbone": "causal",
-            "base_source": "stage1_step3750_ema_merged",
+            "base_source": "stage1_step3075_ema_merged",
             "trainable": "adapter_only",
             "conditioning_mode": "conditional_only",
             "forward_mode": "single_conditional",

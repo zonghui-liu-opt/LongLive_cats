@@ -263,7 +263,7 @@ def test_generator_v2_payload_load_is_exact_and_strict(tmp_path):
         "checkpoint_format": "longlive_stage1_causal_ema_merged",
         "checkpoint_version": 1,
         "model_name": "Wan2.2-TI2V-5B",
-        "source_training_step": 3750,
+        "source_training_step": 3075,
         "source_adapter": "adapter_ema.safetensors",
         "dtype": "bfloat16",
         "source_base_sha256": base_sha256,
@@ -283,7 +283,7 @@ def test_generator_v2_payload_load_is_exact_and_strict(tmp_path):
     summary = strict_load_stage2_role_base(target, asset=asset)
     assert summary["strict_reload_succeeded"] is True
 
-    payload["global_step"] = 3750
+    payload["global_step"] = 3075
     torch.save(payload, checkpoint)
     asset = {
         **_verified_teacher_asset(checkpoint, payload, "generator"),

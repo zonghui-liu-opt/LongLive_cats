@@ -102,6 +102,243 @@ def _shape_key(shape: tuple[int, int]) -> str:
     return f"{shape[0]}x{shape[1]}"
 
 
+def validate_stage2_balanced_sampler_state(
+    state_dict: Mapping[str, Any],
+    *,
+    expected_role: str | None = None,
+    expected_completed_batches: int | None = None,
+) -> dict[str, Any]:
+    """Validate one self-contained sampler checkpoint without a live dataset.
+
+    The serialized group permutations contain the exact dataset partition, so
+    checkpoint publication can prove the full queue/cursor/RNG schema before a
+    ``_SUCCESS`` marker exists.  Runtime loading performs the additional check
+    against the live dataset's action/shape partition.
+    """
+
+    state = _require_exact_mapping(
+        state_dict, label="Stage-2 sampler state", expected_keys=_STATE_KEYS
+    )
+    if state["schema"] != STAGE2_SAMPLER_STATE_SCHEMA:
+        raise RuntimeError("Unsupported Stage-2 balanced sampler schema.")
+    role = state["role"]
+    if role not in STAGE2_SAMPLER_ROLES:
+        raise RuntimeError(f"Invalid Stage-2 sampler role {role!r}.")
+    if expected_role is not None and role != expected_role:
+        raise RuntimeError(
+            f"Stage-2 sampler role mismatch: expected {expected_role!r}, got {role!r}."
+        )
+    base_seed = _require_plain_int(state["base_seed"], "base_seed", minimum=0)
+    stream_seed = _require_plain_int(state["stream_seed"], "stream_seed", minimum=0)
+    if stream_seed != _derive_stream_seed(base_seed, role):
+        raise RuntimeError(
+            "Stage-2 sampler stream_seed is not derived from base_seed/role."
+        )
+    dataset_hash = state["dataset_action_spatial_sha256"]
+    if (
+        not isinstance(dataset_hash, str)
+        or len(dataset_hash) != 64
+        or any(character not in "0123456789abcdef" for character in dataset_hash)
+    ):
+        raise RuntimeError(
+            "Stage-2 sampler dataset_action_spatial_sha256 must be lowercase SHA-256."
+        )
+
+    action_order = state["action_order"]
+    if (
+        not isinstance(action_order, list)
+        or len(action_order) != 3
+        or len(set(action_order)) != 3
+        or any(
+            not isinstance(action_id, str)
+            or not action_id
+            or action_id != action_id.strip()
+            for action_id in action_order
+        )
+    ):
+        raise RuntimeError("Stage-2 sampler action_order must contain three clean ids.")
+    raw_shapes = state["spatial_shape_order"]
+    if not isinstance(raw_shapes, list) or not raw_shapes:
+        raise RuntimeError(
+            "Stage-2 sampler spatial_shape_order must be a non-empty list."
+        )
+    spatial_shapes = tuple(
+        _normalize_spatial_shape(value, f"spatial_shape_order[{index}]")
+        for index, value in enumerate(raw_shapes)
+    )
+    if len(set(spatial_shapes)) != len(spatial_shapes) or spatial_shapes != tuple(
+        shape for shape in STAGE2_ALLOWED_SPATIAL_SHAPES if shape in set(spatial_shapes)
+    ):
+        raise RuntimeError("Stage-2 sampler spatial_shape_order is not canonical.")
+
+    microbatch = _require_plain_int(
+        state["microbatch_size_per_device"],
+        "microbatch_size_per_device",
+        minimum=1,
+    )
+    if microbatch not in (1, 2):
+        raise RuntimeError("Stage-2 sampler microbatch_size_per_device must be 1 or 2.")
+    locked = {
+        "global_batch_size": STAGE2_GLOBAL_BATCH_SIZE,
+        "per_action_batch_counts": list(STAGE2_PER_ACTION_BATCH_COUNTS),
+        "batches_per_stream_epoch": STAGE2_BATCHES_PER_STREAM_EPOCH,
+    }
+    for key, expected in locked.items():
+        if state[key] != expected or type(state[key]) is not type(expected):
+            raise RuntimeError(
+                f"Stage-2 sampler state {key} mismatch: {state[key]!r} != {expected!r}."
+            )
+
+    completed = _require_plain_int(
+        state["completed_batches"], "completed_batches", minimum=0
+    )
+    if expected_completed_batches is not None and completed != _require_plain_int(
+        expected_completed_batches, "expected_completed_batches", minimum=0
+    ):
+        raise RuntimeError(
+            "Stage-2 sampler completed_batches disagrees with the trainer clock."
+        )
+    derived = {
+        "stream_epoch": completed // STAGE2_BATCHES_PER_STREAM_EPOCH,
+        "batch_cursor": completed % STAGE2_BATCHES_PER_STREAM_EPOCH,
+        "extra_slot_cursor": completed % len(action_order),
+    }
+    for key, expected in derived.items():
+        if _require_plain_int(state[key], key, minimum=0) != expected:
+            raise RuntimeError(
+                f"Stage-2 sampler {key} is inconsistent with completed_batches."
+            )
+
+    action_states = _require_exact_mapping(
+        state["action_states"],
+        label="Stage-2 sampler action_states",
+        expected_keys=set(action_order),
+    )
+    declared_shape_keys = {_shape_key(shape) for shape in spatial_shapes}
+    observed_shape_keys: set[str] = set()
+    all_indices: list[int] = []
+    for action_index, action_id in enumerate(action_order):
+        action_state = _require_exact_mapping(
+            action_states[action_id],
+            label=f"Stage-2 sampler action state {action_id!r}",
+            expected_keys=_ACTION_STATE_KEYS,
+        )
+        groups = action_state["groups"]
+        if not isinstance(groups, Mapping) or not groups:
+            raise RuntimeError(
+                f"Stage-2 sampler action {action_id!r} must contain shape groups."
+            )
+        if not set(groups).issubset(declared_shape_keys):
+            raise RuntimeError(
+                f"Stage-2 sampler action {action_id!r} contains undeclared shapes."
+            )
+        observed_shape_keys.update(groups)
+        action_population = 0
+        action_consumed = 0
+        for shape_key, raw_group in groups.items():
+            group = _require_exact_mapping(
+                raw_group,
+                label=f"Stage-2 sampler group {action_id!r}/{shape_key}",
+                expected_keys=_GROUP_STATE_KEYS,
+            )
+            queue_epoch = _require_plain_int(
+                group["queue_epoch"], f"{action_id}/{shape_key}.queue_epoch", minimum=0
+            )
+            cursor = _require_plain_int(
+                group["cursor"], f"{action_id}/{shape_key}.cursor", minimum=0
+            )
+            order = group["order"]
+            if (
+                not isinstance(order, list)
+                or not order
+                or any(
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or index < 0
+                    or index >= STAGE2_NUM_SAMPLES
+                    for index in order
+                )
+                or len(order) != len(set(order))
+            ):
+                raise RuntimeError(
+                    f"Stage-2 sampler {action_id!r}/{shape_key} order is invalid."
+                )
+            if cursor > len(order):
+                raise RuntimeError(
+                    f"Stage-2 sampler {action_id!r}/{shape_key} cursor exceeds its queue."
+                )
+            action_population += len(order)
+            action_consumed += queue_epoch * len(order) + cursor
+            all_indices.extend(order)
+        full_rotations, remainder = divmod(completed, len(action_order))
+        expected_consumed = full_rotations * STAGE2_GLOBAL_BATCH_SIZE + sum(
+            rotating_action_batch_counts(update)[action_index]
+            for update in range(remainder)
+        )
+        if action_consumed != expected_consumed:
+            raise RuntimeError(
+                f"Stage-2 sampler {action_id!r} consumed {action_consumed} rows, "
+                f"expected {expected_consumed}."
+            )
+        if action_population <= max(STAGE2_PER_ACTION_BATCH_COUNTS):
+            raise RuntimeError(
+                f"Stage-2 sampler action {action_id!r} population is too small."
+            )
+    if len(all_indices) != STAGE2_NUM_SAMPLES or set(all_indices) != set(
+        range(STAGE2_NUM_SAMPLES)
+    ):
+        raise RuntimeError(
+            "Stage-2 sampler group orders must partition exactly dataset rows [0,600)."
+        )
+    if observed_shape_keys != declared_shape_keys:
+        raise RuntimeError(
+            "Stage-2 sampler spatial_shape_order contains a shape with no rows."
+        )
+
+    generator_state = state["generator_state"]
+    if (
+        not isinstance(generator_state, torch.Tensor)
+        or generator_state.dtype != torch.uint8
+        or generator_state.device.type != "cpu"
+        or generator_state.ndim != 1
+    ):
+        raise RuntimeError(
+            "Stage-2 sampler generator_state must be one-dimensional CPU uint8."
+        )
+    candidate_generator = torch.Generator(device="cpu")
+    try:
+        candidate_generator.set_state(generator_state.clone())
+    except RuntimeError as exc:
+        raise RuntimeError("Invalid Stage-2 sampler generator_state.") from exc
+    return state
+
+
+def validate_stage2_sampler_streams_state(
+    state_dict: Mapping[str, Any],
+    *,
+    expected_completed_batches: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    state = _require_exact_mapping(
+        state_dict,
+        label="Stage-2 sampler streams state",
+        expected_keys={"schema", "fake_score", "generator"},
+    )
+    if state["schema"] != STAGE2_SAMPLER_STREAMS_SCHEMA:
+        raise RuntimeError("Unsupported Stage-2 sampler streams schema.")
+    expected = dict(expected_completed_batches or {})
+    if expected and set(expected) != set(STAGE2_SAMPLER_ROLES):
+        raise RuntimeError(
+            "expected_completed_batches must contain fake_score/generator."
+        )
+    for role in STAGE2_SAMPLER_ROLES:
+        validate_stage2_balanced_sampler_state(
+            state[role],
+            expected_role=role,
+            expected_completed_batches=expected.get(role),
+        )
+    return state
+
+
 def _dataset_action_spatial_hash(
     action_ids: Sequence[str], spatial_shapes: Sequence[tuple[int, int]]
 ) -> str:
@@ -521,6 +758,10 @@ class Stage2BalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
         }
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        validate_stage2_balanced_sampler_state(
+            state_dict,
+            expected_role=self.role,
+        )
         state = _require_exact_mapping(
             state_dict, label="Stage-2 sampler state", expected_keys=_STATE_KEYS
         )
@@ -757,6 +998,7 @@ class Stage2RoleSamplerStreams:
         }
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        validate_stage2_sampler_streams_state(state_dict)
         state = _require_exact_mapping(
             state_dict,
             label="Stage-2 sampler streams state",
@@ -813,4 +1055,6 @@ __all__ = [
     "build_stage2_role_samplers",
     "partition_stage2_global_batch",
     "rotating_action_batch_counts",
+    "validate_stage2_balanced_sampler_state",
+    "validate_stage2_sampler_streams_state",
 ]

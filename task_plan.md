@@ -1,10 +1,10 @@
 # 任务计划：LongLive‑2.0 Stage‑2 Self‑Forcing DMD/DFD
 
 ## 目标
-完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`，按用户指定的三个检查节点交付：训练前准备、训练/日志/权重/可视化、batch推理与其余验收；保持 Stage‑1 与 legacy DMD 行为不回归。
+完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 12 已完成：real-score teacher manifest 之后的完整 Stage-2 H100 操作指南已与当前脚本、600cats配置、C0/C1/C2 smoke、正式训练、checkpoint/resume、JSONL和九图产物对齐，并通过443项相关回归；真实8×H100执行仍由用户在内网完成。
+Phase 16 已完成：复杂H100手册已收敛为单一顶层 `run_stage2_h100.sh`，操作者只需依次选择prepare、smoke、train、control、plot和infer并核对明确PASS标志；底层step3075、动作分布198/202/200、训练、恢复、可视化和推理契约保持不变。
 
 ## 各阶段
 
@@ -85,9 +85,9 @@ Phase 12 已完成：real-score teacher manifest 之后的完整 Stage-2 H100 �
 - [x] 9.8 重跑训练前准备全量本地测试和相关回归，完成两轮独立终审，并在第一个用户检查点停止
 - [x] 9.9 用户检查通过后，写简洁中文 H100 指南并上传 `stage-2`；等待内网准备门禁结果
 - [x] 9.10 实现严格5F→1G trainer、EMA/nonfinite、原子checkpoint、JSONL/plot（原 Steps 9–11），完成735项全仓本地回归并在第二个用户检查点停止
-- [ ] 9.11 用户检查通过后，写本节点指南并上传 `stage-2`；等待内网 H100 smoke 结果
-- [ ] 9.12 smoke通过后，实现baseline batch推理、压缩/sink通用接口和其余本地验收（原 Steps 12–14），按要求完成最终内网任务
-- **Status:** in_progress（检查点B等待用户检查；Phase 9整体仍未完成）
+- [x] 9.11 旧的分批暂停/上传边界已由用户取消；完整H100 runbook已统一覆盖新版prepare与后续生命周期
+- [x] 9.12 完成baseline batch推理、压缩/sink通用接口和全部本地验收（原 Steps 12–14）
+- **Status:** complete（本地代码与验收完成；真实8×H100执行证据单列为外部边界）
 
 ### Phase 10：Stage‑1 LoRA/merged 四卡批量推理对比
 - [x] 10.1 审计 Stage‑1 `adapter_ema.safetensors` 加载格式、现有 inference 分布式采样和6-case双分辨率约束
@@ -116,12 +116,36 @@ Phase 12 已完成：real-score teacher manifest 之后的完整 Stage-2 H100 �
 - [x] 12.5 运行CLI help、shell syntax、文档命令静态审计、目标测试与最终diff检查
 - **Status:** complete（443 passed；真实8×H100 smoke/formal仍待内网执行）
 
-#### 用户指定的停止点（覆盖旧的逐Batch暂停）
-1. **检查点 A——训练前准备**：原 Steps 1–8、本地验证、用户检查、中文指南与分支发布均已完成；当前等待内网8×H100门禁，不写完整trainer、不训练。
-2. **检查点 B——训练闭环**：完成trainer、log、checkpoint/权重保存与可视化并本地验证；不做正式训练，停下给用户安排H100 smoke。
-3. **检查点 C——推理与其余任务**：smoke通过后完成batch推理、技术trace、通用压缩/sink接口及任务文档剩余验收。
+### Phase 13：前5项检查的一键入口
+- [x] 13.1 将teacher、step3075 Generator、配置、F25/negative/formal cache、role init串为一个脚本
+- [x] 13.2 支持安全复用已经验证过的昂贵产物，拒绝半成品或来源漂移
+- [x] 13.3 把H100文档缩短为“填路径、运行、看5个PASS”
+- [x] 13.4 更新契约测试并运行Stage-2相关回归
+- **Status:** complete（437 passed；真实8×H100检查待内网执行）
 
-每个检查点均遵守：用户先审查本地代码；通过后再写该节点的简洁中文部署指导、提交并上传GitHub `stage-2`，随后等待对应内网结果。检查点之间的内部子步骤不再单独停下。
+### Phase 14：Stage‑2 F25 latent 专用重提入口
+- [x] 14.1 核对 Stage‑1 F24 与 Stage‑2 F25 的像素帧、latent帧和训练slice契约
+- [x] 14.2 审计两份新CSV的行数、字段、动作分布、video字符串和旧cache哈希兼容性
+- [x] 14.3 新增只负责F25/attestation/negative/formal-audit的8×H100脚本
+- [x] 14.4 增加无GPU输入契约与shell编排测试
+- [x] 14.5 运行目标测试、shell/静态检查并交付内网命令
+- **Status:** complete（443 passed；真实F25提取待内网600条完整输入与8×H100）
+
+### Phase 15：Stage‑2 当前磁盘态重新严格审计
+- [x] 15.1 完整重读任务书并把 Steps 9–14 映射到当前生产代码、测试和外部 H100 门禁
+- [x] 15.2 独立审计训练状态机、loss/optimizer/EMA/nonfinite/checkpoint/resume 的语义一致性
+- [x] 15.3 独立审计 JSONL、PNG/SVG/HTML 可视化和训练后 batch inference/trace 接口
+- [x] 15.4 建立当前本地回归基线，修复所有可证实的 P0/P1/P2 缺陷并增加反例测试
+- [x] 15.5 连续完成Stage‑2训练、可视化、推理与压缩接口的全部本地验收，不再按旧检查点停工
+- **Status:** complete（Stage‑2 656 passed；正式tests/ 964 passed、2 subtests；最终只读审计P0=0/P1=0）
+
+### Phase 16：Stage‑2 H100 单一指导脚本
+- [x] 16.1 核对现有prepare、C0/C1/C2、formal、plot、inference的真实CLI与成功标志
+- [x] 16.2 设计一个最小子命令接口，复用现有脚本和生产入口，不复制训练逻辑
+- [x] 16.3 实现指导脚本及严格的环境/路径/断点/产物检查
+- [x] 16.4 增加shell编排与文档契约测试，覆盖成功提示和危险误用
+- [x] 16.5 运行shell、CLI、目标回归和diff门禁，交付只需复制执行的内网步骤
+- **Status:** complete（目标回归27 passed；完整Stage‑2 662 passed；独立终审P0=0/P1=0；真实8×H100执行待内网）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
@@ -139,6 +163,7 @@ Phase 12 已完成：real-score teacher manifest 之后的完整 Stage-2 H100 �
 | 新矩阵只保留 `jump_then_toy` | 按用户要求将总样本从 16 降到 12，控制 H100 推理成本 |
 | continuation 作为新独立入口实现 | 规格要求保留旧 64-latent uniform-prompt 实验语义，禁止静默改写 |
 | 先用 characterization 锁住普通 inference 再抽内核 | session 重构涉及 KV/cache/scheduler/anchor，必须用测试约束旧路径兼容性 |
+| Stage‑2双动作每个样本/seed一次生成连续48个noise slots，A/B各取前/后24个 | 用户确认A/B使用独立随机起点，同时同一`(sample, seed)`必须确定性复现；禁止B前重置相同seed复用A noise |
 
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |

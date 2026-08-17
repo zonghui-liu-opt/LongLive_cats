@@ -71,7 +71,7 @@ def test_release_stage2_config_resolves_locked_baseline_contract():
     assert resolved.temporal_compression_ratio == 4
     assert resolved.saved_tensor_cpu_offload_scope == "generator_grad_exit_only"
     assert resolved.architecture_root.endswith("Wan2.2-TI2V-5B")
-    assert resolved.generator_stage1_step == 3750
+    assert resolved.generator_stage1_step == 3075
     assert resolved.init_generator_checkpoint is not None
     assert resolved.init_generator_manifest is not None
     assert resolved.init_real_score_checkpoint is not None
@@ -449,7 +449,7 @@ def test_release_data_paths_support_h100_environment_overrides(monkeypatch):
     )
     assert (
         baseline.contract_hash()
-        == "dae3f4075f073351f27126d86a61be38d3c370fd5399a381788a0f51d959a5ea"
+        == "a7365f2ec45f74c3918ec05725b5d19b488fa4447a409cc6b5db4ccb114dd6c6"
     )
 
     monkeypatch.setenv("LONG_LIVE_STAGE2_METADATA_PATH", "/mnt/stage2/metadata_600.csv")
@@ -469,6 +469,28 @@ def test_release_data_paths_support_h100_environment_overrides(monkeypatch):
     )
     assert overridden.contract_hash() == baseline.contract_hash()
     assert overridden.launch_hash() != baseline.launch_hash()
+
+
+def test_matched_phase_b_arms_share_only_the_a24_parent_contract():
+    b1_config = OmegaConf.load(CONFIG_PATH)
+    b0_config = OmegaConf.create(OmegaConf.to_container(b1_config, resolve=False))
+    b0_config.training.phase_b_mode = "dmd_only"
+    b0_config.training.phase_b_dfd_probability_max = 0.0
+
+    b1 = resolve_stage2_config(b1_config)
+    b0 = resolve_stage2_config(b0_config)
+
+    assert b0.contract_hash() == b1.contract_hash()
+    assert b0.launch_hash() != b1.launch_hash()
+
+    different_budget = OmegaConf.create(
+        OmegaConf.to_container(b1_config, resolve=False)
+    )
+    different_budget.training.phase_b_epochs = 0
+    different_budget.training.phase_b_mode = "disabled"
+    different_budget.training.phase_b_dfd_probability_max = 0.0
+    a_only = resolve_stage2_config(different_budget)
+    assert a_only.contract_hash() != b1.contract_hash()
 
 
 def test_derived_values_and_unipc_timetable_are_not_yaml_sources_of_truth():
