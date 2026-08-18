@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 27 已完成本地实现与回归：跨节点Generator内容认证保留实时TOCTOU守卫，早期checkpoint具备可观测、可诊断的8×H100一键推理shell；待内网真实H100执行确认。
+Phase 28 已完成实现、全仓回归与发布准备：ffprobe在模型加载前完成健康解析，坏PATH首候选可安全回退，显式override保持fail-closed，既有视频技术门禁不放宽。
 
 ## 各阶段
 
@@ -236,6 +236,14 @@ Phase 27 已完成本地实现与回归：跨节点Generator内容认证保留�
 - [x] 27.5 运行聚焦/静态验证，审阅精确diff并交付内网单命令
 - **Status:** complete（Stage-2 inference 100 passed；Black/Ruff/py_compile/bash语法通过；真实H100待内网执行）
 
+### Phase 28：ffprobe失效路径启动前闭环
+- [x] 28.1 复现PATH首候选存在但执行返回127时的当前失败，锁定选择与错误传播缺口
+- [x] 28.2 实现显式override、PATH全部候选与常见系统路径的健康检查式解析，保留严格ffprobe技术验收
+- [x] 28.3 将解析器接入`infer_stage2_tmp.sh`启动前预检，打印实际选择并在加载模型前失败
+- [x] 28.4 增加坏首候选回退、全部无效诊断、显式override与shell契约回归
+- [x] 28.5 运行Stage-1/Stage-2相关回归与静态检查，精确发布`stage-2`并交付内网续跑命令
+- **Status:** complete（相关208 passed；全仓1006 passed、2 subtests；Ruff/py_compile/bash/diff-check通过；待内网续跑）
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -257,6 +265,9 @@ Phase 27 已完成本地实现与回归：跨节点Generator内容认证保留�
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |
 |------|---------|---------|
+| Phase 28红测在收集期因`resolve_ffprobe`尚不存在而ImportError | 1 | 这是预期红基线；实现解析器后坏首候选/显式override/shell三项转绿 |
+| Phase 28首次Ruff命令误把Bash脚本作为Python输入，产生大量无效syntax诊断；同一组合命令因末项成功返回0 | 1 | 改为Ruff只检查Python、`bash -n`独立检查shell，并单独执行Black格式化后复验 |
+| Phase 28对两个既有非Black-clean文件运行全文件Black，产生与修复无关的机械格式化diff | 1 | 用`apply_patch`逐项恢复HEAD原格式，只保留新解析器/测试；重跑208项相关回归和精确diff-check |
 | 修改前目标 pytest 在收集阶段失败：当前 `pytest` 环境缺少 `omegaconf`，且未解析仓库 `scripts` 包 | 1 | 使用文档规定的 `PYTHONPATH="$PWD" python -m pytest`，并把缺失依赖装入 `/tmp` 隔离目录 |
 | 隔离安装 OmegaConf 并按文档方式重跑后，收集继续因缺少 `diffusers` 失败 | 2 | 审计导入链后一次性补入 `diffusers==0.31.0`/easydict；基线最终 7 passed |
 | 更新规划日志时一次补丁上下文误指向 `findings.md` 中不存在的“错误日志”段 | 1 | 读取三份规划文件的实际段落位置后拆分到正确文件 |

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import csv
 import json
 import math
@@ -11,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from typing import Any, Callable
 
 import numpy as np
@@ -36,6 +39,13 @@ REQUIRED_TESTSET_COLUMNS = (
     "height",
     "width",
     "bucket",
+)
+FFPROBE_OVERRIDE_ENV = "LONG_LIVE_FFPROBE"
+_FFPROBE_SYSTEM_CANDIDATES = (
+    "/usr/bin/ffprobe",
+    "/usr/local/bin/ffprobe",
+    "/opt/conda/bin/ffprobe",
+    "/usr/local/ffmpeg/bin/ffprobe",
 )
 
 
@@ -226,12 +236,133 @@ def _run_checked(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
+def _ffprobe_candidates(
+    *,
+    explicit: str | None,
+    search_path: str,
+) -> tuple[list[Path], list[str]]:
+    candidates: list[Path] = []
+    unavailable: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        candidate = Path(os.path.abspath(path.expanduser()))
+        key = os.fspath(candidate)
+        if key in seen:
+            return
+        seen.add(key)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            candidates.append(candidate)
+        else:
+            unavailable.append(f"{candidate} (missing or not executable)")
+
+    if explicit:
+        requested = Path(explicit)
+        if requested.is_absolute() or requested.parent != Path("."):
+            add(requested)
+        else:
+            for directory in search_path.split(os.pathsep):
+                add(Path(directory or os.curdir) / explicit)
+        return candidates, unavailable
+
+    for directory in search_path.split(os.pathsep):
+        add(Path(directory or os.curdir) / "ffprobe")
+    add(Path(sys.executable).resolve().parent / "ffprobe")
+    for value in _FFPROBE_SYSTEM_CANDIDATES:
+        add(Path(value))
+    return candidates, unavailable
+
+
+def _ffprobe_failure_detail(exc: BaseException) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        detail = str(exc.stderr or exc.stdout or exc).strip().replace("\n", " ")
+        return f"exit_code={exc.returncode}, detail={detail[:400]}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _resolve_ffprobe(
+    *,
+    explicit: str | None,
+    search_path: str,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> str:
+    candidates, unavailable = _ffprobe_candidates(
+        explicit=explicit,
+        search_path=search_path,
+    )
+    failures: list[str] = []
+    for candidate in candidates:
+        command = [os.fspath(candidate), "-version"]
+        try:
+            completed = command_runner(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    completed.returncode,
+                    command,
+                    output=completed.stdout,
+                    stderr=completed.stderr,
+                )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            failures.append(f"{candidate} ({_ffprobe_failure_detail(exc)})")
+            continue
+        return os.fspath(candidate)
+
+    attempts = failures + unavailable
+    attempted = "; ".join(attempts) if attempts else "no candidates"
+    source = (
+        f"explicit {FFPROBE_OVERRIDE_ENV}={explicit!r}"
+        if explicit
+        else "PATH and known system locations"
+    )
+    raise RuntimeError(
+        f"No runnable ffprobe found via {source}; tried: {attempted}. "
+        f"Install ffprobe or set {FFPROBE_OVERRIDE_ENV} to an absolute working "
+        "executable."
+    )
+
+
+@lru_cache(maxsize=8)
+def _resolve_ffprobe_cached(explicit: str | None, search_path: str) -> str:
+    return _resolve_ffprobe(
+        explicit=explicit,
+        search_path=search_path,
+        command_runner=subprocess.run,
+    )
+
+
+def resolve_ffprobe(
+    *,
+    environment: Mapping[str, str] | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> str:
+    """Return a runnable ffprobe, skipping broken PATH entries.
+
+    An explicit ``LONG_LIVE_FFPROBE`` is fail-closed: if it cannot execute,
+    unrelated PATH candidates are not silently substituted.  Normal discovery
+    health-checks every PATH candidate before trying common system locations.
+    """
+
+    selected_environment = os.environ if environment is None else environment
+    explicit = selected_environment.get(FFPROBE_OVERRIDE_ENV) or None
+    search_path = selected_environment.get("PATH", "")
+    if command_runner is None:
+        return _resolve_ffprobe_cached(explicit, search_path)
+    return _resolve_ffprobe(
+        explicit=explicit,
+        search_path=search_path,
+        command_runner=command_runner,
+    )
+
+
 def probe_video(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Return stable video-stream metadata through ffprobe."""
 
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe is None:
-        raise RuntimeError("ffprobe is required for Stage-1 causal video validation.")
+    ffprobe = resolve_ffprobe()
     command = [
         ffprobe,
         "-v",
@@ -245,7 +376,13 @@ def probe_video(path: str | os.PathLike[str]) -> dict[str, Any]:
         "json",
         os.fspath(path),
     ]
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            f"ffprobe failed for {path} with executable={ffprobe}: "
+            f"{_ffprobe_failure_detail(exc)}"
+        ) from exc
     streams = json.loads(completed.stdout).get("streams", [])
     if len(streams) != 1:
         raise RuntimeError(f"Expected exactly one video stream in {path}, got {len(streams)}")

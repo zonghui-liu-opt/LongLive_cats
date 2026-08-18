@@ -1,5 +1,16 @@
 # 发现与决策
 
+## 2026-08-18 Phase 28：ffprobe exit 127
+
+- 新错误已越过checkpoint/runtime asset认证、Generator EMA加载和至少一个样本生成；失败发生在临时MP4落盘后的技术验收，不是NCCL、权重、显存或生成模型错误。
+- `probe_video()`当前只调用一次`shutil.which("ffprobe")`，内网PATH首候选为`/home/ma-user/miniconda3/bin/ffprobe`；该命令实际返回127，但代码没有启动健康检查、候选回退或stderr增强诊断。
+- 修复不能跳过ffprobe或在失败时直接接受MP4。应在真实生成前执行`ffprobe -version`，支持显式环境override，并按PATH全部可执行候选及常见系统位置逐个实测；只有健康候选才能用于既有width/height/frame_count/fps门禁。
+- 推理输出使用原子临时文件，当前失败不会把未验收的rank0 MP4冒充完整产物；其他rank已完成的完整video+trace对可由现有resumability在重跑时安全复用。
+- 新解析器对普通发现依次实测PATH全部候选、当前Python环境及常见系统路径；坏候选返回127会记录stderr并继续。显式`LONG_LIVE_FFPROBE`采用fail-closed语义，避免操作者指定错误路径后被静默替换。
+- 一键shell在任何5B模型加载前调用同一解析器并打印`STAGE2_FFPROBE=PASS (<path>)`；没有健康候选时直接给出全部尝试和override提示，避免再次生成完视频才发现系统工具失效。
+- 真实共享回归证明修复没有改变视频验收：Stage-1 causal/continuation/merged comparison和Stage-2 inference联合208 passed；全仓1006 passed、2 subtests。完整技术门禁仍检查width/height/frame_count/fps并哈希正式MP4。
+- 不应删除当前`inference_early_g000080`。原子上下文会删除失败的隐藏临时MP4，已完成的正式video+trace对在重跑时会逐项复核并跳过，剩余样本继续生成。
+
 ## 2026-08-18 Phase 27：跨节点早期checkpoint推理
 
 - G70错误发生在rank0的`build_stage2_runtime_assets()`，其余rank只通过collective转发；尚未加载Generator EMA，也不是NCCL或8卡分片错误。

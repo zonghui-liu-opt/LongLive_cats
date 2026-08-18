@@ -1,5 +1,7 @@
 import csv
+import os
 from pathlib import Path
+import subprocess
 
 from omegaconf import OmegaConf
 from PIL import Image
@@ -13,6 +15,7 @@ from utils.stage1_io import atomic_write_json, canonical_json_sha256
 from utils.stage1_causal_validation import (
     load_causal_testset_records,
     prepare_causal_testsets,
+    resolve_ffprobe,
     validate_causal_testset_outputs,
     validate_converted_causal_base,
 )
@@ -74,6 +77,99 @@ def _fake_carrier_probe(path):
         "frame_count": int(values["frames"]),
         "fps": float(values["fps"]),
     }
+
+
+def _fake_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_ffprobe_resolver_skips_broken_first_path_candidate(tmp_path: Path) -> None:
+    broken = _fake_executable(tmp_path / "broken" / "ffprobe")
+    working = _fake_executable(tmp_path / "working" / "ffprobe")
+    calls: list[Path] = []
+
+    def run(command, **_kwargs):
+        candidate = Path(command[0])
+        calls.append(candidate)
+        if candidate == broken:
+            raise subprocess.CalledProcessError(
+                127,
+                command,
+                stderr="missing shared library",
+            )
+        return subprocess.CompletedProcess(command, 0, "ffprobe version fixture", "")
+
+    selected = resolve_ffprobe(
+        environment={"PATH": f"{broken.parent}{os.pathsep}{working.parent}"},
+        command_runner=run,
+    )
+
+    assert selected == str(working)
+    assert calls == [broken, working]
+
+
+def test_ffprobe_resolver_explicit_override_fails_closed(tmp_path: Path) -> None:
+    broken = _fake_executable(tmp_path / "broken" / "ffprobe")
+    working = _fake_executable(tmp_path / "working" / "ffprobe")
+    calls: list[Path] = []
+
+    def run(command, **_kwargs):
+        calls.append(Path(command[0]))
+        raise subprocess.CalledProcessError(127, command, stderr="not runnable")
+
+    with pytest.raises(
+        RuntimeError,
+        match="LONG_LIVE_FFPROBE.*exit_code=127",
+    ):
+        resolve_ffprobe(
+            environment={
+                "PATH": str(working.parent),
+                "LONG_LIVE_FFPROBE": str(broken),
+            },
+            command_runner=run,
+        )
+
+    assert calls == [broken]
+
+
+def test_ffprobe_resolver_honors_working_explicit_override(tmp_path: Path) -> None:
+    broken = _fake_executable(tmp_path / "broken" / "ffprobe")
+    working = _fake_executable(tmp_path / "working" / "ffprobe")
+    calls: list[Path] = []
+
+    def run(command, **_kwargs):
+        calls.append(Path(command[0]))
+        return subprocess.CompletedProcess(command, 0, "ffprobe version fixture", "")
+
+    selected = resolve_ffprobe(
+        environment={
+            "PATH": str(broken.parent),
+            "LONG_LIVE_FFPROBE": str(working),
+        },
+        command_runner=run,
+    )
+
+    assert selected == str(working)
+    assert calls == [working]
+
+
+def test_ffprobe_resolver_reports_all_failed_discovery(tmp_path: Path) -> None:
+    broken = _fake_executable(tmp_path / "broken" / "ffprobe")
+
+    def run(command, **_kwargs):
+        raise subprocess.CalledProcessError(127, command, stderr="not runnable")
+
+    with pytest.raises(
+        RuntimeError,
+        match="PATH and known system locations.*exit_code=127.*LONG_LIVE_FFPROBE",
+    ):
+        resolve_ffprobe(
+            environment={"PATH": str(broken.parent)},
+            command_runner=run,
+        )
 
 
 def test_testsets_are_strictly_parsed_and_split_by_geometry(tmp_path):

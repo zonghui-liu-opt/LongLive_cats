@@ -67,6 +67,8 @@ def test_early_checkpoint_shell_is_observable_and_cross_node_safe() -> None:
 
     assert text.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail\n")
     assert "STAGE2_INFERENCE_ASSET_API=PASS" in text
+    assert "STAGE2_FFPROBE=PASS" in text
+    assert "LONG_LIVE_FFPROBE" in text
     assert "longlive_stage2_inference_assets/v2" in text
     assert '--nproc-per-node="$STAGE2_INFERENCE_NPROC"' in text
     assert "CUDA_VISIBLE_DEVICES" in text

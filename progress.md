@@ -1,5 +1,20 @@
 # 进度日志
 
+## 会话：2026-08-18（Phase 28）
+
+### ffprobe失效路径启动前闭环
+- **状态：** in_progress
+- 内网8×H100已完成资产认证与模型生成，rank0在验证首个临时MP4时调用`/home/ma-user/miniconda3/bin/ffprobe`返回127。
+- 已定位共享`probe_video()`只使用`shutil.which()`的单一首候选；下一步先补坏首候选/好后备候选红测，再实现健康检查解析器并接入一键shell预检。
+- 保护边界：不跳过视频帧数/尺寸/fps校验，不删除部分完整结果，不触碰用户现有训练、metadata、checkpoint和results改动。
+- 预期红测因生产模块尚无`resolve_ffprobe`而在收集期ImportError；实现后坏PATH首候选回退、显式坏override拒绝、shell预检三项转绿。
+- 新增working override和全部发现失败诊断测试，当前五项聚焦回归全部通过；本机真实解析选择`/opt/homebrew/bin/ffprobe`并完成`-version`健康检查。
+- `stage1_causal_validation`与完整Stage-2 inference联合116 passed；原子输出上下文确认异常时会删除未验收临时MP4，已完成的正式video+trace仍可续跑复用。
+- 首次静态命令误把shell交给Ruff，产生无效Python语法报告；已改成Python/Ruff与shell/`bash -n`分开执行。Black格式化后Ruff、Black、py_compile、bash语法均通过。
+- 全仓正式回归完成：1006 passed、2 subtests passed、14条既有TorchScript弃用warning；无功能失败。
+- 发现两个共享Stage-1文件在HEAD并非全文件Black-clean，首次机械格式化引入无关diff；已逐项恢复原格式，只保留ffprobe生产/测试增量。恢复后相关208 passed，Ruff、py_compile、`bash -n`和精确diff-check通过。
+- 发布范围锁定为解析器、早期推理shell、4类解析回归、shell契约、中文文档及Phase 28记录；继续排除用户`run_stage2_h100.sh`、H100 guide测试、metadata、checkpoint、results和Stage-1脚本。
+
 ## 会话：2026-08-18（Phase 27）
 
 ### 跨节点8×H100早期checkpoint一键推理

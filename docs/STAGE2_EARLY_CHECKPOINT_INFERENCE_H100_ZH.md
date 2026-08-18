@@ -55,6 +55,19 @@ bash infer_stage2_tmp.sh 60 70
 脚本会立即打印预检结果，模型认证期间每30秒输出心跳；失败会显示日志路径，成功后验收
 56个视频、56个trace、`manifest.json`和`index.html`。它只读快照权重，不会停止训练。
 
+启动输出必须包含类似：
+
+```text
+STAGE2_FFPROBE=PASS (/usr/bin/ffprobe)
+```
+
+脚本会跳过PATH中存在但无法运行的ffprobe并尝试后续系统候选。如需指定特殊安装位置：
+
+```bash
+export LONG_LIVE_FFPROBE=/实际可运行的路径/ffprobe
+bash infer_stage2_tmp.sh 70
+```
+
 最新版还修复了跨节点挂载时 `device/inode/mtime` 不同导致的
 `Generator provenance differs from its live manifest` 误报；权重SHA256、大小、manifest和血缘仍严格校验。
 

@@ -60,6 +60,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+# 可选：显式指定健康的ffprobe；留空时会实测PATH和系统常见路径。
+export LONG_LIVE_FFPROBE="${LONG_LIVE_FFPROBE:-}"
 
 readonly INFERENCE_CONFIG="configs/infer_i2v_stage2_baseline.yaml"
 readonly EXPECTED_ASSET_API="longlive_stage2_inference_assets/v2"
@@ -108,6 +110,7 @@ import sys
 project_root, expected = sys.argv[1:]
 sys.path.insert(0, project_root)
 from utils.stage2_inference_assets import STAGE2_INFERENCE_ASSET_API_VERSION
+from utils.stage1_causal_validation import resolve_ffprobe
 
 if STAGE2_INFERENCE_ASSET_API_VERSION != expected:
     raise SystemExit(
@@ -115,6 +118,7 @@ if STAGE2_INFERENCE_ASSET_API_VERSION != expected:
         f"expected={expected}, actual={STAGE2_INFERENCE_ASSET_API_VERSION}"
     )
 print(f"STAGE2_INFERENCE_ASSET_API=PASS ({expected})", flush=True)
+print(f"STAGE2_FFPROBE=PASS ({resolve_ffprobe()})", flush=True)
 PY
 }
 
