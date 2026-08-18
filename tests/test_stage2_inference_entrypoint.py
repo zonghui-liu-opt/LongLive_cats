@@ -60,6 +60,27 @@ def test_release_shell_is_strict_fixed_baseline_torchrun() -> None:
     assert "LONG_LIVE_STAGE2_INFERENCE_OUTPUT" in text
 
 
+def test_early_checkpoint_shell_is_observable_and_cross_node_safe() -> None:
+    shell = PROJECT_ROOT / "infer_stage2_tmp.sh"
+    text = shell.read_text(encoding="utf-8")
+    subprocess.run(["bash", "-n", str(shell)], check=True)
+
+    assert text.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail\n")
+    assert "STAGE2_INFERENCE_ASSET_API=PASS" in text
+    assert "longlive_stage2_inference_assets/v2" in text
+    assert '--nproc-per-node="$STAGE2_INFERENCE_NPROC"' in text
+    assert "CUDA_VISIBLE_DEVICES" in text
+    assert "仍在运行" in text
+    assert "_SUCCESS" in text
+    assert "checkpoint_manifest.json" in text
+    assert "provenance.json" in text
+    assert "manifest.json" in text
+    assert "index.html" in text
+    assert "EXPECTED_ARTIFACTS=56" in text
+    assert "rm -rf" not in text
+    assert "checkpoint_stage2_g000280" not in text
+
+
 def test_stage2_entrypoint_never_imports_legacy_inference_pipeline() -> None:
     sources = "\n".join(
         path.read_text(encoding="utf-8")

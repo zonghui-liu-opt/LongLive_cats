@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 26 已完成：C1分布式LoRA恢复已脱离无关的PEFT/HF tensor-parallel可选导入，累计无Git热补丁、启动握手、完整回归与远端发布均已闭环。
+Phase 27 已完成本地实现与回归：跨节点Generator内容认证保留实时TOCTOU守卫，早期checkpoint具备可观测、可诊断的8×H100一键推理shell；待内网真实H100执行确认。
 
 ## 各阶段
 
@@ -227,6 +227,14 @@ Phase 26 已完成：C1分布式LoRA恢复已脱离无关的PEFT/HF tensor-paral
 - [x] 26.4 增加缺失tensor-parallel模块、schema/value、C1 role resume与hotfix幂等回归
 - [x] 26.5 运行聚焦、完整Stage-2、全仓与静态验收，精确提交并push `stage-2`
 - **Status:** complete（Stage-2 694 passed；全仓998 passed、2 subtests；生产提交`c4202ca`已推送并由ls-remote核验）
+
+### Phase 27：跨节点8×H100早期checkpoint一键推理
+- [x] 27.1 对齐`run_stage2_h100.sh infer`、严格inference asset/loader与当前`infer_stage2_tmp.sh`，建立失败复现
+- [x] 27.2 将持久Generator provenance比较收敛到内容稳定字段，同时保留推理节点rank0新鲜identity与加载前后TOCTOU门禁
+- [x] 27.3 写成可直接执行的8卡早期checkpoint shell：显式预检、启动/心跳/日志、checkpoint选择与输出保护
+- [x] 27.4 增加跨节点identity变化、真实内容变化拒绝、shell静态编排与既有严格推理回归
+- [x] 27.5 运行聚焦/静态验证，审阅精确diff并交付内网单命令
+- **Status:** complete（Stage-2 inference 100 passed；Black/Ruff/py_compile/bash语法通过；真实H100待内网执行）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？

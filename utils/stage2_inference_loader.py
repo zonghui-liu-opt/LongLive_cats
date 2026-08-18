@@ -18,6 +18,7 @@ from typing import Any
 import torch
 
 from utils.stage1_io import canonical_json_sha256, sha256_file
+from utils.stage2_inference_assets import stage2_generator_asset_content_sha256
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RESOLVED_CONFIG_KEYS = {"config", "derived"}
@@ -502,12 +503,12 @@ def load_stage2_ema_generator_for_inference(
         raise TypeError("Stage-2 Generator manifest validator returned invalid data")
     if verified_asset.get("source_step") != 3075:
         raise RuntimeError("Stage-2 Generator base lineage is not Stage-1 step3075")
-    if canonical_json_sha256(dict(verified_asset)) != canonical_json_sha256(
-        recorded_asset
-    ):
+    if stage2_generator_asset_content_sha256(
+        verified_asset
+    ) != stage2_generator_asset_content_sha256(recorded_asset):
         raise RuntimeError(
-            "Stage-2 checkpoint Generator provenance differs from live Stage-1 "
-            "step3075 manifest validation"
+            "Stage-2 checkpoint Generator provenance differs in content from "
+            "live Stage-1 step3075 manifest validation"
         )
 
     if architecture_root is None:

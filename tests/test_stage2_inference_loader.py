@@ -79,11 +79,26 @@ def _checkpoint_fixture(tmp_path: Path) -> tuple[Path, Any, dict[str, Any]]:
     return checkpoint, resolved, saved
 
 
-def _generator_asset() -> dict[str, Any]:
+def _generator_asset(*, identity_device: int = 1) -> dict[str, Any]:
     return {
         "manifest_path": "/fixture/stage1_step3075.manifest.json",
         "checkpoint_path": "/fixture/stage1_step3075_ema_merged.pt",
         "checkpoint_sha256": _SHA_A,
+        "checkpoint_files": [
+            {
+                "name": "stage1_step3075_ema_merged.pt",
+                "path": "/fixture/stage1_step3075_ema_merged.pt",
+                "size": 4,
+                "sha256": _SHA_A,
+                "identity": {
+                    "device": identity_device,
+                    "inode": 2,
+                    "size": 4,
+                    "mtime_ns": 3,
+                    "ctime_ns": 4,
+                },
+            }
+        ],
         "source_step": 3075,
     }
 
@@ -140,13 +155,14 @@ def _ops(
     lora_error: Exception | None = None,
     recorded_architecture_file: dict[str, Any] | None = None,
     include_architecture_file: bool = True,
+    recorded_generator_asset: dict[str, Any] | None = None,
 ) -> Stage2InferenceLoaderOps:
     asset = _generator_asset()
     if recorded_architecture_file is None:
         recorded_architecture_file = _architecture_file(
             checkpoint.parent / "architecture" / "config.json"
         )
-    recorded_asset = deepcopy(asset)
+    recorded_asset = deepcopy(recorded_generator_asset or asset)
     if include_architecture_file:
         recorded_asset["architecture_file"] = deepcopy(recorded_architecture_file)
 
@@ -313,6 +329,41 @@ def test_rank0_trusted_generator_attestation_skips_duplicate_base_hash_scan(
 
     assert "manifest" not in calls
     assert calls["base"]["verify_content_hash"] is False
+    assert loaded.generator_asset == trusted_asset
+
+
+def test_trusted_generator_attestation_accepts_cross_node_file_identity(
+    tmp_path: Path,
+) -> None:
+    checkpoint, resolved, saved = _checkpoint_fixture(tmp_path)
+    architecture_file = _architecture_file(tmp_path / "architecture" / "config.json")
+    recorded_asset = {
+        **_generator_asset(identity_device=1),
+        "architecture_file": architecture_file,
+    }
+    trusted_asset = {
+        **_generator_asset(identity_device=2),
+        "architecture_file": architecture_file,
+    }
+    calls: dict[str, Any] = {}
+
+    loaded = load_stage2_ema_generator_for_inference(
+        checkpoint,
+        architecture_root=tmp_path / "architecture",
+        device="cpu",
+        trusted_generator_asset=trusted_asset,
+        expected_recorded_generator_asset_sha256=canonical_json_sha256(recorded_asset),
+        ops=_ops(
+            checkpoint=checkpoint,
+            resolved=resolved,
+            saved=saved,
+            calls=calls,
+            recorded_architecture_file=architecture_file,
+            recorded_generator_asset=recorded_asset,
+        ),
+    )
+
+    assert calls["base"]["asset"] == trusted_asset
     assert loaded.generator_asset == trusted_asset
 
 

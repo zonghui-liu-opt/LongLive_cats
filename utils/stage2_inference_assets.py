@@ -30,6 +30,7 @@ STAGE2_RUNTIME_ASSETS_SCHEMA = "longlive_stage2_inference_runtime_assets/v1"
 STAGE2_RUNTIME_ASSET_IDENTITY_SCHEMA = (
     "longlive_stage2_inference_runtime_asset_identity/v1"
 )
+STAGE2_INFERENCE_ASSET_API_VERSION = "longlive_stage2_inference_assets/v2"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTITY_KEYS = {"device", "inode", "size", "mtime_ns", "ctime_ns"}
@@ -41,6 +42,36 @@ _RUNTIME_FILE_ASSET_NAMES = (
     "architecture_config",
     "generator_base",
 )
+
+
+def stage2_generator_asset_content_sha256(value: Mapping[str, Any]) -> str:
+    """Hash persistent Generator provenance without host-local stat identity.
+
+    ``device``/``inode`` and timestamps authenticate a file only for the live
+    process that observed them.  They necessarily change when the same bytes
+    are mounted or copied onto another inference node.  Content fields remain
+    covered here, while the live identity stays in the runtime attestation and
+    is checked immediately around the real model load.
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError("Stage-2 Generator asset must be an object")
+    normalized = dict(value)
+    checkpoint_files = normalized.get("checkpoint_files")
+    if checkpoint_files is not None:
+        if not isinstance(checkpoint_files, list):
+            raise TypeError("Stage-2 Generator checkpoint_files must be a list")
+        normalized_files: list[dict[str, Any]] = []
+        for index, entry in enumerate(checkpoint_files):
+            if not isinstance(entry, Mapping):
+                raise TypeError(
+                    f"Stage-2 Generator checkpoint_files[{index}] must be an object"
+                )
+            normalized_entry = dict(entry)
+            normalized_entry.pop("identity", None)
+            normalized_files.append(normalized_entry)
+        normalized["checkpoint_files"] = normalized_files
+    return canonical_json_sha256(normalized)
 
 
 def _sha256(value: Any, label: str) -> str:
@@ -509,11 +540,12 @@ def build_stage2_runtime_assets(
             expected_step=3075,
         )
     )
-    if canonical_json_sha256(verified_generator) != canonical_json_sha256(
-        recorded_generator_asset
-    ):
+    if stage2_generator_asset_content_sha256(
+        verified_generator
+    ) != stage2_generator_asset_content_sha256(recorded_generator_asset):
         raise RuntimeError(
-            "Stage-2 checkpoint Generator provenance differs from its live manifest"
+            "Stage-2 checkpoint Generator provenance differs in content from "
+            "its live manifest"
         )
     architecture = _authenticate_model_tree(
         Path(config.architecture_root) / "config.json",
@@ -846,10 +878,12 @@ def assert_stage2_runtime_asset_identities(
 
 
 __all__ = [
+    "STAGE2_INFERENCE_ASSET_API_VERSION",
     "STAGE2_RUNTIME_ASSETS_SCHEMA",
     "STAGE2_RUNTIME_ASSET_IDENTITY_SCHEMA",
     "assert_stage2_runtime_asset_identities",
     "build_stage2_runtime_assets",
+    "stage2_generator_asset_content_sha256",
     "validate_stage2_runtime_asset_identity",
     "validate_stage2_runtime_assets",
 ]

@@ -1,5 +1,18 @@
 # 进度日志
 
+## 会话：2026-08-18（Phase 27）
+
+### 跨节点8×H100早期checkpoint一键推理
+- **状态：** complete（本地实现与回归完成；真实8×H100执行待内网确认）
+- 用户在第二台8×H100运行G70推理；rank0报告`Stage-2 checkpoint Generator provenance differs from its live manifest`，其余rank同步失败。
+- 已确认现有`infer_stage2_tmp.sh`复用严格runner，但缺显式预检错误和bootstrap进度；`run_stage2_h100.sh infer`则硬锁G280，不能直接服务Phase A早期checkpoint。
+- 生产代码比较了含训练节点文件identity的完整Generator资产对象；下一步先用跨节点identity红测锁住问题，再实现内容稳定比较和当前节点identity运行期守卫，随后收敛为一个可直接执行的8卡shell。
+- 已确认该完整对象比较在rank0 asset attestation与每rank Generator loader各有一次；测试范围因此锁定`test_stage2_inference_assets.py`和`test_stage2_inference_loader.py`，并继续用`test_stage2_inference_entrypoint.py`锁住新shell编排。
+- 红测精确复现：仅改变recorded Generator的`device/inode/mtime_ns/ctime_ns`时rank0和loader都会失败，改变真实`checkpoint_sha256`也会失败。
+- 新增内容稳定比较helper并同时替换两处全对象比较；recorded完整资产SHA仍用于rank间一致性，live identity仍传给真实base loader并由既有加载前后identity门禁复核。
+- 重写`infer_stage2_tmp.sh`：默认G70、支持多步数顺序执行、8卡数量/唯一性检查、完整资产预检、跨节点API探针、启动摘要、30秒心跳、追加日志、可恢复输出和56件套最终验收。
+- 聚焦3项红测转绿；三个直接相关模块29 passed；完整Stage-2 inference八模块100 passed。Ruff、Black、py_compile、`bash -n`全部通过；本机故意缺少内网Python路径时脚本可立即给出明确失败信息，不再静默退出。
+
 ## 会话：2026-08-18（Phase 26）
 
 ### C1分布式LoRA恢复依赖兼容修复

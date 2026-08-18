@@ -36,50 +36,27 @@ done
 ## 2. 在空闲 H100 节点推理
 
 该节点必须能访问与训练一致的代码、checkpoint、Stage-1 Generator base、T5、tokenizer、VAE、source manifest 和测试图片。
+先同步远程 `stage-2` 最新代码，再直接运行仓库内的一键脚本：
 
 ```bash
-set -Eeuo pipefail
+cd /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
+git pull --ff-only longlive-cats stage-2
 
-export STAGE2_PROJECT_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
-export STAGE2_PYTHON=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python
-export STAGE2_TORCHRUN="$(dirname "$STAGE2_PYTHON")/torchrun"
-export STAGE2_WORK_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new
-export STAGE2_TRAIN_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training
-export SNAPSHOT_ROOT="$STAGE2_TRAIN_ROOT/early_checkpoint_snapshots"
+# 默认使用8卡推理G70。
+bash infer_stage2_tmp.sh
 
-export ARCH_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B
-export LONG_LIVE_STAGE2_SOURCE_MANIFEST="$STAGE2_WORK_ROOT/stage2_600cats_f25_v1/cache_manifest.attested.json"
-export LONG_LIVE_STAGE2_ARCHITECTURE_ROOT="$ARCH_ROOT"
-export LONG_LIVE_STAGE2_T5_CHECKPOINT="$ARCH_ROOT/models_t5_umt5-xxl-enc-bf16.pth"
-export LONG_LIVE_STAGE2_TOKENIZER_DIR="$ARCH_ROOT/google/umt5-xxl"
-export LONG_LIVE_STAGE2_VAE_CHECKPOINT="$ARCH_ROOT/Wan2.2_VAE.pth"
+# 只跑G60。
+bash infer_stage2_tmp.sh 60
 
-# 另一台节点有 8 张空闲 H100 时直接全部使用。
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export INFER_NPROC=8
-
-cd "$STAGE2_PROJECT_ROOT"
-
-infer_one() {
-    local step="$1"
-    export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$SNAPSHOT_ROOT/checkpoint_stage2_g${step}"
-    export LONG_LIVE_STAGE2_INFERENCE_OUTPUT="$STAGE2_TRAIN_ROOT/inference_early_g${step}"
-
-    test -f "$LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT/_SUCCESS"
-    test ! -e "$LONG_LIVE_STAGE2_INFERENCE_OUTPUT"
-
-    "$STAGE2_TORCHRUN" \
-      --standalone --nnodes=1 --nproc-per-node="$INFER_NPROC" --max-restarts=0 \
-      --no-python "$STAGE2_PYTHON" -I -B \
-      scripts/run_stage2_inference.py \
-      --config configs/infer_i2v_stage2_baseline.yaml \
-      2>&1 | tee "$STAGE2_TRAIN_ROOT/inference_early_g${step}.log"
-}
-
-# 只看最新效果时仅执行 infer_one 000070。
-infer_one 000060
-infer_one 000070
+# 顺序比较G60、G70。
+bash infer_stage2_tmp.sh 60 70
 ```
+
+脚本会立即打印预检结果，模型认证期间每30秒输出心跳；失败会显示日志路径，成功后验收
+56个视频、56个trace、`manifest.json`和`index.html`。它只读快照权重，不会停止训练。
+
+最新版还修复了跨节点挂载时 `device/inode/mtime` 不同导致的
+`Generator provenance differs from its live manifest` 误报；权重SHA256、大小、manifest和血缘仍严格校验。
 
 ### 2.1 使用另一台 8×H100 加速
 
@@ -92,10 +69,10 @@ infer_one 000070
 视频总数仍为 56。每张卡都会加载完整 Generator，这不是把一个模型拆到 8 张卡上的模型并行。
 实际加速比还会受到模型加载、VAE 解码和共享存储读取速度影响。
 
-如果只想尽快查看最新效果，注释掉 `infer_one 000060`，仅用全部 8 卡执行：
+如果只想尽快查看最新效果，仅用全部8卡执行：
 
 ```bash
-infer_one 000070
+bash infer_stage2_tmp.sh 70
 ```
 
 如果需要比较 G60/G70，推荐让两个 checkpoint 依次各用全部 8 卡。也可以在两个终端中分别使用

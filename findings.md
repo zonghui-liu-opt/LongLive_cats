@@ -1,5 +1,18 @@
 # 发现与决策
 
+## 2026-08-18 Phase 27：跨节点早期checkpoint推理
+
+- G70错误发生在rank0的`build_stage2_runtime_assets()`，其余rank只通过collective转发；尚未加载Generator EMA，也不是NCCL或8卡分片错误。
+- checkpoint持久provenance中的Generator资产包含训练节点当时的`device/inode/mtime_ns/ctime_ns`；推理节点重新验证manifest后生成当前节点identity，现有代码对整个对象做canonical JSON相等，导致相同SHA内容也可能因跨节点stat identity不同而失败。
+- 安全修复不能删除哈希/manifest门禁或修改checkpoint provenance。持久比较应验证manifest、checkpoint SHA/size/schema/lineage等内容稳定字段；rank0重新哈希后得到的当前identity仍必须进入runtime asset，并由`strict_load_stage2_role_base()`在加载前后复核，继续防止认证后文件被替换。
+- `infer_stage2_tmp.sh`当前两个裸`test`会静默退出，且Python runner在资产认证/模型bootstrap期间无启动进度。新shell需给每个失败条件明确报错，并在长bootstrap阶段输出心跳。
+- 同一完整对象比较在两处重复：rank0 `stage2_inference_assets` 的live-manifest认证，以及每rank `stage2_inference_loader` 对rank0 trusted asset与checkpoint recorded asset的复核；修复必须覆盖两处，否则rank0通过后仍会在各rank loader阶段再次失败。
+- 正确的数据流是：checkpoint中的完整recorded asset及其SHA保持不变；rank0严格重验manifest/底座内容后生成live trusted asset；只在recorded-vs-live比较时忽略`checkpoint_files[*].identity`，后续loader始终携带live identity并在真实模型加载前后调用现有identity守卫。
+- 已用统一`stage2_generator_asset_content_sha256()`修复rank0和每rank两处比较：只排除host-local identity，`checkpoint_sha256/size/path/manifest/schema/source_step`等内容契约仍保持fail-closed；跨节点identity测试转绿，SHA漂移反例继续拒绝。
+- 新`infer_stage2_tmp.sh`默认G70并支持`60`或`60 70`顺序执行；固定快照目录，避免训练保留策略删除formal checkpoint；启动前校验输入、GPU数和跨节点API版本，bootstrap期间每30秒心跳，失败报告日志，成功强制验收56视频/56 trace/manifest/index。
+- 56来自固定baseline矩阵：`(6个单动作 + 8个双动作) × 4个seed = 56`；8卡只做rank-stride数据并行，每卡7个样本，不会把总产物乘成448。
+- 全部Stage-2 inference测试100 passed；Ruff、Black、py_compile和`bash -n`均通过。真实8×H100权重加载与生成需由内网执行。
+
 ## 2026-08-18 Phase 26：C1分布式LoRA恢复依赖错配
 
 - C0 已通过而 C1 在 `initialize_stage2_roles()` 的 generator build/load/local audit 阶段失败；C1 尚未执行下一 F1、rollout、loss、backward、optimizer、EMA或新checkpoint。

@@ -191,6 +191,29 @@ def _fixture(
     return config, {"validator": validate_generator_manifest}, calls
 
 
+def _rewrite_recorded_generator(
+    config: ResolvedStage2InferenceConfig,
+    mutate: Any,
+) -> None:
+    checkpoint = Path(config.stage2_checkpoint)
+    provenance_path = checkpoint / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    mutate(provenance["assets"]["generator"])
+    provenance_bytes = _write_json(provenance_path, provenance)
+
+    manifest_path = checkpoint / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["provenance_sha256"] = canonical_json_sha256(provenance)
+    provenance_entry = next(
+        item for item in manifest["files"] if item["name"] == "provenance.json"
+    )
+    provenance_entry["size"] = len(provenance_bytes)
+    provenance_entry["sha256"] = hashlib.sha256(provenance_bytes).hexdigest()
+    manifest.pop("manifest_sha256")
+    manifest["manifest_sha256"] = canonical_json_sha256(manifest)
+    _write_json(manifest_path, manifest)
+
+
 def test_rank0_runtime_asset_attestation_authenticates_production_shape(
     tmp_path: Path,
 ) -> None:
@@ -214,6 +237,45 @@ def test_rank0_runtime_asset_attestation_authenticates_production_shape(
         "generator_base",
     }
     assert_stage2_runtime_asset_identities(assets, include_source_manifest=True)
+
+
+def test_cross_node_generator_identity_uses_fresh_rank0_attestation(
+    tmp_path: Path,
+) -> None:
+    config, fixture, _ = _fixture(tmp_path)
+
+    def change_training_node_identity(generator: dict[str, Any]) -> None:
+        identity = generator["checkpoint_files"][0]["identity"]
+        for key in ("device", "inode", "mtime_ns", "ctime_ns"):
+            identity[key] += 1
+
+    _rewrite_recorded_generator(config, change_training_node_identity)
+    assets = build_stage2_runtime_assets(
+        config,
+        validate_generator_manifest_fn=fixture["validator"],
+    )
+
+    live_file = Path(assets["generator_asset"]["checkpoint_path"])
+    assert assets["generator_asset"]["checkpoint_files"][0]["identity"] == (
+        _file_identity(live_file)
+    )
+    assert_stage2_runtime_asset_identities(assets, names=("generator_base",))
+
+
+def test_cross_node_generator_relocation_still_rejects_content_drift(
+    tmp_path: Path,
+) -> None:
+    config, fixture, _ = _fixture(tmp_path)
+    _rewrite_recorded_generator(
+        config,
+        lambda generator: generator.__setitem__("checkpoint_sha256", "f" * 64),
+    )
+
+    with pytest.raises(RuntimeError, match="Generator provenance.*differs"):
+        build_stage2_runtime_assets(
+            config,
+            validate_generator_manifest_fn=fixture["validator"],
+        )
 
 
 def test_same_path_equal_size_model_replacement_is_rejected_before_attestation(
