@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 21 已完成：H100的3.71秒合法runtime/audit开销已单列为orchestration，原5% closure门禁保持；无Git热修器可从`ab67824`累计升级，675项回归通过并发布`stage-2`。
+Phase 25 进行中：系统审计并修复Stage-2训练全生命周期的参数命名契约，统一schema、运行时wrapper/FSDP2、EMA、optimizer、checkpoint/resume与inference命名空间；补齐真实嵌套PEFT回归并发布stage-2。
 
 ## 各阶段
 
@@ -187,6 +187,39 @@ Phase 21 已完成：H100的3.71秒合法runtime/audit开销已单列为orchestr
 - [x] 21.5 运行聚焦/完整Stage‑2/静态回归，精确commit并push `stage-2`
 - **Status:** complete（联合106 passed；完整Stage‑2 675 passed；真实`ab67824`升级fixture逐字节PASS；GitHub提交`79747d3`；真实8×H100 smoke待内网复验）
 
+### Phase 22：8×H100 smoke OOM 诊断
+- [x] 完整读取rank3异常栈并提取OOM瞬间的allocated/reserved/free数据
+- [x] 对齐smoke的micro-batch、gradient accumulation、FSDP2与activation配置
+- [x] 定位22.9 GiB的统计口径及其与rollout峰值的差异
+- [x] 区分工作集压力、allocator碎片和外部进程占用，并给出保持global batch 64的方案
+- [x] 汇总证据与内网复验命令；不在诊断请求下修改生产代码
+- **Status:** complete（主因：69.91 GiB live allocated；直接触发：7.11 GiB reserved碎片下318 MiB all-gather连续申请失败；外部进程占用非主因）
+
+### Phase 23：prepare PASS后的重复OOM闭环
+- [x] 完整读取新附件并与Phase 22异常逐行比对
+- [x] 核对wrapper的默认配置回退、环境变量生命周期与prepare/smoke绑定方式
+- [x] 给出运行前resolved micro/acc自证及全新smoke目录命令
+- [x] 明确micro1仍失败时的二级offload边界与所需证据
+- **Status:** complete（先要求`STAGE2_BATCH_PROFILE micro=1 acc=8 world=8 effective_global=64`；再重新prepare并用全新目录smoke）
+
+### Phase 24：EMA parameter names mismatch诊断
+- [x] 定位唯一报错字符串与EMA/FSDP2相关源码入口
+- [x] 复核EMA构造、首次update、state_dict校验和resume加载的名字集合
+- [x] 用最小模型验证PEFT+FSDP2参数名前缀在生命周期中的变化
+- [x] 区分当前HEAD代码缺陷与内网源码/checkpoint混用
+- [x] 输出根因、所需完整trace证据与安全解决方案
+- **Status:** complete（需生产补丁：EMA以immutable LoRA schema做唯一后缀映射；不可放宽/删除名字门禁）
+
+### Phase 25：Stage-2参数命名契约系统修复
+- [x] 25.1 穷举所有参数名生成、清洗、映射、序列化与集合校验入口，建立统一命名矩阵
+- [x] 25.2 先增加真实外层Stage2DiTRole+内层PEFT红测，覆盖精确/唯一后缀/歧义/缺失/重复映射
+- [x] 25.3 实现schema-aware唯一规范名解析，并接入EMA构造、update、swap、state/checkpoint与resume
+- [x] 25.4 复核并修复optimizer、LoRA gather/load、checkpoint、inference的同类命名漂移，保留fail-closed门禁
+- [x] 25.5 扩展无Git内网累计hotfix与启动握手，覆盖旧版到当前版的安全升级
+- [x] 25.6 运行聚焦、完整Stage-2、静态与混合版本回归，精确审阅diff
+- [ ] 25.7 只提交本轮代码/测试/文档，push远端`stage-2`并核验commit
+- **Status:** in_progress
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -247,6 +280,9 @@ Phase 21 已完成：H100的3.71秒合法runtime/audit开销已单列为orchestr
 | Phase 19 runtime API红测首次收集因审计helper不存在而失败 | 1 | 确认启动期握手覆盖缺口后实现版本/签名双重审计，目标测试转为通过 |
 | 一次组合pytest命令写了两个`-k`，后者覆盖前者而只运行3项loss测试 | 1 | 不把该结果冒充trainer覆盖；拆开命令后单独运行runtime API/smoke options 6项并通过 |
 | Phase 19首次Black check要求格式化trainer新增审计代码 | 1 | 先记录再仅对该任务文件机械格式化，随后重跑全部静态门禁 |
+| Phase 25第二轮回归命令引用不存在的`tests/test_stage2_fsdp2.py` | 1 | 用`rg --files`确认实际覆盖在`test_stage2_init_only.py`，改用真实文件集合后129 passed |
+| Phase 25第二次只读组合命令的JavaScript包装遗漏模板字符串右括号 | 1 | shell未执行；修正包装后读取wrapper/runbook测试并继续 |
+| 全工作树`git diff --check`命中用户metadata原有CRLF/尾随空白 | 1 | 不修改用户数据；对本轮精确文件集及两个新文件分别执行whitespace门禁并通过 |
 
 ## 备注
 - 重大决策前重新读取本计划。

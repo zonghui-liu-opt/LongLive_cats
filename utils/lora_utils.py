@@ -45,6 +45,7 @@ import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from utils.parameter_names import map_parameter_names_to_expected
 
 _LORA_PARAMETER_MARKERS = (".lora_A.", ".lora_B.")
 _CANONICAL_LORA_KEY_MARKERS = (".lora_A.weight", ".lora_B.weight")
@@ -682,17 +683,12 @@ def _match_expected_adapter_key(
     candidate: str,
     expected_schema: Mapping[str, LoraTensorSpec],
 ) -> str:
-    matches = [
-        key
-        for key in expected_schema
-        if candidate == key or candidate.endswith(f".{key}")
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            "FSDP LoRA parameter did not map uniquely to the pre-FSDP schema: "
-            f"parameter={candidate!r}, matches={matches}"
-        )
-    return matches[0]
+    return map_parameter_names_to_expected(
+        (candidate,),
+        expected_schema,
+        label="FSDP LoRA canonical key",
+        require_complete=False,
+    )[candidate]
 
 
 def _chunk_size_and_offset(
@@ -1068,14 +1064,11 @@ def get_lora_sharded_state_dict(
             raise ValueError(f"duplicate local LoRA shard key: {canonical_key}")
         spec = expected_schema[canonical_key]
         cleaned_raw_name = _clean_fsdp_parameter_name(raw_name)
-        if not (
-            cleaned_raw_name == spec.raw_parameter_name
-            or cleaned_raw_name.endswith(f".{spec.raw_parameter_name}")
-        ):
-            raise ValueError(
-                "post-FSDP parameter name differs from pre-FSDP schema: "
-                f"current={cleaned_raw_name!r}, expected={spec.raw_parameter_name!r}"
-            )
+        map_parameter_names_to_expected(
+            (cleaned_raw_name,),
+            (spec.raw_parameter_name,),
+            label="post-FSDP LoRA raw name",
+        )
         if parameter.dtype != spec.dtype:
             raise TypeError(
                 f"local LoRA master dtype mismatch for {canonical_key}: "

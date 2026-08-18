@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from utils.lora_utils import LocalLoraShard, LoraTensorSpec
+from utils.parameter_names import map_parameter_names_to_expected
 from utils.stage2_code_version import capture_stage2_source_version
 from utils.stage1_checkpoint import capture_rng_state, restore_rng_state
 from utils.stage1_io import (
@@ -939,6 +940,38 @@ def _is_lora_name(name: str) -> bool:
     return any(marker in name for marker in ("lora_A", "lora_B"))
 
 
+def _schema_raw_parameter_specs(
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+) -> OrderedDict[str, LoraTensorSpec]:
+    raw = OrderedDict(
+        (spec.raw_parameter_name, spec) for _, spec in sorted(schema.items())
+    )
+    if len(raw) != len(schema) or any(
+        not isinstance(name, str) or not name or name != name.strip() for name in raw
+    ):
+        raise ValueError(
+            f"Stage-2 {role} schema has duplicate or invalid raw parameter names"
+        )
+    return raw
+
+
+def _map_parameter_names_to_schema_raw(
+    names: Iterable[str],
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+    label: str,
+) -> OrderedDict[str, str]:
+    raw_specs = _schema_raw_parameter_specs(schema, role=role)
+    return map_parameter_names_to_expected(
+        names,
+        raw_specs,
+        label=f"Stage-2 {role} {label}",
+    )
+
+
 def _validate_stage2_optimizer_param_groups(
     groups: Any,
     *,
@@ -1012,28 +1045,21 @@ def audit_stage2_lora_optimizer(
         raise TypeError(
             f"Stage-2 {role} optimizer accepts only FP32 LoRA A/B: {invalid[:8]}"
         )
+    mapped_names: Mapping[str, str] | None = None
     if expected_schema is not None:
-        mapped: set[str] = set()
+        mapped_names = _map_parameter_names_to_schema_raw(
+            named,
+            expected_schema,
+            role=role,
+            label="optimizer runtime names",
+        )
+        raw_specs = _schema_raw_parameter_specs(expected_schema, role=role)
         for name, parameter in named.items():
-            matches = [
-                key
-                for key, spec in expected_schema.items()
-                if name == spec.raw_parameter_name
-                or name.endswith(f".{spec.raw_parameter_name}")
-            ]
-            if len(matches) != 1:
-                raise ValueError(
-                    f"Stage-2 {role} optimizer parameter {name!r} does not map "
-                    f"uniquely to its role schema: {matches}"
-                )
-            spec = expected_schema[matches[0]]
+            spec = raw_specs[mapped_names[name]]
             if tuple(parameter.shape) != tuple(spec.global_shape):
                 raise ValueError(
                     f"Stage-2 {role} optimizer parameter shape drift: {name}"
                 )
-            mapped.add(matches[0])
-        if mapped != set(expected_schema):
-            raise ValueError(f"Stage-2 {role} optimizer role schema is incomplete")
 
     expected_ids = {id(parameter) for parameter in named.values()}
     group_parameters = [
@@ -1061,7 +1087,9 @@ def audit_stage2_lora_optimizer(
                 expected_completed_updates=expected_completed_updates,
                 require_cpu=False,
             )
-    return tuple(named)
+    return tuple(
+        mapped_names[name] if mapped_names is not None else name for name in named
+    )
 
 
 def _validate_adam_values(
@@ -1166,6 +1194,110 @@ def validate_stage2_full_optimizer_state(
     return state
 
 
+def _rename_stage2_optimizer_state_parameters(
+    state: Mapping[str, Any],
+    mapping: Mapping[str, str],
+    *,
+    role: str,
+) -> Mapping[str, Any]:
+    """Rename both DCP moment keys and param-group FQNs atomically."""
+
+    if not isinstance(state, Mapping) or set(state) != {"state", "param_groups"}:
+        raise ValueError(f"Stage-2 {role} optimizer state has invalid containers")
+    moments = state["state"]
+    groups = state["param_groups"]
+    if (
+        not isinstance(moments, Mapping)
+        or isinstance(groups, (str, bytes))
+        or not isinstance(groups, Sequence)
+    ):
+        raise TypeError(f"Stage-2 {role} optimizer state has invalid containers")
+    source_names = set(mapping)
+    if set(moments) != source_names:
+        raise ValueError(
+            f"Stage-2 {role} optimizer moment names differ from param groups"
+        )
+    if len(set(mapping.values())) != len(mapping):
+        raise ValueError(f"Stage-2 {role} optimizer parameter rename collides")
+    renamed_groups: list[dict[str, Any]] = []
+    grouped_names: list[str] = []
+    for group in groups:
+        if not isinstance(group, Mapping):
+            raise TypeError(f"Stage-2 {role} optimizer param group is invalid")
+        params = group.get("params")
+        if isinstance(params, (str, bytes)) or not isinstance(params, Sequence):
+            raise TypeError(f"Stage-2 {role} optimizer params must be FQNs")
+        if any(name not in mapping for name in params):
+            raise ValueError(
+                f"Stage-2 {role} optimizer param groups contain unknown names"
+            )
+        grouped_names.extend(params)
+        renamed_groups.append(
+            {
+                **dict(group),
+                "params": [mapping[name] for name in params],
+            }
+        )
+    if (
+        len(grouped_names) != len(set(grouped_names))
+        or set(grouped_names) != source_names
+    ):
+        raise ValueError(
+            f"Stage-2 {role} optimizer param groups/moments are inconsistent"
+        )
+    if all(source == target for source, target in mapping.items()):
+        return state
+    return {
+        "state": OrderedDict(
+            (mapping[name], moments[name]) for name in sorted(source_names)
+        ),
+        "param_groups": renamed_groups,
+    }
+
+
+def _canonicalize_stage2_optimizer_state(
+    state: Mapping[str, Any],
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+) -> Mapping[str, Any]:
+    names = _optimizer_names(state)
+    mapping = _map_parameter_names_to_schema_raw(
+        names,
+        schema,
+        role=role,
+        label="optimizer checkpoint names",
+    )
+    return _rename_stage2_optimizer_state_parameters(state, mapping, role=role)
+
+
+def _optimizer_state_for_runtime(
+    state: Mapping[str, Any],
+    module: torch.nn.Module,
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+) -> Mapping[str, Any]:
+    canonical = _canonicalize_stage2_optimizer_state(state, schema, role=role)
+    runtime_names = tuple(
+        name for name, parameter in module.named_parameters() if parameter.requires_grad
+    )
+    runtime_to_raw = _map_parameter_names_to_schema_raw(
+        runtime_names,
+        schema,
+        role=role,
+        label="optimizer restore runtime names",
+    )
+    raw_to_runtime = {raw: runtime for runtime, raw in runtime_to_raw.items()}
+    if len(raw_to_runtime) != len(runtime_to_raw):
+        raise ValueError(f"Stage-2 {role} optimizer runtime name mapping collides")
+    return _rename_stage2_optimizer_state_parameters(
+        canonical,
+        raw_to_runtime,
+        role=role,
+    )
+
+
 def _dcp_optimizer_apis():
     try:
         from torch.distributed.checkpoint.state_dict import (
@@ -1221,10 +1353,16 @@ def gather_stage2_optimizer_state(
         ops,
     )
     local_error: Exception | None = None
+    canonical_state: Mapping[str, Any] | None = None
     if rank == 0:
         try:
-            validate_stage2_full_optimizer_state(
+            canonical_state = _canonicalize_stage2_optimizer_state(
                 full_state,
+                expected_schema,
+                role=role,
+            )
+            validate_stage2_full_optimizer_state(
+                canonical_state,
                 role=role,
                 expected_parameter_names=names,
                 expected_completed_updates=expected_completed_updates,
@@ -1236,7 +1374,7 @@ def gather_stage2_optimizer_state(
             f"Stage-2 {role} rank-0 optimizer validation failed"
         ) from local_error
     ops.barrier()
-    return full_state if rank == 0 else None
+    return canonical_state if rank == 0 else None
 
 
 def restore_stage2_optimizer_state(
@@ -1269,15 +1407,27 @@ def restore_stage2_optimizer_state(
         ops,
     )
     local_error: Exception | None = None
+    runtime_optimizer_state: Mapping[str, Any] | None = None
     if rank == 0:
         try:
             if optimizer_state is None:
                 raise RuntimeError(f"rank0 is missing {role} optimizer state")
-            validate_stage2_full_optimizer_state(
+            canonical_optimizer_state = _canonicalize_stage2_optimizer_state(
                 optimizer_state,
+                expected_schema,
+                role=role,
+            )
+            validate_stage2_full_optimizer_state(
+                canonical_optimizer_state,
                 role=role,
                 expected_parameter_names=names,
                 expected_completed_updates=expected_completed_updates,
+            )
+            runtime_optimizer_state = _optimizer_state_for_runtime(
+                canonical_optimizer_state,
+                module,
+                expected_schema,
+                role=role,
             )
         except Exception as exc:
             local_error = exc
@@ -1300,7 +1450,7 @@ def restore_stage2_optimizer_state(
         lambda: set_fn(
             module,
             optimizer,
-            optimizer_state if rank == 0 else {},
+            runtime_optimizer_state if rank == 0 else {},
             options=options,
         ),
         ops,
@@ -1903,6 +2053,8 @@ def _validate_prepared_payloads(
     OrderedDict[str, torch.Tensor],
     OrderedDict[str, torch.Tensor],
     OrderedDict[str, torch.Tensor] | None,
+    Mapping[str, Any],
+    Mapping[str, Any],
     dict[str, Any],
 ]:
     validate_stage2_trainer_state(trainer_state)
@@ -1928,20 +2080,30 @@ def _validate_prepared_payloads(
         if generator_ema is not None
         else None
     )
+    canonical_generator_optimizer = _canonicalize_stage2_optimizer_state(
+        generator_optimizer_state,
+        generator_schema,
+        role="generator",
+    )
+    canonical_fake_optimizer = _canonicalize_stage2_optimizer_state(
+        fake_score_optimizer_state,
+        fake_score_schema,
+        role="fake_score",
+    )
     generator_names = _optimizer_names_for_schema(
-        generator_optimizer_state, generator_schema, role="generator"
+        canonical_generator_optimizer, generator_schema, role="generator"
     )
     fake_names = _optimizer_names_for_schema(
-        fake_score_optimizer_state, fake_score_schema, role="fake_score"
+        canonical_fake_optimizer, fake_score_schema, role="fake_score"
     )
     validate_stage2_full_optimizer_state(
-        generator_optimizer_state,
+        canonical_generator_optimizer,
         role="generator",
         expected_parameter_names=generator_names,
         expected_completed_updates=completed_g,
     )
     validate_stage2_full_optimizer_state(
-        fake_score_optimizer_state,
+        canonical_fake_optimizer,
         role="fake_score",
         expected_parameter_names=fake_names,
         expected_completed_updates=completed_f,
@@ -1955,7 +2117,14 @@ def _validate_prepared_payloads(
         },
         trainer_state=trainer_state,
     )
-    return raw_g, raw_f, ema, _validate_topology(topology)
+    return (
+        raw_g,
+        raw_f,
+        ema,
+        canonical_generator_optimizer,
+        canonical_fake_optimizer,
+        _validate_topology(topology),
+    )
 
 
 def _optimizer_names_for_schema(
@@ -1965,23 +2134,13 @@ def _optimizer_names_for_schema(
     role: str,
 ) -> tuple[str, ...]:
     names = _optimizer_names(optimizer_state)
-    mapped: set[str] = set()
-    for name in names:
-        matches = [
-            key
-            for key, spec in schema.items()
-            if name == spec.raw_parameter_name
-            or name.endswith(f".{spec.raw_parameter_name}")
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Stage-2 {role} optimizer parameter {name!r} does not map "
-                f"uniquely to the role schema: {matches}"
-            )
-        mapped.add(matches[0])
-    if mapped != set(schema) or len(names) != len(schema):
-        raise ValueError(f"Stage-2 {role} optimizer role/schema mapping is incomplete")
-    return names
+    mapping = _map_parameter_names_to_schema_raw(
+        names,
+        schema,
+        role=role,
+        label="optimizer payload names",
+    )
+    return tuple(mapping[name] for name in names)
 
 
 def save_stage2_checkpoint_from_payloads(
@@ -2016,7 +2175,14 @@ def save_stage2_checkpoint_from_payloads(
     renamed = False
     quarantined_uncommitted: Path | None = None
     try:
-        raw_g, raw_f, ema, audited_topology = _validate_prepared_payloads(
+        (
+            raw_g,
+            raw_f,
+            ema,
+            generator_optimizer_state,
+            fake_score_optimizer_state,
+            audited_topology,
+        ) = _validate_prepared_payloads(
             trainer_state=trainer_state,
             generator_raw=generator_raw,
             fake_score_raw=fake_score_raw,

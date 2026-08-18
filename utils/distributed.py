@@ -11,6 +11,7 @@ import socket
 from typing import Any
 import torch
 import torch.distributed as dist
+from utils.parameter_names import map_parameter_names_to_expected
 from torch.distributed.fsdp import (
     FullStateDictConfig,
     FullyShardedDataParallel as FSDP,
@@ -1070,6 +1071,7 @@ class TrainableShardedEMA:
         *,
         require_lora_only: bool = True,
         topology: Mapping[str, Any] | None = None,
+        expected_parameter_names: Sequence[str] | None = None,
     ):
         if not 0.0 <= float(decay) < 1.0:
             raise ValueError(f"EMA decay must be in [0, 1), got {decay}")
@@ -1079,6 +1081,11 @@ class TrainableShardedEMA:
         self.start_step = int(start_step)
         self.require_lora_only = bool(require_lora_only)
         self.topology = dict(topology or {})
+        self.expected_parameter_names = (
+            tuple(expected_parameter_names)
+            if expected_parameter_names is not None
+            else None
+        )
         self.shadow: dict[str, torch.Tensor] = {}
         self.local_shapes: dict[str, tuple[int, ...]] = {}
         self.global_shapes: dict[str, tuple[int, ...]] = {}
@@ -1143,7 +1150,49 @@ class TrainableShardedEMA:
                     "TrainableShardedEMA only accepts LoRA trainables; "
                     f"found {non_lora}"
                 )
+        if self.expected_parameter_names is not None:
+            mapping = map_parameter_names_to_expected(
+                parameters,
+                self.expected_parameter_names,
+                label="TrainableShardedEMA",
+            )
+            parameters = {
+                mapping[name]: parameter for name, parameter in parameters.items()
+            }
         return dict(sorted(parameters.items()))
+
+    def _normalize_state_parameter_names(
+        self, state_dict: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Upgrade legacy wrapper-prefixed EMA keys before strict validation."""
+
+        if self.expected_parameter_names is None:
+            return state_dict
+        local_shapes = state_dict.get("local_shapes")
+        if not isinstance(local_shapes, Mapping):
+            return state_dict
+        mapping = map_parameter_names_to_expected(
+            local_shapes,
+            self.expected_parameter_names,
+            label="EMA checkpoint",
+        )
+        runtime_names = set(mapping)
+        normalized = dict(state_dict)
+        for field in ("local_shapes", "global_shapes", "shard_metadata"):
+            values = state_dict.get(field)
+            if not isinstance(values, Mapping) or set(values) != runtime_names:
+                raise ValueError(
+                    f"EMA checkpoint {field} names differ from local_shapes"
+                )
+            normalized[field] = {mapping[name]: value for name, value in values.items()}
+        shadows = state_dict.get("shadow")
+        if isinstance(shadows, Mapping):
+            if shadows and set(shadows) != runtime_names:
+                raise ValueError("EMA checkpoint shadow names differ from local_shapes")
+            normalized["shadow"] = {
+                mapping[name]: value for name, value in shadows.items()
+            }
+        return normalized
 
     def _validate_local_topology(
         self, parameters: Mapping[str, torch.nn.Parameter]
@@ -1324,6 +1373,7 @@ class TrainableShardedEMA:
     def load_state_dict(
         self, state_dict: Mapping[str, Any], module: torch.nn.Module
     ) -> None:
+        state_dict = self._normalize_state_parameter_names(state_dict)
         rank, world_size = self._rank_and_world_size()
         validate_trainable_sharded_ema_state_dict(
             state_dict,

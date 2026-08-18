@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from peft import LoraConfig, get_peft_model
 from torch import nn
 
 from utils.distributed import TrainableShardedEMA
+from utils.lora_utils import build_lora_shard_schema
+from model.stage2_dmd import Stage2DiTRole
 
 
 class TinyLocalLora(nn.Module):
@@ -50,11 +53,17 @@ def test_ema_initializes_at_start_step_then_decays_in_cpu_fp32():
     assert ema.initialized
     assert all(tensor.device.type == "cpu" for tensor in ema.shadow.values())
     assert all(tensor.dtype == torch.float32 for tensor in ema.shadow.values())
-    assert all(torch.equal(tensor, torch.full_like(tensor, 3.0)) for tensor in ema.shadow.values())
+    assert all(
+        torch.equal(tensor, torch.full_like(tensor, 3.0))
+        for tensor in ema.shadow.values()
+    )
 
     fill_trainable(model, 5.0)
     assert ema.update_after_step(model, 4) == "updated"
-    assert all(torch.equal(tensor, torch.full_like(tensor, 4.0)) for tensor in ema.shadow.values())
+    assert all(
+        torch.equal(tensor, torch.full_like(tensor, 4.0))
+        for tensor in ema.shadow.values()
+    )
     with pytest.raises(ValueError, match="must increase"):
         ema.update_after_step(model, 4)
 
@@ -132,8 +141,87 @@ def test_ema_rejects_non_lora_trainables_and_nonfinite_updates():
 
     model = TinyLocalLora()
     ema = TrainableShardedEMA(model, start_step=1)
-    next(parameter for parameter in model.parameters() if parameter.requires_grad).data.fill_(
-        torch.nan
-    )
+    next(
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ).data.fill_(torch.nan)
     with pytest.raises(ValueError, match="non-finite"):
         ema.update_after_step(model, 1)
+
+
+class TinyPeftBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = nn.Linear(3, 4, bias=False)
+
+    def forward(self, value):
+        return self.block(value)
+
+
+def _nested_stage2_peft_role():
+    peft_model = get_peft_model(
+        TinyPeftBackbone(),
+        LoraConfig(
+            r=2,
+            lora_alpha=2,
+            target_modules={"block"},
+            bias="none",
+        ),
+    )
+    role = Stage2DiTRole(peft_model, role="generator", is_causal=True)
+    schema = build_lora_shard_schema(role.model, expected_dtype=torch.float32)
+    expected_names = tuple(spec.raw_parameter_name for spec in schema.values())
+    return role, expected_names
+
+
+def test_stage2_nested_peft_ema_uses_pre_fsdp_schema_names_end_to_end():
+    role, expected_names = _nested_stage2_peft_role()
+    assert all(not name.startswith("model.") for name in expected_names)
+    assert all(
+        name.startswith("model.")
+        for name, parameter in role.named_parameters()
+        if parameter.requires_grad
+    )
+
+    ema = TrainableShardedEMA(
+        role,
+        decay=0.5,
+        start_step=1,
+        expected_parameter_names=expected_names,
+    )
+    assert set(ema.local_shapes) == set(expected_names)
+    assert ema.update_after_step(role, 1) == "initialized"
+
+    raw = trainable_values(role)
+    fill_trainable(role, 9.0)
+    with ema.swap_into(role):
+        assert all(
+            torch.equal(
+                parameter,
+                ema.shadow[name.removeprefix("model.")],
+            )
+            for name, parameter in role.named_parameters()
+            if parameter.requires_grad
+        )
+    for name, parameter in role.named_parameters():
+        if parameter.requires_grad:
+            assert torch.equal(parameter, torch.full_like(parameter, 9.0))
+    assert raw
+
+
+def test_stage2_nested_peft_ema_loads_legacy_outer_wrapper_names():
+    legacy_role, expected_names = _nested_stage2_peft_role()
+    legacy = TrainableShardedEMA(legacy_role, start_step=1)
+    legacy.update_after_step(legacy_role, 1)
+    legacy_state = legacy.state_dict()
+    assert all(name.startswith("model.") for name in legacy_state["local_shapes"])
+
+    current_role, current_expected_names = _nested_stage2_peft_role()
+    assert current_expected_names == expected_names
+    current = TrainableShardedEMA(
+        current_role,
+        start_step=1,
+        expected_parameter_names=current_expected_names,
+    )
+    current.load_state_dict(legacy_state, current_role)
+    assert set(current.shadow) == set(current_expected_names)
+    assert set(current.state_dict()["local_shapes"]) == set(current_expected_names)

@@ -88,6 +88,16 @@ def _optimizer(schema, step):
     }
 
 
+def _prefixed_optimizer(schema, step, prefix):
+    state = _optimizer(schema, step)
+    state["state"] = {
+        f"{prefix}.{name}": values for name, values in state["state"].items()
+    }
+    for group in state["param_groups"]:
+        group["params"] = [f"{prefix}.{name}" for name in group["params"]]
+    return state
+
+
 @lru_cache(maxsize=None)
 def _cached_sampler_state(g):
     actions = ("a", "b", "c")
@@ -288,6 +298,7 @@ def _save(
     provenance=None,
     phase_b_mode="dmd_dfd",
     metrics_snapshot=None,
+    optimizer_runtime_prefix=None,
 ):
     ema_states, rng_states = _rank_states(g)
     return save_stage2_checkpoint_from_payloads(
@@ -301,8 +312,16 @@ def _save(
         generator_ema=(_adapter(GENERATOR_SCHEMA, float(g + 2)) if g >= 40 else None),
         generator_schema=GENERATOR_SCHEMA,
         fake_score_schema=FAKE_SCHEMA,
-        generator_optimizer_state=_optimizer(GENERATOR_SCHEMA, g),
-        fake_score_optimizer_state=_optimizer(FAKE_SCHEMA, 5 * g),
+        generator_optimizer_state=(
+            _optimizer(GENERATOR_SCHEMA, g)
+            if optimizer_runtime_prefix is None
+            else _prefixed_optimizer(GENERATOR_SCHEMA, g, optimizer_runtime_prefix)
+        ),
+        fake_score_optimizer_state=(
+            _optimizer(FAKE_SCHEMA, 5 * g)
+            if optimizer_runtime_prefix is None
+            else _prefixed_optimizer(FAKE_SCHEMA, 5 * g, optimizer_runtime_prefix)
+        ),
         rank_ema_states=ema_states,
         rank_rng_states=rng_states,
         resolved_config={"contract": "fixture", "g": g},
@@ -380,6 +399,36 @@ def test_atomic_checkpoint_roundtrip_and_exact_file_mapping(tmp_path):
         torch.full((2, 3), 40.0),
     )
     assert set(payload.rank_rng_states) == set(range(8))
+
+
+def test_c0_publication_canonicalizes_runtime_optimizer_names_before_revalidation(
+    tmp_path,
+):
+    directory = _save(tmp_path, 10, optimizer_runtime_prefix="model")
+    validate_stage2_checkpoint(directory)
+
+    generator_state = torch.load(
+        directory / "optimizer_generator.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    fake_state = torch.load(
+        directory / "optimizer_fake_score.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert set(generator_state["state"]) == {
+        spec.raw_parameter_name for spec in GENERATOR_SCHEMA.values()
+    }
+    assert set(fake_state["state"]) == {
+        spec.raw_parameter_name for spec in FAKE_SCHEMA.values()
+    }
+    assert all(
+        not name.startswith("model.")
+        for state in (generator_state, fake_state)
+        for group in state["param_groups"]
+        for name in group["params"]
+    )
 
 
 def test_next_f1_probe_roundtrips_inside_manifest_bound_provenance(tmp_path):

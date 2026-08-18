@@ -685,6 +685,10 @@ class Trainer:
             self.model.generator,
             decay=self.resolved.ema_decay,
             start_step=self.resolved.ema_initialize_at_completed_generator_update,
+            expected_parameter_names=tuple(
+                spec.raw_parameter_name
+                for spec in self.lora_schemas["generator"].values()
+            ),
             topology={
                 "rank_layout": tuple(range(self.world_size)),
                 "mesh_dim_names": ("shard",),

@@ -20,6 +20,91 @@ from dataclasses import dataclass
 from pathlib import Path
 
 HOTFIX_API_VERSION = "longlive_stage2_dmd_runtime/v2"
+PARAMETER_NAME_API_VERSION = "longlive_stage2_parameter_names/v1"
+_PARAMETER_NAMES_SOURCE = '''"""Fail-closed parameter-name mapping across transparent module wrappers."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from collections.abc import Iterable
+
+STAGE2_PARAMETER_NAME_API_VERSION = "longlive_stage2_parameter_names/v1"
+
+
+def _validated_names(values: Iterable[str], *, label: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{label} must be an iterable of parameter names")
+    names = tuple(values)
+    invalid = [
+        name
+        for name in names
+        if not isinstance(name, str) or not name or name != name.strip()
+    ]
+    if invalid:
+        raise ValueError(f"{label} contains invalid parameter names: {invalid}")
+    if len(names) != len(set(names)):
+        raise ValueError(f"{label} contains duplicate parameter names")
+    return names
+
+
+def map_parameter_names_to_expected(
+    actual_names: Iterable[str],
+    expected_names: Iterable[str],
+    *,
+    label: str,
+    require_complete: bool = True,
+) -> OrderedDict[str, str]:
+    """Map runtime FQNs to one immutable namespace without guessing.
+
+    A runtime name may equal an expected name or add one or more complete
+    dotted wrapper segments in front of it.  Zero matches, multiple matches,
+    and two runtime names resolving to the same expected name are rejected.
+    """
+
+    actual = _validated_names(actual_names, label=f"{label} runtime names")
+    expected = _validated_names(expected_names, label=f"{label} expected names")
+    if not expected:
+        raise ValueError(f"{label} expected parameter names are empty")
+    expected_set = set(expected)
+
+    mapped: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    for actual_name in actual:
+        suffixes = [actual_name]
+        suffixes.extend(
+            actual_name[index + 1 :]
+            for index, character in enumerate(actual_name)
+            if character == "."
+        )
+        matches = [suffix for suffix in suffixes if suffix in expected_set]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{label} parameter {actual_name!r} did not map uniquely to the "
+                f"expected namespace: matches={matches}"
+            )
+        expected_name = matches[0]
+        if expected_name in owners:
+            raise ValueError(
+                f"{label} parameter-name collision for {expected_name!r}: "
+                f"{owners[expected_name]!r} and {actual_name!r}"
+            )
+        mapped[actual_name] = expected_name
+        owners[expected_name] = actual_name
+
+    if require_complete and set(owners) != expected_set:
+        raise ValueError(
+            f"{label} parameter-name mapping is incomplete: "
+            f"missing={sorted(expected_set - set(owners))}, "
+            f"extra={sorted(set(owners) - expected_set)}"
+        )
+    return OrderedDict((name, mapped[name]) for name in sorted(mapped))
+
+
+__all__ = [
+    "STAGE2_PARAMETER_NAME_API_VERSION",
+    "map_parameter_names_to_expected",
+]
+'''
 
 
 class HotfixError(RuntimeError):
@@ -411,6 +496,25 @@ _STAGE2_DMD_RUNTIME_METHODS = {
                     "orchestration": result.get("attempt_orchestration_seconds", 0.0)
                     + control_seconds,
                     "ema": ema_seconds,
+        """,
+    ),
+    _PatchUnit(
+        "generator_ema_schema_names",
+        """        self.generator_ema = TrainableShardedEMA(
+            self.model.generator,
+            decay=self.resolved.ema_decay,
+            start_step=self.resolved.ema_initialize_at_completed_generator_update,
+            topology={
+""",
+        """        self.generator_ema = TrainableShardedEMA(
+            self.model.generator,
+            decay=self.resolved.ema_decay,
+            start_step=self.resolved.ema_initialize_at_completed_generator_update,
+            expected_parameter_names=tuple(
+                spec.raw_parameter_name
+                for spec in self.lora_schemas["generator"].values()
+            ),
+            topology={
 """,
     ),
 )
@@ -443,6 +547,701 @@ _PLOT_PATCH_UNITS = (
         "clip_optimizer_seconds_max": "Clip + optimizer",
         "orchestration_seconds_max": "Runtime orchestration + audits",
         "ema_seconds_max": "EMA",
+""",
+    ),
+)
+
+
+_DISTRIBUTED_PATCH_UNITS = (
+    _PatchUnit(
+        "parameter_name_import",
+        """import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import (
+""",
+        """import torch
+import torch.distributed as dist
+from utils.parameter_names import map_parameter_names_to_expected
+from torch.distributed.fsdp import (
+""",
+    ),
+    _PatchUnit(
+        "ema_expected_name_signature",
+        """        require_lora_only: bool = True,
+        topology: Mapping[str, Any] | None = None,
+    ):
+""",
+        """        require_lora_only: bool = True,
+        topology: Mapping[str, Any] | None = None,
+        expected_parameter_names: Sequence[str] | None = None,
+    ):
+""",
+    ),
+    _PatchUnit(
+        "ema_expected_name_state",
+        """        self.require_lora_only = bool(require_lora_only)
+        self.topology = dict(topology or {})
+        self.shadow: dict[str, torch.Tensor] = {}
+""",
+        """        self.require_lora_only = bool(require_lora_only)
+        self.topology = dict(topology or {})
+        self.expected_parameter_names = (
+            tuple(expected_parameter_names)
+            if expected_parameter_names is not None
+            else None
+        )
+        self.shadow: dict[str, torch.Tensor] = {}
+""",
+    ),
+    _PatchUnit(
+        "ema_runtime_to_schema_mapping",
+        """                raise ValueError(
+                    "TrainableShardedEMA only accepts LoRA trainables; "
+                    f"found {non_lora}"
+                )
+        return dict(sorted(parameters.items()))
+
+    def _validate_local_topology(
+""",
+        '''                raise ValueError(
+                    "TrainableShardedEMA only accepts LoRA trainables; "
+                    f"found {non_lora}"
+                )
+        if self.expected_parameter_names is not None:
+            mapping = map_parameter_names_to_expected(
+                parameters,
+                self.expected_parameter_names,
+                label="TrainableShardedEMA",
+            )
+            parameters = {
+                mapping[name]: parameter for name, parameter in parameters.items()
+            }
+        return dict(sorted(parameters.items()))
+
+    def _normalize_state_parameter_names(
+        self, state_dict: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Upgrade legacy wrapper-prefixed EMA keys before strict validation."""
+
+        if self.expected_parameter_names is None:
+            return state_dict
+        local_shapes = state_dict.get("local_shapes")
+        if not isinstance(local_shapes, Mapping):
+            return state_dict
+        mapping = map_parameter_names_to_expected(
+            local_shapes,
+            self.expected_parameter_names,
+            label="EMA checkpoint",
+        )
+        runtime_names = set(mapping)
+        normalized = dict(state_dict)
+        for field in ("local_shapes", "global_shapes", "shard_metadata"):
+            values = state_dict.get(field)
+            if not isinstance(values, Mapping) or set(values) != runtime_names:
+                raise ValueError(
+                    f"EMA checkpoint {field} names differ from local_shapes"
+                )
+            normalized[field] = {mapping[name]: value for name, value in values.items()}
+        shadows = state_dict.get("shadow")
+        if isinstance(shadows, Mapping):
+            if shadows and set(shadows) != runtime_names:
+                raise ValueError("EMA checkpoint shadow names differ from local_shapes")
+            normalized["shadow"] = {
+                mapping[name]: value for name, value in shadows.items()
+            }
+        return normalized
+
+    def _validate_local_topology(
+''',
+    ),
+    _PatchUnit(
+        "ema_load_name_normalization",
+        """    def load_state_dict(
+        self, state_dict: Mapping[str, Any], module: torch.nn.Module
+    ) -> None:
+        rank, world_size = self._rank_and_world_size()
+""",
+        """    def load_state_dict(
+        self, state_dict: Mapping[str, Any], module: torch.nn.Module
+    ) -> None:
+        state_dict = self._normalize_state_parameter_names(state_dict)
+        rank, world_size = self._rank_and_world_size()
+""",
+    ),
+)
+
+
+_LORA_PATCH_UNITS = (
+    _PatchUnit(
+        "parameter_name_import",
+        """from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+_LORA_PARAMETER_MARKERS = (".lora_A.", ".lora_B.")
+""",
+        """from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from utils.parameter_names import map_parameter_names_to_expected
+
+_LORA_PARAMETER_MARKERS = (".lora_A.", ".lora_B.")
+""",
+    ),
+    _PatchUnit(
+        "canonical_schema_mapping",
+        """def _match_expected_adapter_key(
+    candidate: str,
+    expected_schema: Mapping[str, LoraTensorSpec],
+) -> str:
+    matches = [
+        key
+        for key in expected_schema
+        if candidate == key or candidate.endswith(f".{key}")
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "FSDP LoRA parameter did not map uniquely to the pre-FSDP schema: "
+            f"parameter={candidate!r}, matches={matches}"
+        )
+    return matches[0]
+""",
+        """def _match_expected_adapter_key(
+    candidate: str,
+    expected_schema: Mapping[str, LoraTensorSpec],
+) -> str:
+    return map_parameter_names_to_expected(
+        (candidate,),
+        expected_schema,
+        label="FSDP LoRA canonical key",
+        require_complete=False,
+    )[candidate]
+""",
+    ),
+    _PatchUnit(
+        "raw_schema_mapping",
+        """        cleaned_raw_name = _clean_fsdp_parameter_name(raw_name)
+        if not (
+            cleaned_raw_name == spec.raw_parameter_name
+            or cleaned_raw_name.endswith(f".{spec.raw_parameter_name}")
+        ):
+            raise ValueError(
+                "post-FSDP parameter name differs from pre-FSDP schema: "
+                f"current={cleaned_raw_name!r}, expected={spec.raw_parameter_name!r}"
+            )
+        if parameter.dtype != spec.dtype:
+""",
+        """        cleaned_raw_name = _clean_fsdp_parameter_name(raw_name)
+        map_parameter_names_to_expected(
+            (cleaned_raw_name,),
+            (spec.raw_parameter_name,),
+            label="post-FSDP LoRA raw name",
+        )
+        if parameter.dtype != spec.dtype:
+""",
+    ),
+)
+
+
+_STAGE2_FSDP2_PATCH_UNITS = (
+    _PatchUnit(
+        "parameter_name_import",
+        """from utils.lora_utils import LoraTensorSpec
+
+STAGE2_FSDP2_WORLD_SIZE = 8
+""",
+        """from utils.lora_utils import LoraTensorSpec
+from utils.parameter_names import map_parameter_names_to_expected
+
+STAGE2_FSDP2_WORLD_SIZE = 8
+""",
+    ),
+    _PatchUnit(
+        "post_fsdp_schema_map",
+        """    frozen_tensor_count = 0
+    global_frozen_parameters = 0
+    canonical_keys: list[str] = []
+    for name, parameter in named_parameters:
+""",
+        """    frozen_tensor_count = 0
+    global_frozen_parameters = 0
+    canonical_keys: list[str] = []
+    runtime_to_raw: Mapping[str, str] = {}
+    raw_to_key: dict[str, str] = {}
+    if expected_schema is not None:
+        raw_to_key = {
+            spec.raw_parameter_name: key for key, spec in expected_schema.items()
+        }
+        if len(raw_to_key) != len(expected_schema):
+            raise ValueError(f"Stage-2 {role} schema has duplicate raw parameter names")
+        runtime_to_raw = map_parameter_names_to_expected(
+            (name for name, _ in trainable),
+            raw_to_key,
+            label=f"Stage-2 {role} post-FSDP LoRA",
+        )
+    for name, parameter in named_parameters:
+""",
+    ),
+    _PatchUnit(
+        "post_fsdp_schema_lookup",
+        """        assert expected_schema is not None
+        matches = [
+            key
+            for key, spec in expected_schema.items()
+            if name.endswith(spec.raw_parameter_name)
+            or name.endswith(f".{spec.raw_parameter_name}")
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Stage-2 {role} post-FSDP parameter does not map to schema: {name}"
+            )
+        key = matches[0]
+""",
+        """        assert expected_schema is not None
+        key = raw_to_key[runtime_to_raw[name]]
+""",
+    ),
+)
+
+
+_STAGE2_CHECKPOINT_PATCH_UNITS = (
+    _PatchUnit(
+        "parameter_name_import",
+        """from utils.lora_utils import LocalLoraShard, LoraTensorSpec
+from utils.stage2_code_version import capture_stage2_source_version
+""",
+        """from utils.lora_utils import LocalLoraShard, LoraTensorSpec
+from utils.parameter_names import map_parameter_names_to_expected
+from utils.stage2_code_version import capture_stage2_source_version
+""",
+    ),
+    _PatchUnit(
+        "schema_raw_name_helpers",
+        """def _is_lora_name(name: str) -> bool:
+    return any(marker in name for marker in ("lora_A", "lora_B"))
+
+
+def _validate_stage2_optimizer_param_groups(
+""",
+        """def _is_lora_name(name: str) -> bool:
+    return any(marker in name for marker in ("lora_A", "lora_B"))
+
+
+def _schema_raw_parameter_specs(
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+) -> OrderedDict[str, LoraTensorSpec]:
+    raw = OrderedDict(
+        (spec.raw_parameter_name, spec) for _, spec in sorted(schema.items())
+    )
+    if len(raw) != len(schema) or any(
+        not isinstance(name, str) or not name or name != name.strip() for name in raw
+    ):
+        raise ValueError(
+            f"Stage-2 {role} schema has duplicate or invalid raw parameter names"
+        )
+    return raw
+
+
+def _map_parameter_names_to_schema_raw(
+    names: Iterable[str],
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+    label: str,
+) -> OrderedDict[str, str]:
+    raw_specs = _schema_raw_parameter_specs(schema, role=role)
+    return map_parameter_names_to_expected(
+        names,
+        raw_specs,
+        label=f"Stage-2 {role} {label}",
+    )
+
+
+def _validate_stage2_optimizer_param_groups(
+""",
+    ),
+    _PatchUnit(
+        "optimizer_runtime_schema_audit",
+        """    if expected_schema is not None:
+        mapped: set[str] = set()
+        for name, parameter in named.items():
+            matches = [
+                key
+                for key, spec in expected_schema.items()
+                if name == spec.raw_parameter_name
+                or name.endswith(f".{spec.raw_parameter_name}")
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Stage-2 {role} optimizer parameter {name!r} does not map "
+                    f"uniquely to its role schema: {matches}"
+                )
+            spec = expected_schema[matches[0]]
+            if tuple(parameter.shape) != tuple(spec.global_shape):
+                raise ValueError(
+                    f"Stage-2 {role} optimizer parameter shape drift: {name}"
+                )
+            mapped.add(matches[0])
+        if mapped != set(expected_schema):
+            raise ValueError(f"Stage-2 {role} optimizer role schema is incomplete")
+""",
+        """    mapped_names: Mapping[str, str] | None = None
+    if expected_schema is not None:
+        mapped_names = _map_parameter_names_to_schema_raw(
+            named,
+            expected_schema,
+            role=role,
+            label="optimizer runtime names",
+        )
+        raw_specs = _schema_raw_parameter_specs(expected_schema, role=role)
+        for name, parameter in named.items():
+            spec = raw_specs[mapped_names[name]]
+            if tuple(parameter.shape) != tuple(spec.global_shape):
+                raise ValueError(
+                    f"Stage-2 {role} optimizer parameter shape drift: {name}"
+                )
+""",
+    ),
+    _PatchUnit(
+        "optimizer_audit_canonical_return",
+        """    return tuple(named)
+
+
+def _validate_adam_values(
+""",
+        """    return tuple(
+        mapped_names[name] if mapped_names is not None else name for name in named
+    )
+
+
+def _validate_adam_values(
+""",
+    ),
+    _PatchUnit(
+        "optimizer_state_name_transforms",
+        """    return state
+
+
+def _dcp_optimizer_apis():
+""",
+        '''    return state
+
+
+def _rename_stage2_optimizer_state_parameters(
+    state: Mapping[str, Any],
+    mapping: Mapping[str, str],
+    *,
+    role: str,
+) -> Mapping[str, Any]:
+    """Rename both DCP moment keys and param-group FQNs atomically."""
+
+    if not isinstance(state, Mapping) or set(state) != {"state", "param_groups"}:
+        raise ValueError(f"Stage-2 {role} optimizer state has invalid containers")
+    moments = state["state"]
+    groups = state["param_groups"]
+    if (
+        not isinstance(moments, Mapping)
+        or isinstance(groups, (str, bytes))
+        or not isinstance(groups, Sequence)
+    ):
+        raise TypeError(f"Stage-2 {role} optimizer state has invalid containers")
+    source_names = set(mapping)
+    if set(moments) != source_names:
+        raise ValueError(
+            f"Stage-2 {role} optimizer moment names differ from param groups"
+        )
+    if len(set(mapping.values())) != len(mapping):
+        raise ValueError(f"Stage-2 {role} optimizer parameter rename collides")
+    renamed_groups: list[dict[str, Any]] = []
+    grouped_names: list[str] = []
+    for group in groups:
+        if not isinstance(group, Mapping):
+            raise TypeError(f"Stage-2 {role} optimizer param group is invalid")
+        params = group.get("params")
+        if isinstance(params, (str, bytes)) or not isinstance(params, Sequence):
+            raise TypeError(f"Stage-2 {role} optimizer params must be FQNs")
+        if any(name not in mapping for name in params):
+            raise ValueError(
+                f"Stage-2 {role} optimizer param groups contain unknown names"
+            )
+        grouped_names.extend(params)
+        renamed_groups.append(
+            {
+                **dict(group),
+                "params": [mapping[name] for name in params],
+            }
+        )
+    if (
+        len(grouped_names) != len(set(grouped_names))
+        or set(grouped_names) != source_names
+    ):
+        raise ValueError(
+            f"Stage-2 {role} optimizer param groups/moments are inconsistent"
+        )
+    if all(source == target for source, target in mapping.items()):
+        return state
+    return {
+        "state": OrderedDict(
+            (mapping[name], moments[name]) for name in sorted(source_names)
+        ),
+        "param_groups": renamed_groups,
+    }
+
+
+def _canonicalize_stage2_optimizer_state(
+    state: Mapping[str, Any],
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+) -> Mapping[str, Any]:
+    names = _optimizer_names(state)
+    mapping = _map_parameter_names_to_schema_raw(
+        names,
+        schema,
+        role=role,
+        label="optimizer checkpoint names",
+    )
+    return _rename_stage2_optimizer_state_parameters(state, mapping, role=role)
+
+
+def _optimizer_state_for_runtime(
+    state: Mapping[str, Any],
+    module: torch.nn.Module,
+    schema: Mapping[str, LoraTensorSpec],
+    *,
+    role: str,
+) -> Mapping[str, Any]:
+    canonical = _canonicalize_stage2_optimizer_state(state, schema, role=role)
+    runtime_names = tuple(
+        name for name, parameter in module.named_parameters() if parameter.requires_grad
+    )
+    runtime_to_raw = _map_parameter_names_to_schema_raw(
+        runtime_names,
+        schema,
+        role=role,
+        label="optimizer restore runtime names",
+    )
+    raw_to_runtime = {raw: runtime for runtime, raw in runtime_to_raw.items()}
+    if len(raw_to_runtime) != len(runtime_to_raw):
+        raise ValueError(f"Stage-2 {role} optimizer runtime name mapping collides")
+    return _rename_stage2_optimizer_state_parameters(
+        canonical,
+        raw_to_runtime,
+        role=role,
+    )
+
+
+def _dcp_optimizer_apis():
+''',
+    ),
+    _PatchUnit(
+        "optimizer_gather_canonicalization",
+        """    local_error: Exception | None = None
+    if rank == 0:
+        try:
+            validate_stage2_full_optimizer_state(
+                full_state,
+                role=role,
+""",
+        """    local_error: Exception | None = None
+    canonical_state: Mapping[str, Any] | None = None
+    if rank == 0:
+        try:
+            canonical_state = _canonicalize_stage2_optimizer_state(
+                full_state,
+                expected_schema,
+                role=role,
+            )
+            validate_stage2_full_optimizer_state(
+                canonical_state,
+                role=role,
+""",
+    ),
+    _PatchUnit(
+        "optimizer_gather_canonical_return",
+        """    ops.barrier()
+    return full_state if rank == 0 else None
+
+
+def restore_stage2_optimizer_state(
+""",
+        """    ops.barrier()
+    return canonical_state if rank == 0 else None
+
+
+def restore_stage2_optimizer_state(
+""",
+    ),
+    _PatchUnit(
+        "optimizer_restore_name_transform",
+        """    local_error: Exception | None = None
+    if rank == 0:
+        try:
+            if optimizer_state is None:
+                raise RuntimeError(f"rank0 is missing {role} optimizer state")
+            validate_stage2_full_optimizer_state(
+                optimizer_state,
+                role=role,
+                expected_parameter_names=names,
+                expected_completed_updates=expected_completed_updates,
+            )
+""",
+        """    local_error: Exception | None = None
+    runtime_optimizer_state: Mapping[str, Any] | None = None
+    if rank == 0:
+        try:
+            if optimizer_state is None:
+                raise RuntimeError(f"rank0 is missing {role} optimizer state")
+            canonical_optimizer_state = _canonicalize_stage2_optimizer_state(
+                optimizer_state,
+                expected_schema,
+                role=role,
+            )
+            validate_stage2_full_optimizer_state(
+                canonical_optimizer_state,
+                role=role,
+                expected_parameter_names=names,
+                expected_completed_updates=expected_completed_updates,
+            )
+            runtime_optimizer_state = _optimizer_state_for_runtime(
+                canonical_optimizer_state,
+                module,
+                expected_schema,
+                role=role,
+            )
+""",
+    ),
+    _PatchUnit(
+        "optimizer_restore_runtime_payload",
+        """            optimizer_state if rank == 0 else {},
+            options=options,
+""",
+        """            runtime_optimizer_state if rank == 0 else {},
+            options=options,
+""",
+    ),
+    _PatchUnit(
+        "prepared_optimizer_return_types",
+        """    OrderedDict[str, torch.Tensor],
+    OrderedDict[str, torch.Tensor],
+    OrderedDict[str, torch.Tensor] | None,
+    dict[str, Any],
+]:
+""",
+        """    OrderedDict[str, torch.Tensor],
+    OrderedDict[str, torch.Tensor],
+    OrderedDict[str, torch.Tensor] | None,
+    Mapping[str, Any],
+    Mapping[str, Any],
+    dict[str, Any],
+]:
+""",
+    ),
+    _PatchUnit(
+        "prepared_optimizer_canonicalization",
+        """    generator_names = _optimizer_names_for_schema(
+        generator_optimizer_state, generator_schema, role="generator"
+    )
+    fake_names = _optimizer_names_for_schema(
+        fake_score_optimizer_state, fake_score_schema, role="fake_score"
+    )
+    validate_stage2_full_optimizer_state(
+        generator_optimizer_state,
+""",
+        """    canonical_generator_optimizer = _canonicalize_stage2_optimizer_state(
+        generator_optimizer_state,
+        generator_schema,
+        role="generator",
+    )
+    canonical_fake_optimizer = _canonicalize_stage2_optimizer_state(
+        fake_score_optimizer_state,
+        fake_score_schema,
+        role="fake_score",
+    )
+    generator_names = _optimizer_names_for_schema(
+        canonical_generator_optimizer, generator_schema, role="generator"
+    )
+    fake_names = _optimizer_names_for_schema(
+        canonical_fake_optimizer, fake_score_schema, role="fake_score"
+    )
+    validate_stage2_full_optimizer_state(
+        canonical_generator_optimizer,
+""",
+    ),
+    _PatchUnit(
+        "prepared_fake_optimizer_validation",
+        """    validate_stage2_full_optimizer_state(
+        fake_score_optimizer_state,
+        role="fake_score",
+""",
+        """    validate_stage2_full_optimizer_state(
+        canonical_fake_optimizer,
+        role="fake_score",
+""",
+    ),
+    _PatchUnit(
+        "prepared_optimizer_return",
+        """    return raw_g, raw_f, ema, _validate_topology(topology)
+
+
+def _optimizer_names_for_schema(
+""",
+        """    return (
+        raw_g,
+        raw_f,
+        ema,
+        canonical_generator_optimizer,
+        canonical_fake_optimizer,
+        _validate_topology(topology),
+    )
+
+
+def _optimizer_names_for_schema(
+""",
+    ),
+    _PatchUnit(
+        "optimizer_payload_schema_mapping",
+        """    names = _optimizer_names(optimizer_state)
+    mapped: set[str] = set()
+    for name in names:
+        matches = [
+            key
+            for key, spec in schema.items()
+            if name == spec.raw_parameter_name
+            or name.endswith(f".{spec.raw_parameter_name}")
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Stage-2 {role} optimizer parameter {name!r} does not map "
+                f"uniquely to the role schema: {matches}"
+            )
+        mapped.add(matches[0])
+    if mapped != set(schema) or len(names) != len(schema):
+        raise ValueError(f"Stage-2 {role} optimizer role/schema mapping is incomplete")
+    return names
+""",
+        """    names = _optimizer_names(optimizer_state)
+    mapping = _map_parameter_names_to_schema_raw(
+        names,
+        schema,
+        role=role,
+        label="optimizer payload names",
+    )
+    return tuple(mapping[name] for name in names)
+""",
+    ),
+    _PatchUnit(
+        "prepared_optimizer_unpack",
+        """        raw_g, raw_f, ema, audited_topology = _validate_prepared_payloads(
+""",
+        """        (
+            raw_g,
+            raw_f,
+            ema,
+            generator_optimizer_state,
+            fake_score_optimizer_state,
+            audited_topology,
+        ) = _validate_prepared_payloads(
 """,
     ),
 )
@@ -584,6 +1383,27 @@ def _transform_runtime_source(
     )
 
 
+def _transform_parameter_names_source(source: str) -> TransformResult:
+    if source == _PARAMETER_NAMES_SOURCE:
+        changed = False
+    elif source == "":
+        changed = True
+    else:
+        raise HotfixError("unrecognized or partial utils/parameter_names.py")
+    try:
+        tree = ast.parse(_PARAMETER_NAMES_SOURCE, filename="utils/parameter_names.py")
+        compile(tree, "utils/parameter_names.py", "exec")
+    except (SyntaxError, ValueError) as error:
+        raise HotfixError(
+            f"bundled parameter-name resolver is invalid: {error}"
+        ) from error
+    return TransformResult(
+        source=_PARAMETER_NAMES_SOURCE,
+        changed=changed,
+        changed_units=("utils/parameter_names.py:create",) if changed else (),
+    )
+
+
 def transform_stage2_runtime_sources(
     sources: Mapping[str, str],
 ) -> dict[str, TransformResult]:
@@ -592,6 +1412,11 @@ def transform_stage2_runtime_sources(
     required = {
         "model/stage2_dmd.py",
         "trainer/stage2_distillation.py",
+        "utils/distributed.py",
+        "utils/lora_utils.py",
+        "utils/parameter_names.py",
+        "utils/stage2_checkpoint.py",
+        "utils/stage2_fsdp2.py",
         "utils/stage2_metrics.py",
         "scripts/plot_stage2_training.py",
     }
@@ -609,6 +1434,29 @@ def transform_stage2_runtime_sources(
             "trainer/stage2_distillation.py",
             sources["trainer/stage2_distillation.py"],
             _TRAINER_PATCH_UNITS,
+        ),
+        "utils/distributed.py": _transform_runtime_source(
+            "utils/distributed.py",
+            sources["utils/distributed.py"],
+            _DISTRIBUTED_PATCH_UNITS,
+        ),
+        "utils/lora_utils.py": _transform_runtime_source(
+            "utils/lora_utils.py",
+            sources["utils/lora_utils.py"],
+            _LORA_PATCH_UNITS,
+        ),
+        "utils/parameter_names.py": _transform_parameter_names_source(
+            sources["utils/parameter_names.py"]
+        ),
+        "utils/stage2_checkpoint.py": _transform_runtime_source(
+            "utils/stage2_checkpoint.py",
+            sources["utils/stage2_checkpoint.py"],
+            _STAGE2_CHECKPOINT_PATCH_UNITS,
+        ),
+        "utils/stage2_fsdp2.py": _transform_runtime_source(
+            "utils/stage2_fsdp2.py",
+            sources["utils/stage2_fsdp2.py"],
+            _STAGE2_FSDP2_PATCH_UNITS,
         ),
         "utils/stage2_metrics.py": _transform_runtime_source(
             "utils/stage2_metrics.py",
@@ -679,6 +1527,15 @@ expected_source = Path(sys.argv[2]).resolve()
 sys.path.insert(0, str(root))
 from model.stage2_dmd import Stage2DMD
 from trainer.stage2_distillation import _audit_stage2_dmd_runtime_api
+from utils.distributed import TrainableShardedEMA
+from utils.parameter_names import (
+    STAGE2_PARAMETER_NAME_API_VERSION,
+    map_parameter_names_to_expected,
+)
+from utils.stage2_checkpoint import (
+    _canonicalize_stage2_optimizer_state,
+    _optimizer_state_for_runtime,
+)
 
 actual_source = Path(inspect.getsourcefile(Stage2DMD) or "<unknown>").resolve()
 if actual_source != expected_source:
@@ -686,9 +1543,31 @@ if actual_source != expected_source:
         f"Stage2DMD loaded from unexpected source: {actual_source} != {expected_source}"
     )
 audit = _audit_stage2_dmd_runtime_api(Stage2DMD)
+if STAGE2_PARAMETER_NAME_API_VERSION != "longlive_stage2_parameter_names/v1":
+    raise RuntimeError("Stage-2 parameter-name API version mismatch")
+mapping = map_parameter_names_to_expected(
+    ("model.base_model.model.block.lora_A.default.weight",),
+    ("base_model.model.block.lora_A.default.weight",),
+    label="Stage-2 hotfix probe",
+)
+if mapping != {
+    "model.base_model.model.block.lora_A.default.weight":
+        "base_model.model.block.lora_A.default.weight"
+}:
+    raise RuntimeError("Stage-2 parameter-name resolver probe failed")
+if "expected_parameter_names" not in inspect.signature(TrainableShardedEMA).parameters:
+    raise RuntimeError("TrainableShardedEMA lacks schema-aware names")
+if not callable(_canonicalize_stage2_optimizer_state) or not callable(
+    _optimizer_state_for_runtime
+):
+    raise RuntimeError("Stage-2 optimizer name transforms are unavailable")
 print(
     "STAGE2_DMD_RUNTIME_API=PASS "
     f"version={audit['api_version']} source={audit['source_file']}"
+)
+print(
+    "STAGE2_PARAMETER_NAMES_API=PASS "
+    f"version={STAGE2_PARAMETER_NAME_API_VERSION}"
 )
 """
     environment = os.environ.copy()
@@ -731,6 +1610,11 @@ def apply_stage2_innernet_hotfix(
     relative_paths = (
         "model/stage2_dmd.py",
         "trainer/stage2_distillation.py",
+        "utils/distributed.py",
+        "utils/lora_utils.py",
+        "utils/parameter_names.py",
+        "utils/stage2_checkpoint.py",
+        "utils/stage2_fsdp2.py",
         "utils/stage2_metrics.py",
         "scripts/plot_stage2_training.py",
     )
@@ -740,7 +1624,16 @@ def apply_stage2_innernet_hotfix(
     modes: dict[str, int] = {}
     for relative, target in targets.items():
         if not target.is_file():
-            raise HotfixError(f"Stage-2 runtime source does not exist: {target}")
+            if (
+                relative != "utils/parameter_names.py"
+                or target.exists()
+                or target.is_symlink()
+            ):
+                raise HotfixError(f"Stage-2 runtime source does not exist: {target}")
+            originals[relative] = b""
+            sources[relative] = ""
+            modes[relative] = 0o644
+            continue
         original = target.read_bytes()
         try:
             source = original.decode("utf-8")
@@ -779,9 +1672,10 @@ def apply_stage2_innernet_hotfix(
     written: list[str] = []
     if changed_files:
         for relative in changed_files:
-            backup_by_file[relative] = _write_backup(
-                targets[relative], originals[relative]
-            )
+            if originals[relative]:
+                backup_by_file[relative] = _write_backup(
+                    targets[relative], originals[relative]
+                )
         try:
             for relative in changed_files:
                 _atomic_replace(
@@ -797,9 +1691,12 @@ def apply_stage2_innernet_hotfix(
             rollback_failures = []
             for relative in reversed(written):
                 try:
-                    _atomic_replace(
-                        targets[relative], originals[relative], modes[relative]
-                    )
+                    if originals[relative]:
+                        _atomic_replace(
+                            targets[relative], originals[relative], modes[relative]
+                        )
+                    else:
+                        targets[relative].unlink()
                 except OSError as rollback_error:
                     rollback_failures.append(f"{relative}: {rollback_error}")
             details = (

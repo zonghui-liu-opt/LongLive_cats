@@ -22,6 +22,11 @@ CURRENT_RUNTIME_SOURCES = {
     for relative in (
         "model/stage2_dmd.py",
         "trainer/stage2_distillation.py",
+        "utils/distributed.py",
+        "utils/lora_utils.py",
+        "utils/parameter_names.py",
+        "utils/stage2_checkpoint.py",
+        "utils/stage2_fsdp2.py",
         "utils/stage2_metrics.py",
         "scripts/plot_stage2_training.py",
     )
@@ -177,6 +182,28 @@ def _legacy_timing_sources() -> dict[str, str]:
     return sources
 
 
+def _legacy_naming_sources() -> dict[str, str]:
+    sources = dict(CURRENT_RUNTIME_SOURCES)
+    patch_units = {
+        "trainer/stage2_distillation.py": tuple(
+            unit
+            for unit in hotfix_module._TRAINER_PATCH_UNITS
+            if unit.name == "generator_ema_schema_names"
+        ),
+        "utils/distributed.py": hotfix_module._DISTRIBUTED_PATCH_UNITS,
+        "utils/lora_utils.py": hotfix_module._LORA_PATCH_UNITS,
+        "utils/stage2_checkpoint.py": hotfix_module._STAGE2_CHECKPOINT_PATCH_UNITS,
+        "utils/stage2_fsdp2.py": hotfix_module._STAGE2_FSDP2_PATCH_UNITS,
+    }
+    for relative, units in patch_units.items():
+        source = sources[relative]
+        for unit in reversed(units):
+            assert source.count(unit.current) == 1, (relative, unit.name)
+            source = source.replace(unit.current, unit.legacy, 1)
+        sources[relative] = source
+    return sources
+
+
 def test_transform_exact_legacy_source_to_current_source():
     result = transform_stage2_dmd_source(_legacy_model_source())
 
@@ -234,6 +261,38 @@ def test_phase21_timing_sources_are_patched_together_and_idempotently(tmp_path: 
         "scripts/plot_stage2_training.py",
     )
     assert len(first.backup_paths) == 3
+    for relative, expected in CURRENT_RUNTIME_SOURCES.items():
+        assert (tmp_path / relative).read_text(encoding="utf-8") == expected
+
+    second = apply_stage2_innernet_hotfix(tmp_path, verify_runtime=False)
+    assert second.status == "ALREADY_APPLIED"
+    assert second.changed_files == ()
+    assert second.backup_paths == ()
+
+
+def test_phase25_naming_sources_and_new_resolver_are_patched_as_one_transaction(
+    tmp_path: Path,
+):
+    legacy_sources = _legacy_naming_sources()
+    _write_fixture(
+        tmp_path,
+        CURRENT_MODEL_SOURCE,
+        runtime_sources=legacy_sources,
+    )
+    (tmp_path / "utils" / "parameter_names.py").unlink()
+
+    first = apply_stage2_innernet_hotfix(tmp_path, verify_runtime=False)
+
+    assert first.status == "PATCHED"
+    assert first.changed_files == (
+        "trainer/stage2_distillation.py",
+        "utils/distributed.py",
+        "utils/lora_utils.py",
+        "utils/parameter_names.py",
+        "utils/stage2_checkpoint.py",
+        "utils/stage2_fsdp2.py",
+    )
+    assert len(first.backup_paths) == 5
     for relative, expected in CURRENT_RUNTIME_SOURCES.items():
         assert (tmp_path / relative).read_text(encoding="utf-8") == expected
 
@@ -331,6 +390,7 @@ def test_cli_check_verifies_current_checkout_runtime_api():
     assert completed.returncode == 0, completed.stderr
     assert "STAGE2_INNERNET_HOTFIX=ALREADY_APPLIED" in completed.stdout
     assert "STAGE2_DMD_RUNTIME_API=PASS" in completed.stdout
+    assert "STAGE2_PARAMETER_NAMES_API=PASS" in completed.stdout
 
 
 def test_innernet_runbooks_publish_the_same_no_git_repair_command():
@@ -342,6 +402,7 @@ def test_innernet_runbooks_publish_the_same_no_git_repair_command():
         text = runbook.read_text(encoding="utf-8")
         assert "scripts/apply_stage2_innernet_hotfix.py" in text
         assert "STAGE2_DMD_RUNTIME_API=PASS" in text
+        assert "STAGE2_PARAMETER_NAMES_API=PASS" in text
         assert "STAGE2_INNERNET_HOTFIX=PATCHED" in text
 
     trainer_source = (PROJECT_ROOT / "trainer" / "stage2_distillation.py").read_text(

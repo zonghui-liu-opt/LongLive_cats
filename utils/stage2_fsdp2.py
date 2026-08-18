@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from utils.lora_utils import LoraTensorSpec
+from utils.parameter_names import map_parameter_names_to_expected
 
 STAGE2_FSDP2_WORLD_SIZE = 8
 STAGE2_FSDP2_MESH_SHAPE = (8,)
@@ -391,6 +392,19 @@ def audit_stage2_fsdp2_role(
     frozen_tensor_count = 0
     global_frozen_parameters = 0
     canonical_keys: list[str] = []
+    runtime_to_raw: Mapping[str, str] = {}
+    raw_to_key: dict[str, str] = {}
+    if expected_schema is not None:
+        raw_to_key = {
+            spec.raw_parameter_name: key for key, spec in expected_schema.items()
+        }
+        if len(raw_to_key) != len(expected_schema):
+            raise ValueError(f"Stage-2 {role} schema has duplicate raw parameter names")
+        runtime_to_raw = map_parameter_names_to_expected(
+            (name for name, _ in trainable),
+            raw_to_key,
+            label=f"Stage-2 {role} post-FSDP LoRA",
+        )
     for name, parameter in named_parameters:
         if not isinstance(parameter, DTensor):
             raise RuntimeError(f"Stage-2 {role} parameter is not DTensor: {name}")
@@ -422,17 +436,7 @@ def audit_stage2_fsdp2_role(
         if parameter.dtype != torch.float32:
             raise TypeError(f"Stage-2 {role} LoRA DTensor must remain FP32: {name}")
         assert expected_schema is not None
-        matches = [
-            key
-            for key, spec in expected_schema.items()
-            if name.endswith(spec.raw_parameter_name)
-            or name.endswith(f".{spec.raw_parameter_name}")
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"Stage-2 {role} post-FSDP parameter does not map to schema: {name}"
-            )
-        key = matches[0]
+        key = raw_to_key[runtime_to_raw[name]]
         if tuple(parameter.shape) != tuple(expected_schema[key].global_shape):
             raise RuntimeError(f"Stage-2 {role} global LoRA shape mismatch: {key}")
         canonical_keys.append(key)

@@ -135,6 +135,7 @@ require_runtime() {
   [[ -f "$SCRIPT_ROOT/train.py" ]] || fail "缺少train.py"
   "$STAGE2_PYTHON" -I -B - "$SCRIPT_ROOT" <<'PY'
 from pathlib import Path
+import inspect
 import sys
 
 project_root = Path(sys.argv[1]).resolve(strict=True)
@@ -142,6 +143,15 @@ sys.path.insert(0, str(project_root))
 
 from model.stage2_dmd import Stage2DMD
 from trainer.stage2_distillation import _audit_stage2_dmd_runtime_api
+from utils.distributed import TrainableShardedEMA
+from utils.parameter_names import (
+    STAGE2_PARAMETER_NAME_API_VERSION,
+    map_parameter_names_to_expected,
+)
+from utils.stage2_checkpoint import (
+    _canonicalize_stage2_optimizer_state,
+    _optimizer_state_for_runtime,
+)
 
 audit = _audit_stage2_dmd_runtime_api(Stage2DMD)
 expected_source = (project_root / "model" / "stage2_dmd.py").resolve(strict=True)
@@ -154,6 +164,25 @@ if actual_source != expected_source:
 print(
     "STAGE2_DMD_RUNTIME_API=PASS "
     f"version={audit['api_version']} source={actual_source}"
+)
+if STAGE2_PARAMETER_NAME_API_VERSION != "longlive_stage2_parameter_names/v1":
+    raise SystemExit("Stage-2参数命名API版本不匹配")
+mapping = map_parameter_names_to_expected(
+    ("model.base_model.model.block.lora_A.default.weight",),
+    ("base_model.model.block.lora_A.default.weight",),
+    label="Stage-2 launch probe",
+)
+if len(mapping) != 1:
+    raise SystemExit("Stage-2参数命名映射探针失败")
+if "expected_parameter_names" not in inspect.signature(TrainableShardedEMA).parameters:
+    raise SystemExit("Stage-2 EMA缺少schema命名接口")
+if not callable(_canonicalize_stage2_optimizer_state) or not callable(
+    _optimizer_state_for_runtime
+):
+    raise SystemExit("Stage-2 optimizer缺少双向命名转换")
+print(
+    "STAGE2_PARAMETER_NAMES_API=PASS "
+    f"version={STAGE2_PARAMETER_NAME_API_VERSION}"
 )
 PY
 }

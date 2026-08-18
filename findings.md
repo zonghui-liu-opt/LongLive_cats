@@ -495,3 +495,43 @@
 - 最终文档复核无P0；已明确score连续sigma与rollout UniPC是独立契约、Stage‑1 negative prompt精确hash、F/G独立sample stream、global-mean梯度等价及B1十点概率序列。
 - 可视化终点和phase marker必须京eresolved config推导：A24纯DMD为G240/F1200，完整A24+B4为G280/F1400，partial/preflight仍可绘制但不可伪装complete。
 - 压缩适配的child raw G/EMA均从parent EMA启动，F从parent raw启动；branch/control成对使用A8+B2或A12+B2。W24 inference-only只是OOD full-context reference，不是质量上界。
+# 2026-08-18 Phase 22：OOM首始证据
+
+- 异常不是初始化OOM，也不是fake/real score路径OOM；它发生在rollout调用generator第5B transformer block前，FSDP2为该block执行all-gather/unshard并尝试申请318 MiB。
+- 失败瞬间单卡79.19 GiB中只剩273.06 MiB；同一rank进程占78.91 GiB，PyTorch已分配69.91 GiB，缓存池保留但未分配7.11 GiB。因此“只需要22.9G”不能代表该rollout时刻的真实峰值。
+- 7.11 GiB reserved-but-unallocated说明allocator碎片/分段可能是直接触发条件，但69.91 GiB live allocated也证明工作集本身已经很高；不能只用`empty_cache()`或把22.9G当容量依据。
+- 8卡FSDP2不是把8张80GB拼成640GB统一显存：三角色参数各自分片，但当前block会在每个rank本地all-gather，rollout activation、24帧的3个chunk输出图、self/cross-KV及allocator临时buffer仍需单卡容纳。Generator activation checkpoint因cache正确性明确关闭，micro2会把这些激活近似翻倍。
+- OOM记录显示GPU总量减去当前进程占用仅约0.28 GiB，与报告的0.267 GiB free一致；没有证据支持另一个进程占了大块显存。rank3只是最先报告失败的rank。
+- trainer每个logical substep先`reset_peak_memory_stats()`，成功后才采集/写入max memory；CUDA OOM不属于其可恢复nonfinite分支，会直接越过指标写入。因此22.9 GiB若来自最后一条JSONL，代表上一条成功F/no-grad子步，而非失败rollout；若来自`nvidia-smi`，则只是采样瞬间。
+- 79.19 GiB的门禁上限分别为allocated约67.31 GiB、reserved约71.27 GiB、free至少8 GiB；当前69.91 GiB allocated、约77.02 GiB reserved、0.267 GiB free即使不抛OOM也必须拒绝micro2。
+- 唯一首选回退是micro1×8×acc8，仍为global batch64；新config需要重新prepare绑定launch hash，并在全新smoke目录完整重跑C0/C1/C2。`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`可减少动态shape/多阶段分配碎片，但不能替代micro1。micro1仍失败才允许Generator grad-exit `save_on_cpu`候选。
+
+# 2026-08-18 Phase 23：重复附件首始判断
+
+- 新附件不是prepare/manifest/launch-hash异常，而是与Phase 22逐项相同的5B Generator FSDP2 OOM；说明prepare成功后仍启动了一个无法通过显存门禁的候选。
+- 最可能的操作原因是只运行默认`bash run_stage2_h100.sh prepare/smoke`，或生成micro1配置后换了shell，导致`STAGE2_CONFIG`未继承，wrapper重新使用仓库默认micro2×acc4。必须在昂贵smoke前打印resolved microbatch/accumulation/global batch作为自证。
+- 源码确认wrapper的`${STAGE2_CONFIG:-canonical}`和默认`smoke_micro2_acc4`正是上述回退；`ACTIVE_CONFIG`每次启动都从`STAGE2_CONFIG`重建，因此在另一个shell只导出`ACTIVE_CONFIG`也不够，必须导出`STAGE2_CONFIG`。
+- `prepare=PASS`绑定的是当次resolved config的launch hash；切micro1后必须再次执行wrapper `prepare`。只改YAML后直接沿用旧prepare证据会被严格复验拒绝或造成操作者误判。
+
+# 2026-08-18 Phase 24：EMA名字异常首始证据
+
+- 精确字符串`EMA parameter names mismatch`只在portable EMA state validator中出现，不是optimizer或模型forward报错。异常意味着EMA状态里记录的local/global shape名字集合与当前模型提供的parameter_names集合不完全相等。
+- 需要完整trace区分两条路径：首次G update后的EMA内部自检，或C1/C2从C0/C1 checkpoint加载rank-local EMA state；二者根因和修复边界不同。
+- 代码路径已证明C0即可触发：`build_lora_shard_schema(wrapper.model)`保存内层PEFT raw names；`TrainableShardedEMA(self.model.generator)`遍历外层Stage2DiTRole并给每个名字增加`model.`；`save_stage2_checkpoint`在rank-local EMA clock audit处要求EMA names等于schema raw names。
+- `utils/lora_utils.py`的FSDP2导出早已正确允许`current == schema`或`current.endswith('.'+schema)`，说明wrapper前缀是预期运行时现象；EMA没有复用这条schema-aware映射才是缺口。不能简单全局删除字符串`model.`，因为PEFT合法名字自身包含`base_model.model.`，粗暴replace会损坏语义并可能碰撞。
+- 真实PEFT最小反例不依赖FSDP即可稳定复现：`base_model.model.block...`对`model.base_model.model.block...`，missing/extra正好是一一加前缀关系。FSDP prefix cleanup不会移除Stage2 role的业务字段`model.`，因此8卡行为相同。
+- 当前简化EMA测试在同一对象上同时构造schema/EMA，Stage2 checkpoint fixture又手工令两套名字相同；没有覆盖外层Stage2DiTRole+内层PeftModel的真实组合，是本地回归全绿而H100 C0暴露问题的具体原因。
+
+# 2026-08-18 Phase 25：统一参数命名契约
+
+- 本轮目标不是放宽`EMA parameter names mismatch`校验，而是让Stage-2所有持久化状态都使用pre-FSDP LoRA schema的`raw_parameter_name`作为唯一规范名。
+- 运行时对象允许存在Stage2业务wrapper和FSDP/checkpoint/compiler wrapper前缀，但到schema边界必须通过精确相等或唯一`.`后缀映射；任何0匹配或多匹配都必须在训练/保存前失败。
+- 必须审计的消费者包括EMA、optimizer DCP、LoRA raw gather/load、checkpoint C0/C1/C2、resume和Stage-2 inference；不得假设修复EMA即可代表其他路径安全。
+- 首轮全仓清单确认optimizer也跨越同一边界：`audit_stage2_lora_optimizer()`接受外层运行时FQN并只验证其可唯一映射到schema；DCP full state因此仍可能以外层FQN持久化。`validate_stage2_checkpoint()`默认又用optimizer FQN校验rank EMA名字。若只把EMA改为schema名，C0发布后的checkpoint复验仍会再次发生names mismatch。
+- `stage2_fsdp2.audit_stage2_fsdp2_role()`、optimizer audit、checkpoint optimizer-schema mapping和LoRA gather各自复制了相似但不完全一致的后缀逻辑；必须收敛到同一公共resolver，消除无点分隔endswith、重复匹配与错误消息漂移。
+- 统一矩阵：`LoraTensorSpec`的mapping key是canonical adapter key，`raw_parameter_name`是pre-FSDP inner PEFT FQN；训练runtime FQN可在其前增加`model.`及技术wrapper；DCP只在调用PyTorch API时需要runtime FQN，写盘前应规范为raw FQN、恢复前再严格映射回当前runtime FQN；generator EMA topology/shadow同样只写raw FQN。
+- Stage-2 inference从`generator_ema.safetensors`读取canonical adapter key并在新建PEFT模型上strict load/merge，不依赖EMA/optimizer raw FQN，因此无需改变推理artifact格式；只需保证训练checkpoint生成的canonical adapter本身不回归。
+- EMA兼容策略无需升级payload schema：新checkpoint所有topology/shadow key均为schema raw FQN；加载旧payload时先用当前expected schema做全量双射重命名，再执行原schema version 2的shape/mesh/shadow严格校验，既兼容旧外层前缀又不放宽内容门禁。
+- optimizer兼容策略同理：任何传入DCP state先规范为schema raw FQN并验证moments/step/hyperparameters；仅在`set_optimizer_state_dict`前映射到当前module runtime FQN。写盘始终canonical，旧wrapper-prefixed checkpoint仍可resume。
+- 启动期现在有两层防混版：hotfix隔离probe同时验证DMD callback/timing与parameter-name API；H100 wrapper在任何torchrun前再次验证resolver样例、`TrainableShardedEMA.expected_parameter_names`及optimizer双向转换函数。缺任一文件会在8卡模型构造前失败。
+- 完整回归证据：Stage-2 694 passed；全tests 997 passed、2 subtests passed。唯一全工作树whitespace失败来自用户原有600clip metadata，不属于代码补丁且未触碰。

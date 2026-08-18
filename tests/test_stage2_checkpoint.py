@@ -15,6 +15,7 @@ from utils.stage2_checkpoint import (
     capture_stage2_rng_state,
     consolidate_stage2_lora_shards,
     derive_stage2_phase_state,
+    gather_stage2_optimizer_state,
     restore_stage2_optimizer_state,
     restore_stage2_rng_state,
     validate_stage2_cycle_boundary,
@@ -310,6 +311,12 @@ class TinyRole(torch.nn.Module):
         self.lora_B = torch.nn.Parameter(torch.ones(4, 2, dtype=torch.float32))
 
 
+class OuterTinyRole(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = TinyRole()
+
+
 def _tiny_optimizer_state(step: int = 5):
     names = ("lora_A", "lora_B")
     return {
@@ -459,6 +466,103 @@ def test_optimizer_restore_interface_broadcasts_then_audits_local_moments():
     assert calls[0][0] is state
     assert all(
         parameter in optimizer.state for parameter in (module.lora_A, module.lora_B)
+    )
+
+
+def test_optimizer_gather_canonicalizes_outer_runtime_fqns_to_schema_names():
+    module = OuterTinyRole()
+    optimizer = torch.optim.AdamW(
+        [module.model.lora_A, module.model.lora_B],
+        lr=2e-6,
+        betas=(0.0, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
+    for parameter in optimizer.param_groups[0]["params"]:
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    schema = {
+        "lora_A.weight": LoraTensorSpec("lora_A", (2, 3), torch.float32),
+        "lora_B.weight": LoraTensorSpec("lora_B", (4, 2), torch.float32),
+    }
+    runtime_state = _tiny_optimizer_state(step=1)
+    runtime_state["state"] = {
+        f"model.{name}": value for name, value in runtime_state["state"].items()
+    }
+    runtime_state["param_groups"][0]["params"] = ["model.lora_A", "model.lora_B"]
+
+    operations = Stage2CollectiveOps(
+        get_rank=lambda: 0,
+        get_world_size=lambda: 8,
+        barrier=lambda: None,
+        consensus=lambda success: success,
+        broadcast_object=lambda value, src: value,
+    )
+    gathered = gather_stage2_optimizer_state(
+        module,
+        optimizer,
+        role="generator",
+        expected_schema=schema,
+        expected_completed_updates=1,
+        collectives=operations,
+        get_optimizer_state_dict_fn=lambda *args, **kwargs: runtime_state,
+        options_factory=lambda **kwargs: kwargs,
+    )
+
+    assert set(gathered["state"]) == {"lora_A", "lora_B"}
+    assert gathered["param_groups"][0]["params"] == ["lora_A", "lora_B"]
+
+
+def test_optimizer_restore_maps_canonical_checkpoint_names_to_outer_runtime_fqns():
+    module = OuterTinyRole()
+    optimizer = torch.optim.AdamW(
+        [module.model.lora_A, module.model.lora_B],
+        lr=2e-6,
+        betas=(0.0, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
+    schema = {
+        "lora_A.weight": LoraTensorSpec("lora_A", (2, 3), torch.float32),
+        "lora_B.weight": LoraTensorSpec("lora_B", (4, 2), torch.float32),
+    }
+    canonical_state = _tiny_optimizer_state(step=5)
+    installed_names = []
+
+    def set_state(model, target_optimizer, rank_state, *, options):
+        del options
+        installed_names.extend(rank_state["param_groups"][0]["params"])
+        parameters = dict(model.named_parameters())
+        for name, values in rank_state["state"].items():
+            target_optimizer.state[parameters[name]] = {
+                key: value.clone() if isinstance(value, torch.Tensor) else value
+                for key, value in values.items()
+            }
+
+    operations = Stage2CollectiveOps(
+        get_rank=lambda: 0,
+        get_world_size=lambda: 8,
+        barrier=lambda: None,
+        consensus=lambda success: success,
+        broadcast_object=lambda value, src: value,
+    )
+    restore_stage2_optimizer_state(
+        module,
+        optimizer,
+        canonical_state,
+        role="generator",
+        expected_schema=schema,
+        expected_completed_updates=5,
+        collectives=operations,
+        set_optimizer_state_dict_fn=set_state,
+        options_factory=lambda **kwargs: kwargs,
+    )
+
+    assert installed_names == ["model.lora_A", "model.lora_B"]
+    assert all(
+        parameter in optimizer.state
+        for parameter in (module.model.lora_A, module.model.lora_B)
     )
 
 
