@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 26 进行中：修复 C1 分布式 LoRA 恢复被 PEFT 0.19.1 无条件导入 Transformers tensor-parallel 模块阻断的问题，并扩展无 Git 热补丁、启动握手与回归覆盖。
+Phase 26 已完成：C1分布式LoRA恢复已脱离无关的PEFT/HF tensor-parallel可选导入，累计无Git热补丁、启动握手、完整回归与远端发布均已闭环。
 
 ## 各阶段
 
@@ -225,8 +225,8 @@ Phase 26 进行中：修复 C1 分布式 LoRA 恢复被 PEFT 0.19.1 无条件导
 - [x] 26.2 用不依赖PEFT tensor-parallel可选集成的严格LoRA恢复实现替换脆弱调用
 - [x] 26.3 扩展累计无Git热补丁、启动API握手和中文运行手册
 - [x] 26.4 增加缺失tensor-parallel模块、schema/value、C1 role resume与hotfix幂等回归
-- [ ] 26.5 运行聚焦、完整Stage-2、全仓与静态验收，精确提交并push `stage-2`
-- **Status:** in_progress
+- [x] 26.5 运行聚焦、完整Stage-2、全仓与静态验收，精确提交并push `stage-2`
+- **Status:** complete（Stage-2 694 passed；全仓998 passed、2 subtests；生产提交`c4202ca`已推送并由ls-remote核验）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？

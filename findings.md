@@ -7,6 +7,7 @@
 - PEFT 0.19.1在任何已初始化`torch.distributed`进程中处理LoRA state时都会进入`_maybe_shard_state_dict_for_tp()`，并在检查模型是否真的使用HF tensor parallel之前无条件导入`transformers.integrations.tensor_parallel`。内网Transformers不含该模块，所以8个rank一致失败；本项目使用FSDP2而非HF tensor parallel，这个导入与实际恢复无关。
 - 仅升级Transformers会改变Wan/diffusers/tokenizers整套运行依赖，且内网环境不一定可联网；仅降级PEFT又会改变已验证的LoRA注入语义。更安全的修复是让项目的严格LoRA loader把canonical A/B key一一映射到已存在的default-adapter runtime parameter key，执行完整schema/shape/dtype/finite/loaded-value校验后用PyTorch原生load，完全不调用PEFT的可选HF-TP恢复分支。
 - 新loader必须只允许未FSDP/未DTensor的pre-shard模型，并继续拒绝missing/extra/duplicate/nonfinite/shape/dtype错误；这与C1 role初始化和inference merge的实际调用时点一致，不得通过捕获`ModuleNotFoundError`后静默跳过加载。
+- 修复已发布到`longlive-cats/stage-2`提交`c4202ca0d71c6a5712c98f7091ac76dc240a5ed5`；内网只需同步最新版累计hotfix脚本，确认新增`STAGE2_LORA_LOAD_API=PASS`后可直接重跑C1并复用已严格验证的C0 checkpoint。
 
 ## 2026-08-17 Phase 21：timing closure 首始证据
 

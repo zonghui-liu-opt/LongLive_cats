@@ -3,7 +3,7 @@
 ## 会话：2026-08-18（Phase 26）
 
 ### C1分布式LoRA恢复依赖兼容修复
-- **状态：** in_progress
+- **状态：** complete（代码、无Git热补丁、全回归与远端发布均完成；真实C1 8×H100复验待内网执行）
 - 用户报告C0 PASS、C1在generator role构建/恢复阶段8 rank统一报`ModuleNotFoundError: transformers.integrations.tensor_parallel`。
 - 已确认失败发生在C1专属的raw adapter恢复：`stage2_role_init -> strict_load_lora_state_dict -> peft.set_peft_model_state_dict -> _maybe_shard_state_dict_for_tp`；训练子步尚未开始。
 - 本地PEFT 0.19.1源码证明其在distributed initialized时先无条件导入HF tensor-parallel集成，再检查LoRA base是否存在TP plan；内网旧Transformers因此即使项目只用FSDP2也会失败。
@@ -16,6 +16,7 @@
 - 首次静态检查仅报告3个本轮Python文件需Black机械格式化；Ruff/py_compile/bash链因`&&`在Black处按预期停止，格式化后将完整重跑而不把未执行项记录为通过。
 - Black机械格式化后同步hotfix current指纹；hotfix+缺模块回归11 passed，Black、Ruff、py_compile与`bash -n`全部通过。
 - 全仓正式`python -m pytest -q tests`为998 passed、2 subtests passed、14条既有TorchScript弃用warning；相较Phase 25新增的唯一测试即缺失HF tensor-parallel模块的distributed-safe LoRA恢复回归。
+- 精确暂存11个任务文件，用户metadata/checkpoints/tmp/results/Stage-1脚本与动作CSV均未进入提交；生产提交`c4202ca0d71c6a5712c98f7091ac76dc240a5ed5`已push `longlive-cats/stage-2`，`git ls-remote`返回同一SHA。
 
 ## 会话：2026-08-18（Phase 25）
 
