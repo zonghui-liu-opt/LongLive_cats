@@ -54,9 +54,9 @@ export LONG_LIVE_STAGE2_T5_CHECKPOINT="$ARCH_ROOT/models_t5_umt5-xxl-enc-bf16.pt
 export LONG_LIVE_STAGE2_TOKENIZER_DIR="$ARCH_ROOT/google/umt5-xxl"
 export LONG_LIVE_STAGE2_VAE_CHECKPOINT="$ARCH_ROOT/Wan2.2_VAE.pth"
 
-# 一张空闲 H100；多张卡时同时修改这两个变量。
-export CUDA_VISIBLE_DEVICES=0
-export INFER_NPROC=1
+# 另一台节点有 8 张空闲 H100 时直接全部使用。
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export INFER_NPROC=8
 
 cd "$STAGE2_PROJECT_ROOT"
 
@@ -81,12 +81,26 @@ infer_one 000060
 infer_one 000070
 ```
 
-一张卡可以运行；多张空闲卡只负责分摊样本，每张卡仍会加载完整 Generator。例如 4 卡：
+### 2.1 使用另一台 8×H100 加速
+
+现有入口使用样本级数据并行。8 张卡会把 56 个样本平均分片，每张卡生成 7 个视频：
+
+```text
+56 个视频 ÷ 8 张卡 = 每张卡 7 个视频
+```
+
+视频总数仍为 56。每张卡都会加载完整 Generator，这不是把一个模型拆到 8 张卡上的模型并行。
+实际加速比还会受到模型加载、VAE 解码和共享存储读取速度影响。
+
+如果只想尽快查看最新效果，注释掉 `infer_one 000060`，仅用全部 8 卡执行：
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export INFER_NPROC=4
+infer_one 000070
 ```
+
+如果需要比较 G60/G70，推荐让两个 checkpoint 依次各用全部 8 卡。也可以在两个终端中分别使用
+GPU 0–3 跑 G60、GPU 4–7 跑 G70；两种方式的理想总耗时接近，但顺序使用 8 卡更简单，且共享
+存储的瞬时读取压力更小。不要让两个 8 卡任务同时占用同一组 GPU。
 
 ## 3. 为什么每个 checkpoint 生成 56 个视频
 
