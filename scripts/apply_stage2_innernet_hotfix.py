@@ -21,6 +21,7 @@ from pathlib import Path
 
 HOTFIX_API_VERSION = "longlive_stage2_dmd_runtime/v2"
 PARAMETER_NAME_API_VERSION = "longlive_stage2_parameter_names/v1"
+LORA_LOAD_API_VERSION = "longlive_stage2_lora_load/v1"
 _PARAMETER_NAMES_SOURCE = '''"""Fail-closed parameter-name mapping across transparent module wrappers."""
 
 from __future__ import annotations
@@ -672,6 +673,83 @@ from torch.distributed.fsdp import (
 
 
 _LORA_PATCH_UNITS = (
+    _PatchUnit(
+        "lora_load_api_version",
+        """_LORA_PARAMETER_MARKERS = (".lora_A.", ".lora_B.")
+_CANONICAL_LORA_KEY_MARKERS = (".lora_A.weight", ".lora_B.weight")
+
+
+@dataclass(frozen=True)
+""",
+        """_LORA_PARAMETER_MARKERS = (".lora_A.", ".lora_B.")
+_CANONICAL_LORA_KEY_MARKERS = (".lora_A.weight", ".lora_B.weight")
+STAGE2_LORA_LOAD_API_VERSION = "longlive_stage2_lora_load/v1"
+
+
+@dataclass(frozen=True)
+""",
+    ),
+    _PatchUnit(
+        "distributed_safe_lora_load_doc",
+        '''    """Strictly validate and load a complete canonical PEFT adapter state."""
+''',
+        '''    """Strictly load canonical default-adapter LoRA A/B tensors.
+
+    PEFT's generic loader probes Hugging Face tensor parallelism whenever a
+    distributed process group exists, even when this model uses only FSDP2.
+    That optional probe makes checkpoint resume depend on a Transformers
+    integration which is irrelevant to this project.  Stage-2 has a narrower
+    contract: one complete default LoRA adapter is loaded before FSDP wrapping.
+    Resolve that exact canonical/runtime bijection here and use PyTorch's
+    native partial state load while retaining the existing value audit.
+    """
+''',
+    ),
+    _PatchUnit(
+        "distributed_safe_lora_load",
+        """    incompatible = peft.set_peft_model_state_dict(lora_model, validated)
+    mismatched = list(getattr(incompatible, "mismatched_keys", []) or [])
+    unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+    if mismatched or unexpected:
+        raise ValueError(
+            "PEFT rejected adapter tensors: "
+            f"mismatched={mismatched}, unexpected={unexpected}"
+        )
+""",
+        """    runtime_by_canonical: dict[str, str] = {}
+    for runtime_name, _parameter in lora_model.named_parameters():
+        if not _is_lora_parameter_name(runtime_name):
+            continue
+        canonical_key = _canonical_key_from_parameter_name(runtime_name)
+        previous = runtime_by_canonical.get(canonical_key)
+        if previous is not None:
+            raise ValueError(
+                "canonical LoRA key maps to multiple runtime parameters: "
+                f"key={canonical_key!r}, parameters={[previous, runtime_name]}"
+            )
+        runtime_by_canonical[canonical_key] = runtime_name
+
+    expected_keys = set(validated)
+    runtime_keys = set(runtime_by_canonical)
+    if runtime_keys != expected_keys:
+        raise ValueError(
+            "canonical/runtime LoRA parameter mapping is incomplete: "
+            f"missing={sorted(expected_keys - runtime_keys)}, "
+            f"extra={sorted(runtime_keys - expected_keys)}"
+        )
+    runtime_state = OrderedDict(
+        (runtime_by_canonical[key], validated[key]) for key in sorted(validated)
+    )
+    incompatible = lora_model.load_state_dict(runtime_state, strict=False)
+    missing_adapter = sorted(set(incompatible.missing_keys).intersection(runtime_state))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+    if missing_adapter or unexpected:
+        raise ValueError(
+            "PyTorch rejected canonical LoRA adapter tensors: "
+            f"missing={missing_adapter}, unexpected={unexpected}"
+        )
+""",
+    ),
     _PatchUnit(
         "parameter_name_import",
         """from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -1528,6 +1606,10 @@ sys.path.insert(0, str(root))
 from model.stage2_dmd import Stage2DMD
 from trainer.stage2_distillation import _audit_stage2_dmd_runtime_api
 from utils.distributed import TrainableShardedEMA
+from utils.lora_utils import (
+    STAGE2_LORA_LOAD_API_VERSION,
+    strict_load_lora_state_dict,
+)
 from utils.parameter_names import (
     STAGE2_PARAMETER_NAME_API_VERSION,
     map_parameter_names_to_expected,
@@ -1561,6 +1643,12 @@ if not callable(_canonicalize_stage2_optimizer_state) or not callable(
     _optimizer_state_for_runtime
 ):
     raise RuntimeError("Stage-2 optimizer name transforms are unavailable")
+if STAGE2_LORA_LOAD_API_VERSION != "longlive_stage2_lora_load/v1":
+    raise RuntimeError("Stage-2 LoRA load API version mismatch")
+if "peft.set_peft_model_state_dict" in inspect.getsource(
+    strict_load_lora_state_dict
+):
+    raise RuntimeError("Stage-2 LoRA loader still depends on PEFT distributed TP")
 print(
     "STAGE2_DMD_RUNTIME_API=PASS "
     f"version={audit['api_version']} source={audit['source_file']}"
@@ -1568,6 +1656,10 @@ print(
 print(
     "STAGE2_PARAMETER_NAMES_API=PASS "
     f"version={STAGE2_PARAMETER_NAME_API_VERSION}"
+)
+print(
+    "STAGE2_LORA_LOAD_API=PASS "
+    f"version={STAGE2_LORA_LOAD_API_VERSION}"
 )
 """
     environment = os.environ.copy()

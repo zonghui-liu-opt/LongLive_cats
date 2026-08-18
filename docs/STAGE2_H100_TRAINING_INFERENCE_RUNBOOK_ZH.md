@@ -34,7 +34,8 @@ mkdir -p "$STAGE2_WORK_ROOT/logs" "$STAGE2_TRAIN_ROOT"
 ```
 
 若代码通过手工拷贝部署，且出现 `Stage-2 DMD runtime API mismatch`、
-`timing closure error exceeds` 或任意 `parameter names mismatch`，先只同步单文件
+`timing closure error exceeds`、任意 `parameter names mismatch` 或
+`No module named 'transformers.integrations.tensor_parallel'`，先只同步单文件
 `scripts/apply_stage2_innernet_hotfix.py`，再执行：
 
 ```bash
@@ -42,10 +43,11 @@ mkdir -p "$STAGE2_WORK_ROOT/logs" "$STAGE2_TRAIN_ROOT"
 ```
 
 该脚本不读取 Git：它累计修复 model callback API、trainer/metrics timing orchestration，以及
-EMA、optimizer、FSDP2、LoRA gather、checkpoint/resume 的统一参数命名契约，识别旧版、当前版及
+EMA、optimizer、FSDP2、LoRA gather/load、checkpoint/resume 的统一参数命名契约，识别旧版、当前版及
 混合版；全部源码先通过 compile/AST，全部备份完成后才事务替换，失败自动回滚，并用隔离
-Python 重新执行 model/timing 和 parameter-name runtime API audit。必须同时看到
-`STAGE2_DMD_RUNTIME_API=PASS`、`STAGE2_PARAMETER_NAMES_API=PASS` 和
+Python 重新执行 model/timing、parameter-name 和 distributed-safe LoRA load runtime API audit。必须同时看到
+`STAGE2_DMD_RUNTIME_API=PASS`、`STAGE2_PARAMETER_NAMES_API=PASS`、
+`STAGE2_LORA_LOAD_API=PASS` 和
 `STAGE2_INNERNET_HOTFIX=PATCHED`（重复执行则为
 `ALREADY_APPLIED`）；若报告 `FAIL`，目标文件不会被猜测性改写，应保留错误和备份路径排查。
 

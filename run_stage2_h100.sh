@@ -144,6 +144,10 @@ sys.path.insert(0, str(project_root))
 from model.stage2_dmd import Stage2DMD
 from trainer.stage2_distillation import _audit_stage2_dmd_runtime_api
 from utils.distributed import TrainableShardedEMA
+from utils.lora_utils import (
+    STAGE2_LORA_LOAD_API_VERSION,
+    strict_load_lora_state_dict,
+)
 from utils.parameter_names import (
     STAGE2_PARAMETER_NAME_API_VERSION,
     map_parameter_names_to_expected,
@@ -183,6 +187,16 @@ if not callable(_canonicalize_stage2_optimizer_state) or not callable(
 print(
     "STAGE2_PARAMETER_NAMES_API=PASS "
     f"version={STAGE2_PARAMETER_NAME_API_VERSION}"
+)
+if STAGE2_LORA_LOAD_API_VERSION != "longlive_stage2_lora_load/v1":
+    raise SystemExit("Stage-2 LoRA恢复API版本不匹配")
+if "peft.set_peft_model_state_dict" in inspect.getsource(
+    strict_load_lora_state_dict
+):
+    raise SystemExit("Stage-2 LoRA恢复仍依赖PEFT分布式tensor-parallel导入")
+print(
+    "STAGE2_LORA_LOAD_API=PASS "
+    f"version={STAGE2_LORA_LOAD_API_VERSION}"
 )
 PY
 }

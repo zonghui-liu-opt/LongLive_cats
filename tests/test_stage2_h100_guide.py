@@ -186,6 +186,7 @@ def test_stage2_h100_guide_keeps_release_safety_and_validation_order():
     assert "_audit_stage2_dmd_runtime_api" in text
     assert "STAGE2_DMD_RUNTIME_API=PASS" in text
     assert "STAGE2_PARAMETER_NAMES_API=PASS" in text
+    assert "STAGE2_LORA_LOAD_API=PASS" in text
     assert "expected_parameter_names" in text
     assert "_canonicalize_stage2_optimizer_state" in text
     assert 'project_root / "model" / "stage2_dmd.py"' in text

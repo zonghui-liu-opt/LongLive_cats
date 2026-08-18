@@ -1,5 +1,22 @@
 # 进度日志
 
+## 会话：2026-08-18（Phase 26）
+
+### C1分布式LoRA恢复依赖兼容修复
+- **状态：** in_progress
+- 用户报告C0 PASS、C1在generator role构建/恢复阶段8 rank统一报`ModuleNotFoundError: transformers.integrations.tensor_parallel`。
+- 已确认失败发生在C1专属的raw adapter恢复：`stage2_role_init -> strict_load_lora_state_dict -> peft.set_peft_model_state_dict -> _maybe_shard_state_dict_for_tp`；训练子步尚未开始。
+- 本地PEFT 0.19.1源码证明其在distributed initialized时先无条件导入HF tensor-parallel集成，再检查LoRA base是否存在TP plan；内网旧Transformers因此即使项目只用FSDP2也会失败。
+- 决策：不要求内网盲升整套依赖，改为项目自有fail-closed canonical LoRA A/B加载路径，并同步无Git累计hotfix、启动版本握手、runbook和回归测试。
+- 新LoRA loader回归7项已通过；首次hotfix联合测试发现新增API marker的legacy短片段也是current前缀，严格状态机正确拒绝且未写盘。已把指纹延长至`@dataclass`边界，下一轮验证幂等与旧版升级。
+- 已实现`longlive_stage2_lora_load/v1`：canonical key与runtime default-adapter A/B参数必须完整双射，再用原生`load_state_dict`写入并逐tensor复验；不调用PEFT generic distributed/TP恢复分支。
+- 累计hotfix会把旧loader、API marker和既有命名修复作为同一事务写入；wrapper与隔离probe新增`STAGE2_LORA_LOAD_API=PASS`，两份中文手册覆盖本次精确错误。
+- LoRA/hotfix/H100 wrapper联合32 passed；覆盖缺失HF tensor-parallel模块、旧源码升级、重复执行、回滚和现有schema/value反例。
+- checkpoint/role/inference/trainer/hotfix聚焦174 passed；完整Stage-2为694 passed、14条既有TorchScript弃用warning。
+- 首次静态检查仅报告3个本轮Python文件需Black机械格式化；Ruff/py_compile/bash链因`&&`在Black处按预期停止，格式化后将完整重跑而不把未执行项记录为通过。
+- Black机械格式化后同步hotfix current指纹；hotfix+缺模块回归11 passed，Black、Ruff、py_compile与`bash -n`全部通过。
+- 全仓正式`python -m pytest -q tests`为998 passed、2 subtests passed、14条既有TorchScript弃用warning；相较Phase 25新增的唯一测试即缺失HF tensor-parallel模块的distributed-safe LoRA恢复回归。
+
 ## 会话：2026-08-18（Phase 25）
 
 ### Stage-2参数命名契约系统修复

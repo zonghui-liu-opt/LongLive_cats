@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 25 已完成：Stage-2训练全生命周期统一使用pre-FSDP schema raw FQN，runtime wrapper/FSDP2、EMA、optimizer DCP、checkpoint/resume与inference边界均已严格映射；完整回归通过并发布stage-2。
+Phase 26 进行中：修复 C1 分布式 LoRA 恢复被 PEFT 0.19.1 无条件导入 Transformers tensor-parallel 模块阻断的问题，并扩展无 Git 热补丁、启动握手与回归覆盖。
 
 ## 各阶段
 
@@ -220,6 +220,14 @@ Phase 25 已完成：Stage-2训练全生命周期统一使用pre-FSDP schema raw
 - [x] 25.7 只提交本轮代码/测试/文档，push远端`stage-2`并核验commit
 - **Status:** complete（997 passed、2 subtests；生产提交`3551ed0`已推送并由ls-remote核验）
 
+### Phase 26：C1分布式LoRA恢复依赖兼容修复
+- [x] 26.1 定位C0/C1差异与PEFT/Transformers导入链，确认失败发生在pre-FSDP adapter恢复
+- [x] 26.2 用不依赖PEFT tensor-parallel可选集成的严格LoRA恢复实现替换脆弱调用
+- [x] 26.3 扩展累计无Git热补丁、启动API握手和中文运行手册
+- [x] 26.4 增加缺失tensor-parallel模块、schema/value、C1 role resume与hotfix幂等回归
+- [ ] 26.5 运行聚焦、完整Stage-2、全仓与静态验收，精确提交并push `stage-2`
+- **Status:** in_progress
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -283,6 +291,8 @@ Phase 25 已完成：Stage-2训练全生命周期统一使用pre-FSDP schema raw
 | Phase 25第二轮回归命令引用不存在的`tests/test_stage2_fsdp2.py` | 1 | 用`rg --files`确认实际覆盖在`test_stage2_init_only.py`，改用真实文件集合后129 passed |
 | Phase 25第二次只读组合命令的JavaScript包装遗漏模板字符串右括号 | 1 | shell未执行；修正包装后读取wrapper/runbook测试并继续 |
 | 全工作树`git diff --check`命中用户metadata原有CRLF/尾随空白 | 1 | 不修改用户数据；对本轮精确文件集及两个新文件分别执行whitespace门禁并通过 |
+| Phase 26热补丁版本marker的legacy短片段同时是current前缀，严格转换器报告legacy/current各1次 | 1 | 扩展精确指纹到后续`@dataclass`结构边界，消除包含关系而不放宽识别规则 |
+| Phase 26首次Black check要求格式化LoRA loader、hotfix和回归测试 | 1 | 仅机械格式化这3个本轮文件，并重新验证hotfix精确current指纹与幂等性 |
 
 ## 备注
 - 重大决策前重新读取本计划。

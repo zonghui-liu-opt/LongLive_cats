@@ -391,6 +391,7 @@ def test_cli_check_verifies_current_checkout_runtime_api():
     assert "STAGE2_INNERNET_HOTFIX=ALREADY_APPLIED" in completed.stdout
     assert "STAGE2_DMD_RUNTIME_API=PASS" in completed.stdout
     assert "STAGE2_PARAMETER_NAMES_API=PASS" in completed.stdout
+    assert "STAGE2_LORA_LOAD_API=PASS" in completed.stdout
 
 
 def test_innernet_runbooks_publish_the_same_no_git_repair_command():
@@ -403,6 +404,7 @@ def test_innernet_runbooks_publish_the_same_no_git_repair_command():
         assert "scripts/apply_stage2_innernet_hotfix.py" in text
         assert "STAGE2_DMD_RUNTIME_API=PASS" in text
         assert "STAGE2_PARAMETER_NAMES_API=PASS" in text
+        assert "STAGE2_LORA_LOAD_API=PASS" in text
         assert "STAGE2_INNERNET_HOTFIX=PATCHED" in text
 
     trainer_source = (PROJECT_ROOT / "trainer" / "stage2_distillation.py").read_text(

@@ -1,5 +1,13 @@
 # 发现与决策
 
+## 2026-08-18 Phase 26：C1分布式LoRA恢复依赖错配
+
+- C0 已通过而 C1 在 `initialize_stage2_roles()` 的 generator build/load/local audit 阶段失败；C1 尚未执行下一 F1、rollout、loss、backward、optimizer、EMA或新checkpoint。
+- C0 fresh LoRA只配置adapter；C1额外调用`strict_load_lora_state_dict()`恢复C0的generator/fake-score raw adapter。当前实现进一步调用PEFT 0.19.1的`set_peft_model_state_dict()`。
+- PEFT 0.19.1在任何已初始化`torch.distributed`进程中处理LoRA state时都会进入`_maybe_shard_state_dict_for_tp()`，并在检查模型是否真的使用HF tensor parallel之前无条件导入`transformers.integrations.tensor_parallel`。内网Transformers不含该模块，所以8个rank一致失败；本项目使用FSDP2而非HF tensor parallel，这个导入与实际恢复无关。
+- 仅升级Transformers会改变Wan/diffusers/tokenizers整套运行依赖，且内网环境不一定可联网；仅降级PEFT又会改变已验证的LoRA注入语义。更安全的修复是让项目的严格LoRA loader把canonical A/B key一一映射到已存在的default-adapter runtime parameter key，执行完整schema/shape/dtype/finite/loaded-value校验后用PyTorch原生load，完全不调用PEFT的可选HF-TP恢复分支。
+- 新loader必须只允许未FSDP/未DTensor的pre-shard模型，并继续拒绝missing/extra/duplicate/nonfinite/shape/dtype错误；这与C1 role初始化和inference merge的实际调用时点一致，不得通过捕获`ModuleNotFoundError`后静默跳过加载。
+
 ## 2026-08-17 Phase 21：timing closure 首始证据
 
 - `step_seconds_max≈55.196s`，closure差值约3.713s，占6.73%，仅略过5%门槛；异常发生在训练更新已成功、JSONL append前，不是模型数值或optimizer失败。

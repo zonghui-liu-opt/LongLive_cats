@@ -193,7 +193,9 @@ def _fsdp2_lora_worker(rank: int, init_file: str):
         if rank == 0:
             assert result is not None
             assert tuple(result) == tuple(expected)
-            assert all(torch.equal(result[key], expected[key].cpu()) for key in expected)
+            assert all(
+                torch.equal(result[key], expected[key].cpu()) for key in expected
+            )
         else:
             assert result is None
     finally:
@@ -288,9 +290,7 @@ def test_lora_b_zero_audit_detects_mutation():
     b_names = assert_lora_b_weights_zero(model)
     assert len(b_names) == 12
     first_b = next(
-        parameter
-        for name, parameter in model.named_parameters()
-        if ".lora_B." in name
+        parameter for name, parameter in model.named_parameters() if ".lora_B." in name
     )
     first_b.data.flatten()[0] = 1.0
     with pytest.raises(ValueError, match="nonzero tensors"):
@@ -322,6 +322,39 @@ def test_strict_safetensors_roundtrip(tmp_path):
     assert tuple(loaded) == tuple(extracted)
     for key in loaded:
         assert torch.equal(loaded[key], extracted[key].cpu())
+
+
+def test_strict_load_does_not_import_optional_transformers_tensor_parallel(
+    monkeypatch,
+):
+    source = build_exact_lora()
+    generator = torch.Generator().manual_seed(987)
+    for parameter in source.parameters():
+        if parameter.requires_grad:
+            parameter.data.copy_(
+                torch.randn(parameter.shape, generator=generator, dtype=parameter.dtype)
+            )
+    state = clone_state(get_canonical_lora_state_dict(source))
+    target = build_exact_lora()
+
+    import builtins
+
+    original_import = builtins.__import__
+
+    def reject_optional_tensor_parallel(name, *args, **kwargs):
+        if name == "transformers.integrations.tensor_parallel":
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(builtins, "__import__", reject_optional_tensor_parallel)
+
+    strict_load_lora_state_dict(target, state, expected_dtype=torch.float32)
+
+    loaded = get_canonical_lora_state_dict(target)
+    assert tuple(loaded) == tuple(state)
+    for key, expected in state.items():
+        assert torch.equal(loaded[key], expected)
 
 
 @pytest.mark.parametrize("failure", ["missing", "extra", "shape", "dtype", "nan"])
@@ -387,7 +420,9 @@ def test_selective_state_fails_if_non_lora_parameter_is_trainable():
 
 def test_selective_state_rejects_inner_module_with_fsdp_local_shards():
     model = build_exact_lora()
-    first_trainable = next(parameter for parameter in model.parameters() if parameter.requires_grad)
+    first_trainable = next(
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    )
     first_trainable._fsdp_flattened = True
     with pytest.raises(RuntimeError, match="pass the outer FSDP root"):
         get_lora_sharded_state_dict(model)

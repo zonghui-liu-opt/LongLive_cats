@@ -49,6 +49,7 @@ from utils.parameter_names import map_parameter_names_to_expected
 
 _LORA_PARAMETER_MARKERS = (".lora_A.", ".lora_B.")
 _CANONICAL_LORA_KEY_MARKERS = (".lora_A.weight", ".lora_B.weight")
+STAGE2_LORA_LOAD_API_VERSION = "longlive_stage2_lora_load/v1"
 
 
 @dataclass(frozen=True)
@@ -485,7 +486,16 @@ def strict_load_lora_state_dict(
     require_finite: bool = True,
     verify_tensors: bool = True,
 ):
-    """Strictly validate and load a complete canonical PEFT adapter state."""
+    """Strictly load canonical default-adapter LoRA A/B tensors.
+
+    PEFT's generic loader probes Hugging Face tensor parallelism whenever a
+    distributed process group exists, even when this model uses only FSDP2.
+    That optional probe makes checkpoint resume depend on a Transformers
+    integration which is irrelevant to this project.  Stage-2 has a narrower
+    contract: one complete default LoRA adapter is loaded before FSDP wrapping.
+    Resolve that exact canonical/runtime bijection here and use PyTorch's
+    native partial state load while retaining the existing value audit.
+    """
 
     validated = validate_canonical_lora_state_dict(
         lora_model,
@@ -493,13 +503,38 @@ def strict_load_lora_state_dict(
         expected_dtype=expected_dtype,
         require_finite=require_finite,
     )
-    incompatible = peft.set_peft_model_state_dict(lora_model, validated)
-    mismatched = list(getattr(incompatible, "mismatched_keys", []) or [])
-    unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
-    if mismatched or unexpected:
+
+    runtime_by_canonical: dict[str, str] = {}
+    for runtime_name, _parameter in lora_model.named_parameters():
+        if not _is_lora_parameter_name(runtime_name):
+            continue
+        canonical_key = _canonical_key_from_parameter_name(runtime_name)
+        previous = runtime_by_canonical.get(canonical_key)
+        if previous is not None:
+            raise ValueError(
+                "canonical LoRA key maps to multiple runtime parameters: "
+                f"key={canonical_key!r}, parameters={[previous, runtime_name]}"
+            )
+        runtime_by_canonical[canonical_key] = runtime_name
+
+    expected_keys = set(validated)
+    runtime_keys = set(runtime_by_canonical)
+    if runtime_keys != expected_keys:
         raise ValueError(
-            "PEFT rejected adapter tensors: "
-            f"mismatched={mismatched}, unexpected={unexpected}"
+            "canonical/runtime LoRA parameter mapping is incomplete: "
+            f"missing={sorted(expected_keys - runtime_keys)}, "
+            f"extra={sorted(runtime_keys - expected_keys)}"
+        )
+    runtime_state = OrderedDict(
+        (runtime_by_canonical[key], validated[key]) for key in sorted(validated)
+    )
+    incompatible = lora_model.load_state_dict(runtime_state, strict=False)
+    missing_adapter = sorted(set(incompatible.missing_keys).intersection(runtime_state))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+    if missing_adapter or unexpected:
+        raise ValueError(
+            "PyTorch rejected canonical LoRA adapter tensors: "
+            f"missing={missing_adapter}, unexpected={unexpected}"
         )
 
     if verify_tensors:
