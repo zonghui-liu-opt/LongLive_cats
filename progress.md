@@ -3,7 +3,7 @@
 ## 会话：2026-08-18（Phase 25）
 
 ### Stage-2参数命名契约系统修复
-- **状态：** in_progress
+- **状态：** complete（代码、全回归、无Githotfix与远端发布均完成；真实8×H100 smoke待内网复验）
 - 用户要求一次性审核并精准修复Stage-2训练过程所有parameter naming mismatch，不接受只针对当前EMA异常的局部绕过。
 - 已恢复Phase 24根因与当前dirty worktree；本轮保护用户metadata、checkpoints、tmp config、results与Stage-1脚本，只改生产命名契约、回归测试、无Githotfix和必要文档。
 - 审计范围锁定为：pre-FSDP immutable LoRA schema、PEFT canonical/raw names、Stage2 role wrapper、FSDP2 runtime names、optimizer DCP names、EMA topology/shadow、checkpoint save/load/resume及inference adapter加载。
@@ -22,6 +22,8 @@
 - 完整Stage-2回归694 passed、14 warnings；全仓正式`tests/`回归997 passed、2 subtests passed、14 warnings。Black、Ruff、py_compile、bash syntax、本轮scoped diff-check及新文件no-index whitespace均通过。
 - 全工作树diff-check仅命中用户原有600clip metadata的CRLF/尾随空白；按保护边界未修改。一次读取wrapper/runbook的JS包装语法错误在shell执行前失败，修正后成功，不影响仓库。
 - 真实当前checkout执行hotfix `--check`输出`STAGE2_DMD_RUNTIME_API=PASS`、`STAGE2_PARAMETER_NAMES_API=PASS`、`ALREADY_APPLIED targets=9`。
+- 精确暂存19个任务文件，确认用户metadata/checkpoints/tmp/results/Stage-1脚本均未进入index；提交`3551ed00667b82777a57805f62e2b0f47ac9adac`并push `longlive-cats/stage-2`。
+- `git ls-remote longlive-cats refs/heads/stage-2`返回同一`3551ed00667b82777a57805f62e2b0f47ac9adac`，远端发布核验通过。
 
 ## 会话：2026-08-18（Phase 24）
 

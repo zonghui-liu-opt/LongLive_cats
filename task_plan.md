@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 25 进行中：系统审计并修复Stage-2训练全生命周期的参数命名契约，统一schema、运行时wrapper/FSDP2、EMA、optimizer、checkpoint/resume与inference命名空间；补齐真实嵌套PEFT回归并发布stage-2。
+Phase 25 已完成：Stage-2训练全生命周期统一使用pre-FSDP schema raw FQN，runtime wrapper/FSDP2、EMA、optimizer DCP、checkpoint/resume与inference边界均已严格映射；完整回归通过并发布stage-2。
 
 ## 各阶段
 
@@ -217,8 +217,8 @@ Phase 25 进行中：系统审计并修复Stage-2训练全生命周期的参数�
 - [x] 25.4 复核并修复optimizer、LoRA gather/load、checkpoint、inference的同类命名漂移，保留fail-closed门禁
 - [x] 25.5 扩展无Git内网累计hotfix与启动握手，覆盖旧版到当前版的安全升级
 - [x] 25.6 运行聚焦、完整Stage-2、静态与混合版本回归，精确审阅diff
-- [ ] 25.7 只提交本轮代码/测试/文档，push远端`stage-2`并核验commit
-- **Status:** in_progress
+- [x] 25.7 只提交本轮代码/测试/文档，push远端`stage-2`并核验commit
+- **Status:** complete（997 passed、2 subtests；生产提交`3551ed0`已推送并由ls-remote核验）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？

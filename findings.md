@@ -535,3 +535,4 @@
 - optimizer兼容策略同理：任何传入DCP state先规范为schema raw FQN并验证moments/step/hyperparameters；仅在`set_optimizer_state_dict`前映射到当前module runtime FQN。写盘始终canonical，旧wrapper-prefixed checkpoint仍可resume。
 - 启动期现在有两层防混版：hotfix隔离probe同时验证DMD callback/timing与parameter-name API；H100 wrapper在任何torchrun前再次验证resolver样例、`TrainableShardedEMA.expected_parameter_names`及optimizer双向转换函数。缺任一文件会在8卡模型构造前失败。
 - 完整回归证据：Stage-2 694 passed；全tests 997 passed、2 subtests passed。唯一全工作树whitespace失败来自用户原有600clip metadata，不属于代码补丁且未触碰。
+- 生产修复已发布到`longlive-cats/stage-2`提交`3551ed00667b82777a57805f62e2b0f47ac9adac`；远端branch ref已逐字核验。内网无需Git，只需同步最新版累计hotfix脚本并确认两个API PASS后，用全新smoke目录从C0开始。
