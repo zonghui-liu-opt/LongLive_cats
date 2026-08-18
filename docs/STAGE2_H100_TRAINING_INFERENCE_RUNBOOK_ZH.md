@@ -136,6 +136,30 @@ F1 前按同一生产顺序精确重放并核对 sampler batch、exit、loader R
 timestep/noise 与全部计数器，完全一致后才消费一次。任一本周期发生过 nonfinite（即使随后
 精确重放成功）也不得标记 smoke PASS。
 
+### 3.1 OOM 时不要把上一条22.9 GiB指标当成失败峰值
+
+Stage-2 每个逻辑子步开始前会重置CUDA峰值，只有该子步成功返回后才把
+`max_memory_allocated`、`max_memory_reserved`和最小free写进JSONL。CUDA OOM在rollout内部直接
+抛出时，失败子步的峰值来不及写入；最后一条22.9 GiB之类的记录通常只代表此前成功的
+fake-score/no-grad子步。`nvidia-smi`同样只是采样瞬间，可能看不到Generator autograd和FSDP2
+all-gather叠加形成的短时峰值。
+
+典型真实失败如下：单卡总79.19 GiB，当前rank进程已占78.91 GiB，其中PyTorch live allocated
+69.91 GiB、reserved-but-unallocated 7.11 GiB；下一层FSDP2 unshard还要连续申请318 MiB，但
+全卡只剩273 MiB。这里同时存在两个问题：69.91 GiB真实工作集已经过大，7.11 GiB缓存池碎片
+又使连续buffer更难取得。即使allocator调优让这次申请侥幸成功，69.91 GiB仍超过85%门禁约
+67.31 GiB，约77.02 GiB reserved也超过90%门禁约71.27 GiB，micro2不能进入正式训练。
+
+8卡FSDP2不会把8张卡拼成一块640GB显存。三套5B角色的参数会分片，但每个rank仍需独立容纳
+rollout activation、self/cross-KV和临时通信buffer；每个transformer block forward前还会在本卡
+all-gather完整block。Generator因cache反向正确性明确关闭activation checkpoint，micro2会近似
+翻倍主导激活。若OOM报告中“当前进程占用”已经接近整卡总量，则外部进程不是主因；若两者
+差距很大，再用以下命令核对同卡其他PID：
+
+```bash
+nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory,process_name --format=csv,noheader
+```
+
 ## 4. 失败时唯一首选回退：micro1×acc8
 
 只有 micro2×acc4 未通过上述门槛时才执行本节。在仓库外复制配置，只改两个字段；然后用该
@@ -159,14 +183,50 @@ PY
 
 export STAGE2_CONFIG="$MICRO1_CONFIG"
 export ACTIVE_CONFIG="$MICRO1_CONFIG"
-bash prepare_stage2.sh 2>&1 | tee "$STAGE2_WORK_ROOT/logs/prepare_micro1_acc8.log"
-export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_micro1_acc8"
-mkdir -p "$STAGE2_SMOKE_DIR"
+export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_micro1_acc8_v1"
+
+# 必须在新的torchrun进程启动前设置，只缓解碎片，不能替代micro1。
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# 重新绑定micro1 launch hash；prepare会安全复用已认证的昂贵资产。
+bash run_stage2_h100.sh prepare
+
+# 使用全新目录从C0开始，依次完成C0/C1/C2及显存门禁。
+bash run_stage2_h100.sh smoke
 ```
 
-随后把第 3 节三条命令原样各执行一次。micro1 仍失败时停止并保存日志；不要降低 global
-batch、不要改 C/W/K/CFG，也不要开启不安全的 Generator activation checkpoint。只有任务书
-允许的 Generator grad-exit saved-tensor CPU offload 可作为下一次单独 profile 候选。
+必须看到`STAGE2_GUIDE_PREPARE=PASS`和`STAGE2_GUIDE_SMOKE=PASS`。micro1把单次主导激活近似
+减半，而acc8保持`1×8×8=64`的global batch；不要复用已经OOM的micro2目录或任何partial smoke
+lineage。后续正式训练也必须在同一shell中继续使用这个`STAGE2_CONFIG`/`ACTIVE_CONFIG`。
+
+### 4.1 micro1仍OOM时的唯一二级显存候选
+
+先完整保留micro1日志。不要降低global batch、不要改C/W/K/CFG，也不要开启不安全的Generator
+activation checkpoint。只允许在micro1基础上单独profile Generator grad-exit saved-tensor CPU
+offload；它会增加host pinned memory和PCIe开销：
+
+```bash
+export MICRO1_OFFLOAD_CONFIG="$STAGE2_WORK_ROOT/configs/train_i2v_stage2_600cats_micro1_acc8_offload.yaml"
+"$STAGE2_PYTHON" -B - "$MICRO1_CONFIG" "$MICRO1_OFFLOAD_CONFIG" <<'PY'
+from pathlib import Path
+import sys
+from omegaconf import OmegaConf
+
+source, destination = map(Path, sys.argv[1:])
+config = OmegaConf.load(source)
+config.infra.saved_tensor_cpu_offload = True
+OmegaConf.save(config, destination)
+PY
+
+export STAGE2_CONFIG="$MICRO1_OFFLOAD_CONFIG"
+export ACTIVE_CONFIG="$MICRO1_OFFLOAD_CONFIG"
+export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_micro1_acc8_offload_v1"
+bash run_stage2_h100.sh prepare
+bash run_stage2_h100.sh smoke
+```
+
+该候选也必须完整通过C0/C1/C2和原显存余量门禁才能用于正式训练；不得只以“不再抛OOM”作为
+放行依据。
 
 ## 5. 正式冷启动与自动断点恢复
 
