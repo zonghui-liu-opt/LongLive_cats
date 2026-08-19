@@ -8,6 +8,7 @@
 - 仅允许“video存在、trace不存在、最终manifest不存在”进入自动恢复；坏MP4、symlink、trace-only或已有最终manifest时继续fail-closed。隔离区位于root下但不在`videos/`/`traces/`，不会污染56件套验收。
 - 恢复实现对原MP4移动前后各做一次ffprobe/size/SHA验收，并在两侧目录fsync后验证正式路径已空、隔离文件技术identity未变；原文件不删除，隔离名包含内容SHA前缀和随机nonce。
 - 隔离后生成再次失败时，正式video/trace/manifest仍保持未完成，隔离原片保留；下一次启动会按“二者均不存在”正常生成。端到端测试已覆盖第二次失败后第三次成功。
+- 精确生产提交的干净worktree完整通过Stage-2 inference八模块113项；`51b6da06c4f9c4dbc38cbd2177e1e82ba175877d`已发布到`longlive-cats/stage-2`并由ls-remote核验。
 
 ## 2026-08-19 Phase 29：输出根目录identity漂移
 

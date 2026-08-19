@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 30 进行中：闭环旧版root guard失败遗留的“正式视频已提交、trace未提交”单边产物，使同步新代码后可直接安全续跑。
+Phase 30 已完成并发布：旧版root guard失败遗留的“正式视频已提交、trace未提交”单边产物会安全隔离并重生成，同步新代码后可直接续跑。
 
 ## 各阶段
 
@@ -256,8 +256,8 @@ Phase 30 进行中：闭环旧版root guard失败遗留的“正式视频已提�
 - [x] 30.2 补合法video-only恢复、坏视频/symlink/complete-manifest拒绝红测
 - [x] 30.3 将合法单边视频安全移入根内隐藏隔离区，再按原确定性输入重生成完整video+trace
 - [x] 30.4 验证多rank preflight、二次失败续跑、最终56件套与root anchor门禁不回归
-- [ ] 30.5 更新中文文档，运行干净树回归并再次push `stage-2`
-- **Status:** in_progress
+- [x] 30.5 更新中文文档，运行干净树回归并再次push `stage-2`
+- **Status:** complete（干净提交树Stage-2 inference 113 passed；生产提交`51b6da0`已push并由ls-remote核验）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
