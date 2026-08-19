@@ -9,8 +9,10 @@ dependency boundary so orchestration and failure semantics remain CPU-testable.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
+import secrets
 import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -65,7 +67,9 @@ from utils.stage2_inference_batch import (
 from utils.stage2_inference_config import ResolvedStage2InferenceConfig
 from utils.stage2_inference_loader import load_stage2_ema_generator_for_inference
 
-_OUTPUT_ROOT_GUARD_SCHEMA = "longlive_stage2_output_root_guard/v1"
+_OUTPUT_ROOT_GUARD_SCHEMA = "longlive_stage2_output_root_guard/v2"
+_OUTPUT_ROOT_ANCHOR_SCHEMA = "longlive_stage2_output_root_anchor/v1"
+_OUTPUT_ROOT_ANCHOR_NAME = ".stage2-output-root-anchor.json"
 
 
 @dataclass(frozen=True)
@@ -95,12 +99,19 @@ class Stage2InferenceDistributedContext:
 
 @dataclass(frozen=True, slots=True)
 class _Stage2OutputRootGuard:
-    """Authenticated identity of the canonical output directory."""
+    """Authenticated identity of the canonical output directory.
+
+    ``device``/``inode``/``mode`` are the initial observation retained for
+    diagnostics.  The persistent content anchor is the cross-call identity:
+    some shared/overlay filesystems legitimately reallocate a directory inode
+    after a child is committed.
+    """
 
     path: str
     device: int
     inode: int
     mode: int
+    anchor_sha256: str
 
     def __post_init__(self) -> None:
         if (
@@ -121,6 +132,14 @@ class _Stage2OutputRootGuard:
                 )
         if not stat.S_ISDIR(self.mode) or stat.S_ISLNK(self.mode):
             raise ValueError("Stage-2 output root guard must identify a directory")
+        if (
+            type(self.anchor_sha256) is not str
+            or len(self.anchor_sha256) != 64
+            or any(
+                character not in "0123456789abcdef" for character in self.anchor_sha256
+            )
+        ):
+            raise TypeError("Stage-2 output root guard anchor SHA-256 is invalid")
 
     @property
     def root(self) -> Path:
@@ -331,8 +350,155 @@ def _lstat_directory_identity(path: Path) -> tuple[int, int, int]:
     return int(status.st_dev), int(status.st_ino), mode
 
 
+def _canonical_output_root_anchor(nonce: str) -> bytes:
+    if (
+        type(nonce) is not str
+        or len(nonce) != 64
+        or any(character not in "0123456789abcdef" for character in nonce)
+    ):
+        raise TypeError("Stage-2 output root anchor nonce is invalid")
+    return (
+        json.dumps(
+            {"nonce": nonce, "schema": _OUTPUT_ROOT_ANCHOR_SCHEMA},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _read_output_root_anchor(root: Path) -> tuple[bytes, str]:
+    anchor = root / _OUTPUT_ROOT_ANCHOR_NAME
+    try:
+        before = anchor.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"Stage-2 output root anchor is missing: {anchor}") from exc
+    before_identity = (int(before.st_dev), int(before.st_ino), int(before.st_mode))
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(
+            f"Stage-2 output root anchor is not a regular file: {anchor}"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(anchor, flags)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Stage-2 output root anchor cannot be opened: {anchor}"
+        ) from exc
+    try:
+        opened_before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 4097 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > 4096:
+                raise RuntimeError(
+                    f"Stage-2 output root anchor is unexpectedly large: {anchor}"
+                )
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        after = anchor.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Stage-2 output root anchor changed while reading: {anchor}"
+        ) from exc
+    opened_before_identity = (
+        int(opened_before.st_dev),
+        int(opened_before.st_ino),
+        int(opened_before.st_mode),
+    )
+    opened_after_identity = (
+        int(opened_after.st_dev),
+        int(opened_after.st_ino),
+        int(opened_after.st_mode),
+    )
+    after_identity = (int(after.st_dev), int(after.st_ino), int(after.st_mode))
+    if (
+        before_identity != opened_before_identity
+        or opened_before_identity != opened_after_identity
+        or opened_after_identity != after_identity
+        or stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+    ):
+        raise RuntimeError(
+            f"Stage-2 output root anchor changed while reading: {anchor}"
+        )
+    payload = b"".join(chunks)
+    try:
+        value = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Stage-2 output root anchor is invalid: {anchor}") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"nonce", "schema"}
+        or value.get("schema") != _OUTPUT_ROOT_ANCHOR_SCHEMA
+    ):
+        raise RuntimeError(f"Stage-2 output root anchor schema mismatch: {anchor}")
+    try:
+        expected = _canonical_output_root_anchor(value.get("nonce"))
+    except TypeError as exc:
+        raise RuntimeError(f"Stage-2 output root anchor is invalid: {anchor}") from exc
+    if payload != expected:
+        raise RuntimeError(f"Stage-2 output root anchor is not canonical: {anchor}")
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+def _initialize_output_root_anchor(root: Path) -> str:
+    anchor = root / _OUTPUT_ROOT_ANCHOR_NAME
+    try:
+        anchor.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(
+            f"Stage-2 output root anchor cannot be inspected: {anchor}"
+        ) from exc
+    else:
+        return _read_output_root_anchor(root)[1]
+
+    payload = _canonical_output_root_anchor(secrets.token_hex(32))
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=root,
+        prefix=f".{_OUTPUT_ROOT_ANCHOR_NAME}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise RuntimeError(
+                        "Stage-2 output root anchor write made no progress: "
+                        f"{temporary}"
+                    )
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(temporary, anchor, follow_symlinks=False)
+        except FileExistsError:
+            # Another rank won the same-root first-start race.  Its complete
+            # hard-linked payload is authoritative; partial files are never
+            # published at the anchor path.
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+    return _read_output_root_anchor(root)[1]
+
+
 def _assert_output_root_guard(guard: _Stage2OutputRootGuard) -> Path:
-    """Fail closed when the canonical root no longer has its captured identity.
+    """Fail closed when the canonical root loses its persistent content anchor.
 
     This is a conventional pre/post TOCTOU guard, not a claim of capability
     security against an actively malicious local process switching paths in the
@@ -345,6 +511,7 @@ def _assert_output_root_guard(guard: _Stage2OutputRootGuard) -> Path:
     try:
         guard_path = guard.path
         guard_values = (guard.device, guard.inode, guard.mode)
+        anchor_sha256 = guard.anchor_sha256
     except AttributeError as exc:
         raise TypeError("Stage-2 output root guard has invalid fields") from exc
     if (
@@ -355,20 +522,45 @@ def _assert_output_root_guard(guard: _Stage2OutputRootGuard) -> Path:
         or any(type(value) is not int or value < 0 for value in guard_values)
         or not stat.S_ISDIR(guard_values[2])
         or stat.S_ISLNK(guard_values[2])
+        or type(anchor_sha256) is not str
+        or len(anchor_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in anchor_sha256)
     ):
         raise TypeError("Stage-2 output root guard has invalid fields")
     root = Path(guard_path)
     before = _lstat_directory_identity(root)
-    expected = guard_values
-    if before != expected:
-        raise RuntimeError(f"Stage-2 output root identity changed: {root}")
     try:
         resolved = root.resolve(strict=True)
     except OSError as exc:
         raise RuntimeError(f"Stage-2 output root cannot be resolved: {root}") from exc
     after = _lstat_directory_identity(root)
-    if after != expected or resolved != root:
-        raise RuntimeError(f"Stage-2 output root identity changed: {root}")
+    if after != before or resolved != root:
+        raise RuntimeError(
+            "Stage-2 output root identity changed during validation: "
+            f"{root}; before={before}, after={after}, resolved={resolved}"
+        )
+    try:
+        _, observed_anchor_sha256 = _read_output_root_anchor(root)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Stage-2 output root identity changed: {root}; {exc}"
+        ) from exc
+    if observed_anchor_sha256 != anchor_sha256:
+        raise RuntimeError(
+            "Stage-2 output root identity changed: "
+            f"{root}; expected_anchor={anchor_sha256}, "
+            f"observed_anchor={observed_anchor_sha256}"
+        )
+    final = _lstat_directory_identity(root)
+    try:
+        final_resolved = root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"Stage-2 output root cannot be resolved: {root}") from exc
+    if final != after or final_resolved != root:
+        raise RuntimeError(
+            "Stage-2 output root identity changed during validation: "
+            f"{root}; before={after}, after={final}, resolved={final_resolved}"
+        )
     return root
 
 
@@ -379,14 +571,12 @@ def _output_root_guard_identity(
     return {
         "schema": _OUTPUT_ROOT_GUARD_SCHEMA,
         "path": os.fspath(root),
-        "device": guard.device,
-        "inode": guard.inode,
-        "mode": guard.mode,
+        "anchor_sha256": guard.anchor_sha256,
     }
 
 
 def _validate_output_root_guard_identity(value: Any) -> dict[str, Any]:
-    expected_keys = {"schema", "path", "device", "inode", "mode"}
+    expected_keys = {"schema", "path", "anchor_sha256"}
     if not isinstance(value, Mapping) or set(value) != expected_keys:
         raise ValueError("Stage-2 output root guard identity schema mismatch")
     if value.get("schema") != _OUTPUT_ROOT_GUARD_SCHEMA:
@@ -399,17 +589,18 @@ def _validate_output_root_guard_identity(value: Any) -> dict[str, Any]:
         or os.path.normpath(path) != path
     ):
         raise TypeError("Stage-2 output root guard identity path is invalid")
-    result: dict[str, Any] = {"schema": _OUTPUT_ROOT_GUARD_SCHEMA, "path": path}
-    for name in ("device", "inode", "mode"):
-        item = value.get(name)
-        if type(item) is not int or item < 0:
-            raise TypeError(
-                f"Stage-2 output root guard identity {name} must be a plain integer"
-            )
-        result[name] = item
-    if not stat.S_ISDIR(result["mode"]) or stat.S_ISLNK(result["mode"]):
-        raise ValueError("Stage-2 output root guard identity mode is invalid")
-    return result
+    anchor_sha256 = value.get("anchor_sha256")
+    if (
+        type(anchor_sha256) is not str
+        or len(anchor_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in anchor_sha256)
+    ):
+        raise TypeError("Stage-2 output root guard identity anchor is invalid")
+    return {
+        "schema": _OUTPUT_ROOT_GUARD_SCHEMA,
+        "path": path,
+        "anchor_sha256": anchor_sha256,
+    }
 
 
 def _prepare_output_root(
@@ -424,12 +615,14 @@ def _prepare_output_root(
         raise RuntimeError(
             f"Stage-2 output root changed during directory creation: {root}"
         )
+    anchor_sha256 = _initialize_output_root_anchor(resolved)
     device, inode, mode = _lstat_directory_identity(resolved)
     guard = _Stage2OutputRootGuard(
         path=os.fspath(resolved),
         device=device,
         inode=inode,
         mode=mode,
+        anchor_sha256=anchor_sha256,
     )
     _assert_output_root_guard(guard)
     return guard

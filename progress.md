@@ -1,5 +1,19 @@
 # 进度日志
 
+## 会话：2026-08-19（Phase 29）
+
+### 共享存储root identity漂移
+- **状态：** complete（本地实现、干净提交树回归完成；远端push待本轮核验）
+- 内网rank0已生成并验收视频，但在正式MP4提交后的`_assert_regular_parents()`中报告output root identity changed。
+- 已确认guard比较的是device/inode/mode，且真实root替换反例受现有测试保护；不能直接放宽为只检查路径。
+- 当前实施顺序：先补合法identity漂移红测，再加入多rank安全的持久anchor，并保持目录替换/symlink/不完整产物反例全绿。
+- 首次三文件组合补丁因findings上下文不匹配而原子失败；读取真实文件头后已用精确上下文重试。
+- 合法identity漂移红测先按预期失败；加入持久随机anchor后转绿，原有目录/symlink替换反例和新增4类anchor破坏反例全部通过。
+- 新增8-rank并发首次prepare、同目录重启复用、视频保存后identity漂移仍完成video+trace+manifest+index的端到端回归；runtime 33 passed。
+- Stage-2 inference八模块为107 passed、1 deselected；唯一未跑项读取用户现场`infer_stage2_tmp.sh`并要求远端标准shebang，本轮不覆盖该现场脚本，提交前将从精确暂存树复验完整集合。
+- 已从精确提交创建隔离干净worktree并完整复验Stage-2 inference八模块：108 passed；随后安全移除临时worktree。
+- Black、Ruff、py_compile和本轮文件diff-check通过；发布范围仅6个文件，用户现场shell、训练wrapper、metadata、checkpoint和results均保持未暂存。
+
 ## 会话：2026-08-18（Phase 28）
 
 ### ffprobe失效路径启动前闭环

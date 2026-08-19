@@ -1,5 +1,17 @@
 # 发现与决策
 
+## 2026-08-19 Phase 29：输出根目录identity漂移
+
+- 新错误发生在临时MP4已通过ffprobe并原子提交为正式视频之后；因此已有视频不是坏文件，失败点是提交后的输出路径安全复核。
+- 当前root guard只保存并逐次精确比较`st_dev/st_ino/st_mode`，不包含mtime/ctime。正常创建子文件不会改变这些字段，内网现象说明共享/叠加存储返回了新的目录identity，或输出根确实被外部替换。
+- 启动collective已经证明各rank最初看到同一identity；简单删除inode/device检查会使既有“rename旧root并在原路径放新目录”攻击反例失守，不能作为修复。
+- 方案锁定为在输出根内原子建立随机、持久、各rank一致的内容anchor：每次写入前后同时验证canonical非symlink根、anchor类型/内容与单次检查稳定性；跨调用允许目录stat identity漂移，但真实新目录因缺少anchor仍被拒绝。
+- anchor必须支持多rank首次并发竞争和失败后原目录断点续跑；最终artifact严格集合只枚举`videos/`与`traces/`，不会把根级隐藏anchor误计为额外视频或trace。
+- 实现使用同目录完整临时文件加原子硬链接竞争发布`.stage2-output-root-anchor.json`；8个并发prepare只会有一个获胜nonce，所有rank的v2 collective identity统一为canonical path与anchor SHA256，不再传播易漂移的目录stat。
+- 每次guard复核仍对root与anchor做lstat/resolve/open/fstat前后稳定性、类型、canonical JSON和SHA检查；合法漂移测试与“视频保存后才漂移”的端到端测试通过，目录替换、anchor缺失/非法/symlink/另一有效anchor反例继续拒绝。
+- 精确提交生成的干净worktree中，Stage-2 inference八模块108 passed；因此标准远端shell契约、断点续跑和本轮root guard同时闭环，现场脚本的未提交7卡/路径定制不属于发布内容。
+- 用户附带的`infer_stage2_tmp.sh`包含内网绝对路径和7卡定制，是现场脚本；本轮必须保留，不纳入生产提交。
+
 ## 2026-08-18 Phase 28：ffprobe exit 127
 
 - 新错误已越过checkpoint/runtime asset认证、Generator EMA加载和至少一个样本生成；失败发生在临时MP4落盘后的技术验收，不是NCCL、权重、显存或生成模型错误。

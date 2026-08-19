@@ -71,6 +71,16 @@ bash infer_stage2_tmp.sh 70
 最新版还修复了跨节点挂载时 `device/inode/mtime` 不同导致的
 `Generator provenance differs from its live manifest` 误报；权重SHA256、大小、manifest和血缘仍严格校验。
 
+如果视频已经生成后出现：
+
+```text
+Stage-2 output root identity changed
+```
+
+这是旧版把共享存储目录的`device/inode/mode`当作永久身份导致的误报。同步最新`stage-2`后，直接对原命令续跑，
+不要删除输出目录；完整的video+trace会重新校验后跳过。新版会在输出根创建
+`.stage2-output-root-anchor.json`作为持久身份，不要修改或删除它；真实目录替换和symlink仍会被拒绝。
+
 ### 2.1 使用另一台 8×H100 加速
 
 现有入口使用样本级数据并行。8 张卡会把 56 个样本平均分片，每张卡生成 7 个视频：

@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 28 已完成实现、全仓回归与发布准备：ffprobe在模型加载前完成健康解析，坏PATH首候选可安全回退，显式override保持fail-closed，既有视频技术门禁不放宽。
+Phase 29 已完成并通过干净提交树回归：共享存储在视频提交后的输出根目录identity漂移可续跑，根目录替换、symlink逃逸、anchor破坏和不完整产物仍严格拒绝。
 
 ## 各阶段
 
@@ -244,6 +244,13 @@ Phase 28 已完成实现、全仓回归与发布准备：ffprobe在模型加载�
 - [x] 28.5 运行Stage-1/Stage-2相关回归与静态检查，精确发布`stage-2`并交付内网续跑命令
 - **Status:** complete（相关208 passed；全仓1006 passed、2 subtests；Ruff/py_compile/bash/diff-check通过；待内网续跑）
 
+### Phase 29：共享存储输出根目录identity漂移闭环
+- [x] 29.1 定位失败时点与guard字段：视频已通过ffprobe并原子提交，根门禁比较的是device/inode/mode而非时间戳
+- [x] 29.2 先补合法identity漂移、真实目录替换和anchor破坏红测，再实现持久内容anchor门禁
+- [x] 29.3 验证多rank并发初始化、断点续跑、video/trace原子提交和最终manifest/index不回归
+- [x] 29.4 运行Stage-2 inference聚焦/完整回归与静态检查，精确提交并push `stage-2`
+- **Status:** complete（干净提交树Stage-2 inference 108 passed；Black/Ruff/py_compile/diff-check通过；生产提交待本轮push核验）
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -265,6 +272,8 @@ Phase 28 已完成实现、全仓回归与发布准备：ffprobe在模型加载�
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |
 |------|---------|---------|
+| Phase 29首次规划组合补丁引用了`findings.md`中不存在的相邻上下文，整次补丁未应用 | 1 | 重新读取三份规划文件头部并拆分为精确的小补丁 |
+| Phase 29完整inference本地回归有1项shell契约失败 | 1 | 失败只来自用户现场`infer_stage2_tmp.sh`删除shebang的未提交定制；保留现场脚本，并从精确提交创建干净worktree复验为108 passed |
 | Phase 28红测在收集期因`resolve_ffprobe`尚不存在而ImportError | 1 | 这是预期红基线；实现解析器后坏首候选/显式override/shell三项转绿 |
 | Phase 28首次Ruff命令误把Bash脚本作为Python输入，产生大量无效syntax诊断；同一组合命令因末项成功返回0 | 1 | 改为Ruff只检查Python、`bash -n`独立检查shell，并单独执行Black格式化后复验 |
 | Phase 28对两个既有非Black-clean文件运行全文件Black，产生与修复无关的机械格式化diff | 1 | 用`apply_patch`逐项恢复HEAD原格式，只保留新解析器/测试；重跑208项相关回归和精确diff-check |

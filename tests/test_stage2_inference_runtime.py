@@ -5,12 +5,14 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Barrier, Event
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+import utils.stage2_inference_runtime as stage2_inference_runtime
 
 from pipeline.stage2_rollout_profile import resolve_stage2_rollout_profile
 from utils.stage1_io import (
@@ -52,8 +54,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_output_root_may_be_inside_the_project_tree() -> None:
-    guard = _prepare_output_root(_PROJECT_ROOT)
-    assert guard.root == _PROJECT_ROOT
+    with TemporaryDirectory(
+        prefix=".stage2-output-root-test-", dir=_PROJECT_ROOT
+    ) as directory:
+        root = Path(directory).resolve()
+        guard = _prepare_output_root(root)
+        assert guard.root == root
 
 
 def test_regular_parent_creation_is_safe_for_concurrent_ranks(
@@ -75,6 +81,97 @@ def test_regular_parent_creation_is_safe_for_concurrent_ranks(
 
     assert (root / "baseline" / "single_action").is_dir()
     assert not (root / "baseline").is_symlink()
+
+
+def test_output_root_guard_accepts_stable_shared_storage_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = _prepare_output_root(tmp_path / "output")
+    root = guard.root
+    original = stage2_inference_runtime._lstat_directory_identity
+
+    def drifted_identity(path: Path) -> tuple[int, int, int]:
+        device, inode, mode = original(path)
+        if path == root:
+            return device + 101, inode + 103, mode
+        return device, inode, mode
+
+    monkeypatch.setattr(
+        stage2_inference_runtime,
+        "_lstat_directory_identity",
+        drifted_identity,
+    )
+
+    _ensure_regular_parents(
+        guard,
+        root / "baseline" / "single_action" / "sample.mp4",
+    )
+
+    assert (root / "baseline" / "single_action").is_dir()
+
+
+def test_output_root_anchor_is_shared_by_concurrent_rank_preparation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "output"
+    barrier = Barrier(8)
+
+    def prepare(_: int) -> Any:
+        barrier.wait()
+        return _prepare_output_root(root)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        guards = tuple(executor.map(prepare, range(8)))
+
+    assert {guard.root for guard in guards} == {root.resolve()}
+    assert len({guard.anchor_sha256 for guard in guards}) == 1
+    resumed = _prepare_output_root(root)
+    assert resumed.anchor_sha256 == guards[0].anchor_sha256
+
+
+@pytest.mark.parametrize("damage", ["missing", "invalid", "symlink", "other-anchor"])
+def test_output_root_guard_rejects_anchor_damage(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    root = tmp_path / "output"
+    guard = _prepare_output_root(root)
+    anchor = root / stage2_inference_runtime._OUTPUT_ROOT_ANCHOR_NAME
+    anchor.unlink()
+    if damage == "invalid":
+        anchor.write_text("not an anchor\n", encoding="utf-8")
+    elif damage == "symlink":
+        outside = tmp_path / "outside-anchor.json"
+        outside.write_text("not an anchor\n", encoding="utf-8")
+        anchor.symlink_to(outside)
+    elif damage == "other-anchor":
+        other_root = tmp_path / "other-output"
+        _prepare_output_root(other_root)
+        other_anchor = other_root / stage2_inference_runtime._OUTPUT_ROOT_ANCHOR_NAME
+        anchor.write_bytes(other_anchor.read_bytes())
+
+    with pytest.raises(RuntimeError, match="output root identity changed"):
+        _ensure_regular_parents(
+            guard,
+            root / "baseline" / "single_action" / "sample.mp4",
+        )
+
+
+def test_output_root_rank_identity_uses_persistent_anchor(tmp_path: Path) -> None:
+    guard = _prepare_output_root(tmp_path / "output")
+
+    identity = stage2_inference_runtime._output_root_guard_identity(guard)
+
+    assert identity == {
+        "schema": "longlive_stage2_output_root_guard/v2",
+        "path": str(guard.root),
+        "anchor_sha256": guard.anchor_sha256,
+    }
+    assert (
+        stage2_inference_runtime._validate_output_root_guard_identity(identity)
+        == identity
+    )
 
 
 @pytest.mark.parametrize("competitor", ["file", "symlink"])
@@ -603,6 +700,54 @@ def test_runtime_loads_once_preencodes_unique_prompts_and_uses_multisink_only_fo
     assert calls["manifest_writes"] == 1
     assert (Path(config.output_root) / STAGE2_INFERENCE_MANIFEST_NAME).is_file()
     assert (Path(config.output_root) / STAGE2_REVIEW_INDEX_NAME).is_file()
+
+
+def test_runtime_completes_when_root_identity_drifts_after_video_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    sample = _sample(
+        tmp_path,
+        dataset=STAGE2_SINGLE_DATASET,
+        row_id=0,
+        seed=1,
+        prompts=("single prompt",),
+    )
+    calls: dict[str, Any] = {}
+    ops = _runtime_ops((sample,), calls)
+    original_identity = stage2_inference_runtime._lstat_directory_identity
+    root = Path(config.output_root).resolve()
+    drift = {"active": False}
+
+    def drifted_identity(path: Path) -> tuple[int, int, int]:
+        device, inode, mode = original_identity(path)
+        if drift["active"] and path == root:
+            return device + 107, inode + 109, mode
+        return device, inode, mode
+
+    def save_then_drift(video: torch.Tensor, path: Path, *, fps: int) -> None:
+        ops.save_video(video, path, fps=fps)
+        drift["active"] = True
+
+    monkeypatch.setattr(
+        stage2_inference_runtime,
+        "_lstat_directory_identity",
+        drifted_identity,
+    )
+
+    result = run_stage2_inference(
+        config,
+        context=_context(),
+        ops=replace(ops, save_video=save_then_drift),
+    )
+
+    assert result["status"] == "complete"
+    assert result["local_generated"] == 1
+    assert (root / sample.output_relative_path).is_file()
+    assert (root / sample.trace_relative_path).is_file()
+    assert (root / STAGE2_INFERENCE_MANIFEST_NAME).is_file()
+    assert (root / STAGE2_REVIEW_INDEX_NAME).is_file()
 
 
 def test_complete_video_trace_pairs_are_strictly_revalidated_and_never_overwritten(
