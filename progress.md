@@ -1,5 +1,15 @@
 # 进度日志
 
+## 会话：2026-08-19（Phase 30）
+
+### video-only单边提交自动恢复
+- **状态：** in_progress
+- 发布Phase 29后复核原始栈的原子提交边界，确认现场输出必然可能有1个正式视频但无对应trace；旧resume会拒绝它。
+- 已锁定恢复边界：只有最终manifest不存在且单边MP4再次通过技术验收时才移动到隐藏隔离区并重生成；不删除现场视频，不放宽坏文件/symlink/完整批次损坏门禁。
+- 四项恢复红测在旧逻辑上按预期全失败；实现`.stage2-incomplete/`安全隔离后，合法video-only可完成重生成，坏视频、symlink和complete-manifest保持原地拒绝。
+- 补充隔离后新视频再次probe失败、下次启动成功，以及trace-only继续fail-closed；runtime 38 passed。
+- Stage-2 inference八模块当前112 passed、1项现场shell契约deselected；下一步从精确提交树复验标准远端shell后发布。
+
 ## 会话：2026-08-19（Phase 29）
 
 ### 共享存储root identity漂移

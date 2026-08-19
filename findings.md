@@ -1,5 +1,14 @@
 # 发现与决策
 
+## 2026-08-19 Phase 30：旧失败遗留video-only恢复
+
+- 用户栈停在`atomic_output_path(video_path)`成功退出后的`_assert_regular_parents()`；此时正式MP4已通过ffprobe并提交，但trace构建/写入尚未发生。
+- 现有resume preflight要求video与trace同时存在或同时不存在，因此直接同步Phase 29后仍会对这一个单边MP4报`complete video+trace pair`，不能真正“一次性续跑”。
+- generation trace包含noise/latent/cache等运行期审计，不能只凭MP4事后伪造；正确恢复是严格复验单边MP4后将其保留到输出根内隐藏隔离区，再用相同sample/seed/checkpoint完整重生成video+trace。
+- 仅允许“video存在、trace不存在、最终manifest不存在”进入自动恢复；坏MP4、symlink、trace-only或已有最终manifest时继续fail-closed。隔离区位于root下但不在`videos/`/`traces/`，不会污染56件套验收。
+- 恢复实现对原MP4移动前后各做一次ffprobe/size/SHA验收，并在两侧目录fsync后验证正式路径已空、隔离文件技术identity未变；原文件不删除，隔离名包含内容SHA前缀和随机nonce。
+- 隔离后生成再次失败时，正式video/trace/manifest仍保持未完成，隔离原片保留；下一次启动会按“二者均不存在”正常生成。端到端测试已覆盖第二次失败后第三次成功。
+
 ## 2026-08-19 Phase 29：输出根目录identity漂移
 
 - 新错误发生在临时MP4已通过ffprobe并原子提交为正式视频之后；因此已有视频不是坏文件，失败点是提交后的输出路径安全复核。

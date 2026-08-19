@@ -1056,7 +1056,9 @@ def test_every_local_startup_failure_enters_collective_before_raising(
     assert calls["vae_builds"] == 0
 
 
-def test_orphan_video_fails_fast_without_complete_manifest(tmp_path: Path) -> None:
+def test_valid_video_only_artifact_is_quarantined_and_regenerated(
+    tmp_path: Path,
+) -> None:
     config = _config(tmp_path)
     sample = _sample(
         tmp_path,
@@ -1065,20 +1067,208 @@ def test_orphan_video_fails_fast_without_complete_manifest(tmp_path: Path) -> No
         seed=1,
         prompts=("single prompt",),
     )
-    video = Path(config.output_root) / sample.output_relative_path
+    root = Path(config.output_root)
+    video = root / sample.output_relative_path
     video.parent.mkdir(parents=True)
-    video.write_bytes(b"orphan")
+    _video_writer(
+        torch.zeros((1, 96, 3, sample.height, sample.width)),
+        video,
+        fps=24,
+    )
+    orphan_payload = video.read_bytes()
     calls: dict[str, Any] = {}
+
+    result = run_stage2_inference(
+        config,
+        context=_context(),
+        ops=_runtime_ops((sample,), calls),
+    )
+
+    recovered = tuple((root / ".stage2-incomplete").rglob("*.mp4"))
+    assert result["status"] == "complete"
+    assert result["local_generated"] == 1
+    assert calls["generator_loads"] == 1
+    assert calls["video_writes"] == calls["trace_writes"] == 1
+    assert len(recovered) == 1
+    assert recovered[0].read_bytes() == orphan_payload
+    assert video.is_file()
+    assert (root / sample.trace_relative_path).is_file()
+    assert (root / STAGE2_INFERENCE_MANIFEST_NAME).is_file()
+
+
+def test_invalid_video_only_artifact_fails_without_mutation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    sample = _sample(
+        tmp_path,
+        dataset=STAGE2_SINGLE_DATASET,
+        row_id=0,
+        seed=1,
+        prompts=("single prompt",),
+    )
+    root = Path(config.output_root)
+    video = root / sample.output_relative_path
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"invalid orphan")
+    calls: dict[str, Any] = {}
+
+    def reject_orphan(_path: Path) -> dict[str, Any]:
+        raise RuntimeError("invalid orphan video")
+
+    with pytest.raises(RuntimeError, match="invalid orphan video"):
+        run_stage2_inference(
+            config,
+            context=_context(),
+            ops=_runtime_ops((sample,), calls, probe_fn=reject_orphan),
+        )
+
+    assert calls["generator_loads"] == 1
+    assert calls["vae_builds"] == 0
+    assert video.read_bytes() == b"invalid orphan"
+    assert not (root / ".stage2-incomplete").exists()
+
+
+def test_video_only_symlink_fails_without_mutation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    sample = _sample(
+        tmp_path,
+        dataset=STAGE2_SINGLE_DATASET,
+        row_id=0,
+        seed=1,
+        prompts=("single prompt",),
+    )
+    root = Path(config.output_root)
+    video = root / sample.output_relative_path
+    video.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+    video.symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="non-empty regular file"):
+        run_stage2_inference(
+            config,
+            context=_context(),
+            ops=_runtime_ops((sample,), {}),
+        )
+
+    assert video.is_symlink()
+    assert outside.read_bytes() == b"outside"
+    assert not (root / ".stage2-incomplete").exists()
+
+
+def test_video_only_artifact_is_not_recovered_when_manifest_exists(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    sample = _sample(
+        tmp_path,
+        dataset=STAGE2_SINGLE_DATASET,
+        row_id=0,
+        seed=1,
+        prompts=("single prompt",),
+    )
+    root = Path(config.output_root)
+    video = root / sample.output_relative_path
+    video.parent.mkdir(parents=True)
+    _video_writer(
+        torch.zeros((1, 96, 3, sample.height, sample.width)),
+        video,
+        fps=24,
+    )
+    atomic_write_json(root / STAGE2_INFERENCE_MANIFEST_NAME, {"status": "complete"})
+
+    with pytest.raises(RuntimeError, match="complete manifest"):
+        run_stage2_inference(
+            config,
+            context=_context(),
+            ops=_runtime_ops((sample,), {}),
+        )
+
+    assert video.is_file()
+    assert not (root / ".stage2-incomplete").exists()
+
+
+def test_quarantined_video_only_artifact_survives_another_generation_failure(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    sample = _sample(
+        tmp_path,
+        dataset=STAGE2_SINGLE_DATASET,
+        row_id=0,
+        seed=1,
+        prompts=("single prompt",),
+    )
+    root = Path(config.output_root)
+    video = root / sample.output_relative_path
+    video.parent.mkdir(parents=True)
+    _video_writer(
+        torch.zeros((1, 96, 3, sample.height, sample.width)),
+        video,
+        fps=24,
+    )
+    orphan_payload = video.read_bytes()
+    probe_calls = {"count": 0}
+
+    def reject_new_video_after_recovery(path: Path) -> dict[str, Any]:
+        probe_calls["count"] += 1
+        if probe_calls["count"] > 2:
+            raise RuntimeError("new video probe failed")
+        return _video_probe(path)
+
+    with pytest.raises(RuntimeError, match="new video probe failed"):
+        run_stage2_inference(
+            config,
+            context=_context(),
+            ops=_runtime_ops(
+                (sample,),
+                {},
+                probe_fn=reject_new_video_after_recovery,
+            ),
+        )
+
+    recovered = tuple((root / ".stage2-incomplete").rglob("*.mp4"))
+    assert len(recovered) == 1
+    assert recovered[0].read_bytes() == orphan_payload
+    assert not video.exists()
+    assert not (root / sample.trace_relative_path).exists()
+    assert not (root / STAGE2_INFERENCE_MANIFEST_NAME).exists()
+
+    result = run_stage2_inference(
+        config,
+        context=_context(),
+        ops=_runtime_ops((sample,), {}),
+    )
+
+    assert result["status"] == "complete"
+    assert result["local_generated"] == 1
+    assert video.is_file()
+    assert (root / sample.trace_relative_path).is_file()
+    assert recovered[0].read_bytes() == orphan_payload
+
+
+def test_trace_only_artifact_still_fails_closed(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    sample = _sample(
+        tmp_path,
+        dataset=STAGE2_SINGLE_DATASET,
+        row_id=0,
+        seed=1,
+        prompts=("single prompt",),
+    )
+    root = Path(config.output_root)
+    trace = root / sample.trace_relative_path
+    trace.parent.mkdir(parents=True)
+    trace.write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match=r"video\+trace pair"):
         run_stage2_inference(
             config,
             context=_context(),
-            ops=_runtime_ops((sample,), calls),
+            ops=_runtime_ops((sample,), {}),
         )
 
-    assert calls["generator_loads"] == 1
-    assert not (Path(config.output_root) / STAGE2_INFERENCE_MANIFEST_NAME).exists()
+    assert trace.read_text(encoding="utf-8") == "{}\n"
+    assert not (root / ".stage2-incomplete").exists()
 
 
 def test_video_probe_failure_commits_neither_pair_nor_complete_manifest(

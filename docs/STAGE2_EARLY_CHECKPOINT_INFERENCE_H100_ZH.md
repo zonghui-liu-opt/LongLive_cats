@@ -81,6 +81,10 @@ Stage-2 output root identity changed
 不要删除输出目录；完整的video+trace会重新校验后跳过。新版会在输出根创建
 `.stage2-output-root-anchor.json`作为持久身份，不要修改或删除它；真实目录替换和symlink仍会被拒绝。
 
+如果旧错误发生在MP4提交后、trace写入前，新版会先再次严格验收这个单边视频，将原文件保留到
+`<输出目录>/.stage2-incomplete/`，再用同一sample/seed重生成完整video+trace。坏视频、symlink、
+trace-only或已有最终manifest的损坏结果不会自动处理。隐藏隔离区不计入56个正式视频；整批验收通过后可人工归档。
+
 ### 2.1 使用另一台 8×H100 加速
 
 现有入口使用样本级数据并行。8 张卡会把 56 个样本平均分片，每张卡生成 7 个视频：

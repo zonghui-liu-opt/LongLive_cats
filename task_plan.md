@@ -4,7 +4,7 @@
 完整落实 `TASK-stage2-self-forcing-dmd-dfd.md`：以Stage‑1 step3075 EMA为唯一Generator起点，连续完成训练、日志/权重/可视化、batch推理、trace与压缩/sink通用接口；保持Stage‑1与legacy DMD行为不回归，不再受旧检查点暂停规则约束。
 
 ## 当前阶段
-Phase 29 已完成并通过干净提交树回归：共享存储在视频提交后的输出根目录identity漂移可续跑，根目录替换、symlink逃逸、anchor破坏和不完整产物仍严格拒绝。
+Phase 30 进行中：闭环旧版root guard失败遗留的“正式视频已提交、trace未提交”单边产物，使同步新代码后可直接安全续跑。
 
 ## 各阶段
 
@@ -251,6 +251,14 @@ Phase 29 已完成并通过干净提交树回归：共享存储在视频提交�
 - [x] 29.4 运行Stage-2 inference聚焦/完整回归与静态检查，精确提交并push `stage-2`
 - **Status:** complete（干净提交树Stage-2 inference 108 passed；Black/Ruff/py_compile/diff-check通过；生产提交`9a61be5`已push并由ls-remote核验）
 
+### Phase 30：已验收video-only单边产物自动恢复
+- [x] 30.1 复核精确提交顺序，确认旧错误会留下正式MP4但没有trace，现有resume会在模型加载后拒绝该orphan
+- [x] 30.2 补合法video-only恢复、坏视频/symlink/complete-manifest拒绝红测
+- [x] 30.3 将合法单边视频安全移入根内隐藏隔离区，再按原确定性输入重生成完整video+trace
+- [x] 30.4 验证多rank preflight、二次失败续跑、最终56件套与root anchor门禁不回归
+- [ ] 30.5 更新中文文档，运行干净树回归并再次push `stage-2`
+- **Status:** in_progress
+
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
 2. 仓库当前已有多少可复用实现，哪些部分需要补齐？
@@ -272,6 +280,7 @@ Phase 29 已完成并通过干净提交树回归：共享存储在视频提交�
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |
 |------|---------|---------|
+| Phase 30四项video-only恢复测试在旧实现上全部仍报complete pair | 1 | 这是预期红基线；实现严格复验、根内隔离和重生成后4项转绿，并补二次失败与trace-only反例 |
 | Phase 29首次规划组合补丁引用了`findings.md`中不存在的相邻上下文，整次补丁未应用 | 1 | 重新读取三份规划文件头部并拆分为精确的小补丁 |
 | Phase 29完整inference本地回归有1项shell契约失败 | 1 | 失败只来自用户现场`infer_stage2_tmp.sh`删除shebang的未提交定制；保留现场脚本，并从精确提交创建干净worktree复验为108 passed |
 | Phase 28红测在收集期因`resolve_ffprobe`尚不存在而ImportError | 1 | 这是预期红基线；实现解析器后坏首候选/显式override/shell三项转绿 |

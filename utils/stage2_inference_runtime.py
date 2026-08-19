@@ -70,6 +70,7 @@ from utils.stage2_inference_loader import load_stage2_ema_generator_for_inferenc
 _OUTPUT_ROOT_GUARD_SCHEMA = "longlive_stage2_output_root_guard/v2"
 _OUTPUT_ROOT_ANCHOR_SCHEMA = "longlive_stage2_output_root_anchor/v1"
 _OUTPUT_ROOT_ANCHOR_NAME = ".stage2-output-root-anchor.json"
+_INCOMPLETE_ARTIFACT_DIRECTORY = ".stage2-incomplete"
 
 
 @dataclass(frozen=True)
@@ -895,6 +896,81 @@ def _validate_video_tensor(
         raise RuntimeError("Stage-2 generated video must stay in [0,1]")
 
 
+def _quarantine_valid_video_only_artifact(
+    guard: _Stage2OutputRootGuard,
+    *,
+    sample: Stage2InferenceSample,
+    video_path: Path,
+    ops: Stage2InferenceRuntimeOps,
+) -> Path:
+    """Preserve one validated video that cannot have a trustworthy trace.
+
+    A failure after the atomic MP4 commit but before trace construction leaves
+    this exact state.  The generation audit cannot be reconstructed from the
+    video, so preserve it outside the formal artifact trees and deterministically
+    regenerate the complete pair.
+    """
+
+    root = _assert_output_root_guard(guard)
+    manifest_path = root / STAGE2_INFERENCE_MANIFEST_NAME
+    if manifest_path.exists() or manifest_path.is_symlink():
+        raise RuntimeError(
+            "Stage-2 will not recover a video-only artifact after the complete "
+            f"manifest exists: {sample.sample_key}"
+        )
+    _assert_regular_parents(guard, video_path, allow_missing=False)
+    technical = dict(
+        validate_stage2_video_artifact(
+            sample,
+            video_path,
+            probe_fn=ops.probe_video,
+        )
+    )
+    _assert_regular_parents(guard, video_path, allow_missing=False)
+    recovery_parent = (
+        root / _INCOMPLETE_ARTIFACT_DIRECTORY / sample.output_relative_path.parent
+    )
+    recovery_name = (
+        f"{video_path.stem}.recovered-{technical['sha256'][:16]}-"
+        f"{secrets.token_hex(8)}{video_path.suffix}"
+    )
+    recovery_path = recovery_parent / recovery_name
+    _ensure_regular_parents(guard, recovery_path)
+    if recovery_path.exists() or recovery_path.is_symlink():
+        raise FileExistsError(recovery_path)
+    _assert_output_root_guard(guard)
+    os.replace(video_path, recovery_path)
+    for directory in (video_path.parent, recovery_path.parent):
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    _assert_regular_parents(guard, recovery_path, allow_missing=False)
+    if video_path.exists() or video_path.is_symlink():
+        raise RuntimeError(
+            f"Stage-2 video-only artifact remained at its formal path: {video_path}"
+        )
+    recovered = dict(
+        validate_stage2_video_artifact(
+            sample,
+            recovery_path,
+            probe_fn=ops.probe_video,
+        )
+    )
+    if recovered != technical:
+        raise RuntimeError(
+            f"Stage-2 video-only artifact changed while quarantining: {video_path}"
+        )
+    _assert_output_root_guard(guard)
+    print(
+        "[stage2-inference recovery] preserved validated video-only artifact: "
+        f"{recovery_path}; regenerating {sample.sample_key}",
+        flush=True,
+    )
+    return recovery_path
+
+
 def _validate_existing_pair(
     guard: _Stage2OutputRootGuard,
     *,
@@ -912,6 +988,14 @@ def _validate_existing_pair(
     trace_exists = trace_path.exists() or trace_path.is_symlink()
     _assert_output_root_guard(guard)
     if video_exists != trace_exists:
+        if video_exists and not trace_exists:
+            _quarantine_valid_video_only_artifact(
+                guard,
+                sample=sample,
+                video_path=video_path,
+                ops=ops,
+            )
+            return None
         raise RuntimeError(
             "Stage-2 resumability requires a complete video+trace pair; found only "
             f"one artifact for {sample.sample_key}"
