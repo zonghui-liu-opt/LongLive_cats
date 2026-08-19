@@ -249,7 +249,7 @@ Phase 29 已完成并通过干净提交树回归：共享存储在视频提交�
 - [x] 29.2 先补合法identity漂移、真实目录替换和anchor破坏红测，再实现持久内容anchor门禁
 - [x] 29.3 验证多rank并发初始化、断点续跑、video/trace原子提交和最终manifest/index不回归
 - [x] 29.4 运行Stage-2 inference聚焦/完整回归与静态检查，精确提交并push `stage-2`
-- **Status:** complete（干净提交树Stage-2 inference 108 passed；Black/Ruff/py_compile/diff-check通过；生产提交待本轮push核验）
+- **Status:** complete（干净提交树Stage-2 inference 108 passed；Black/Ruff/py_compile/diff-check通过；生产提交`9a61be5`已push并由ls-remote核验）
 
 ## 关键问题
 1. 任务文档规定了哪些明确交付物和验收指标？
