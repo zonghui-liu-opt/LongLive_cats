@@ -680,6 +680,11 @@ class Trainer:
                 self.optimizers[role],
                 role=role,
                 expected_schema=self.lora_schemas[role],
+                expected_optimizer_spec=(
+                    self.resolved.generator_optimizer
+                    if role == "generator"
+                    else self.resolved.fake_score_optimizer
+                ),
             )
         self.generator_ema = TrainableShardedEMA(
             self.model.generator,
@@ -706,6 +711,7 @@ class Trainer:
                 expected_completed_updates=resume_payload.trainer_state[
                     "completed_generator_updates"
                 ],
+                expected_optimizer_spec=self.resolved.generator_optimizer,
             )
             restore_stage2_optimizer_state(
                 module=self.model.fake_score,
@@ -716,6 +722,7 @@ class Trainer:
                 expected_completed_updates=resume_payload.trainer_state[
                     "completed_fake_updates"
                 ],
+                expected_optimizer_spec=self.resolved.fake_score_optimizer,
             )
             self.generator_ema.load_state_dict(
                 resume_payload.local_ema_state, self.model.generator
@@ -1748,6 +1755,11 @@ class Trainer:
                     expected_schema=self.lora_schemas[role],
                     require_initialized_moments=True,
                     expected_completed_updates=expected_completed,
+                    expected_optimizer_spec=(
+                        self.resolved.generator_optimizer
+                        if role == "generator"
+                        else self.resolved.fake_score_optimizer
+                    ),
                 ),
             )
 
@@ -2551,6 +2563,7 @@ class Trainer:
             topology=self._checkpoint_topology(),
             shard_group=self.mesh.get_group("shard"),
             keep_last=self.resolved.keep_last_resumable,
+            milestone_updates=self.resolved.milestone_generator_updates,
         )
         return self._runtime_rank0_checked(
             "read committed Stage-2 checkpoint event",
@@ -2661,6 +2674,7 @@ class Trainer:
             cycle_nonfinite_start = self.state.nonfinite_attempts
             should_save = not self.options.no_save and (
                 self.options.smoke_mode in {"C0", "C1"}
+                or self.state.completed_g in self.resolved.milestone_generator_updates
                 or self.state.completed_g
                 % self.resolved.checkpoint_interval_generator_updates
                 == 0

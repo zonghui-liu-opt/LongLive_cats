@@ -47,14 +47,19 @@ def test_cli_help_is_cpu_safe() -> None:
     assert "Any canonical rollout profile" in completed.stdout
 
 
-def test_release_shell_is_strict_fixed_baseline_torchrun() -> None:
+def test_release_shell_is_strict_observable_baseline_torchrun() -> None:
     shell = PROJECT_ROOT / "infer_stage2_baseline.sh"
     text = shell.read_text(encoding="utf-8")
     subprocess.run(["bash", "-n", str(shell)], check=True)
     assert "set -euo pipefail" in text
-    assert 'exec "${STAGE2_TORCHRUN}"' in text
+    assert '"${STAGE2_TORCHRUN}"' in text
     assert '--no-python "${STAGE2_PYTHON}" -I -B' in text
-    assert "--nproc-per-node=8" in text
+    assert '--nproc-per-node="${STAGE2_INFERENCE_NPROC}"' in text
+    assert 'STAGE2_INFERENCE_NPROC="${STAGE2_INFERENCE_NPROC:-8}"' in text
+    assert "STAGE2_INFERENCE_HEARTBEAT=RUNNING" in text
+    assert "STAGE2_FFPROBE=PASS" in text
+    assert "resolve_ffprobe" in text
+    assert "PYTHONUNBUFFERED=1" in text
     assert "configs/infer_i2v_stage2_baseline.yaml" in text
     assert "LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT" in text
     assert "LONG_LIVE_STAGE2_INFERENCE_OUTPUT" in text

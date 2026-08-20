@@ -1057,6 +1057,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
         topology,
         shard_group,
         keep_last,
+        milestone_updates,
     ):
         saver_calls.append(
             {
@@ -1077,6 +1078,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
                 "topology": topology,
                 "shard_group": shard_group,
                 "keep_last": keep_last,
+                "milestone_updates": milestone_updates,
             }
         )
         old_directory.rmdir()
@@ -1192,6 +1194,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
     assert saver["topology"] == trainer._checkpoint_topology()
     assert saver["shard_group"] is shard_group
     assert saver["keep_last"] == resolved.keep_last_resumable
+    assert saver["milestone_updates"] == resolved.milestone_generator_updates
 
     assert event["path"] == str(destination)
     assert event["manifest_sha256"] == "f" * 64

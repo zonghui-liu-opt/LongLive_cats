@@ -13,6 +13,7 @@ TASK = PROJECT_ROOT / "TASK-stage2-self-forcing-dmd-dfd.md"
 RUNBOOK = PROJECT_ROOT / "docs" / "STAGE2_H100_QUICK_DEPLOY_ZH.md"
 FULL_RUNBOOK = PROJECT_ROOT / "docs" / "STAGE2_H100_TRAINING_INFERENCE_RUNBOOK_ZH.md"
 CONFIG = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats.yaml"
+LONG_CONFIG = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats_micro1_acc8.yaml"
 PREPARE = PROJECT_ROOT / "prepare_stage2.sh"
 PRECOMPUTE = PROJECT_ROOT / "precompute_stage2_i2v_cache_h100_8gpu.sh"
 CONTRACT_HASH = "a7365f2ec45f74c3918ec05725b5d19b488fa4447a409cc6b5db4ccb114dd6c6"
@@ -59,18 +60,24 @@ def test_full_stage2_runbook_covers_exact_release_lifecycle():
         "--stage2-smoke C0",
         "--stage2-smoke C1",
         "--stage2-smoke C2",
-        "microbatch_size_per_device = 1",
-        "gradient_accumulation_steps = 8",
-        "checkpoint_stage2_g000280",
-        "checkpoint_stage2_g000240",
+        "train_i2v_stage2_600cats_micro1_acc8.yaml",
+        "8卡×micro1×acc8=global batch 64",
+        "smoke_longrun",
+        "Phase A=360 epoch",
+        "Generator/Fake-score",
+        "LR=`1e-5/2e-6`",
+        "checkpoint_stage2_g004000",
+        "checkpoint_stage2_g003600",
         "formal_matched_b0",
         'phase_b_mode = "dmd_only"',
         "phase_b_dfd_probability_max = 0.0",
         "immutable ancestry anchor",
         "metrics_lineage.jsonl",
         "--require-complete",
-        "infer_stage2_baseline.sh",
-        "STAGE2_BASELINE_INFERENCE_ARTIFACTS=PASS",
+        "bash run_stage2_h100.sh infer all",
+        "bash run_stage2_h100.sh infer 40 80 120 160 200 240 400 800 1200 1600 2400 3200 3600 4000",
+        "STAGE2_GUIDE_INFER=PASS checkpoints=N",
+        ".stage2-incomplete/",
         "Stage-2 源码 SHA-256",
         "abs(error_seconds) <= max(0.1, 0.05 * step_seconds_max)",
         "SIGKILL",
@@ -81,6 +88,7 @@ def test_full_stage2_runbook_covers_exact_release_lifecycle():
     assert "200/200/200" not in text
     assert "checkpoint_model_003750" not in text
     assert "git status" not in text
+    assert "G60/G70" not in text
 
 
 def test_documented_b0_transform_is_a_resolvable_same_contract_resume(tmp_path):
@@ -101,6 +109,26 @@ def test_documented_b0_transform_is_a_resolvable_same_contract_resume(tmp_path):
     assert b0.phase_b_mode == "dmd_only"
     assert b0.phase_b_dfd_probability_max == 0.0
     assert b0.contract_hash() == baseline.contract_hash() == CONTRACT_HASH
+
+
+def test_documented_longrun_b0_transform_uses_g3600_same_contract_parent(tmp_path):
+    b1_config = OmegaConf.load(LONG_CONFIG)
+    b1 = resolve_stage2_config(b1_config)
+    anchor = tmp_path / "checkpoint_stage2_g003600"
+    anchor.mkdir()
+
+    b0_config = OmegaConf.load(LONG_CONFIG)
+    b0_config.checkpoints.init_from_stage1 = None
+    b0_config.checkpoints.resume_stage2 = str(anchor.resolve(strict=True))
+    b0_config.training.phase_b_mode = "dmd_only"
+    b0_config.training.phase_b_dfd_probability_max = 0.0
+    b0 = resolve_stage2_config(b0_config)
+
+    assert b0.phase_a_generator_updates == 3_600
+    assert b0.total_generator_updates == 4_000
+    assert b0.resume_stage2_checkpoint == str(anchor.resolve())
+    assert b0.contract_hash() == b1.contract_hash()
+    assert b0.launch_hash() != b1.launch_hash()
 
 
 def test_stage2_release_work_root_defaults_outside_the_checkout():

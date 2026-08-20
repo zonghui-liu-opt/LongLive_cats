@@ -1180,6 +1180,7 @@ def restore_stage2_optimizer_state(
                 role=role,
                 expected_parameter_names=names,
                 expected_completed_updates=expected_completed_updates,
+                expected_optimizer_spec=expected_optimizer_spec,
             )
             runtime_optimizer_state = _optimizer_state_for_runtime(
                 canonical_optimizer_state,
@@ -1347,7 +1348,22 @@ def _apply_exact_unit(source: str, unit: _PatchUnit) -> tuple[str, bool]:
     legacy_count = source.count(unit.legacy)
     current_count = source.count(unit.current)
     if legacy_count == 1 and current_count == 0:
-        return source.replace(unit.legacy, unit.current, 1), True
+        replacement = unit.current
+        if unit.name == "optimizer_restore_name_transform":
+            optimizer_spec_signature = """    expected_completed_updates: int,
+    expected_optimizer_spec: Any | None = None,
+    collectives: Stage2CollectiveOps | None = None,
+"""
+            optimizer_spec_argument = (
+                "                expected_optimizer_spec=expected_optimizer_spec,\n"
+            )
+            if optimizer_spec_signature not in source:
+                if replacement.count(optimizer_spec_argument) != 1:
+                    raise HotfixError(
+                        "optimizer restore hotfix has an invalid optimizer-spec fragment"
+                    )
+                replacement = replacement.replace(optimizer_spec_argument, "", 1)
+        return source.replace(unit.legacy, replacement, 1), True
     if legacy_count == 0 and current_count == 1:
         return source, False
     raise HotfixError(

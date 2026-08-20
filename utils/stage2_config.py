@@ -26,6 +26,7 @@ STAGE2_CONFIG_SCHEMA = "longlive_stage2_train/v1"
 STAGE2_METRICS_SCHEMA = "longlive_stage2_metrics/v1"
 STAGE2_TRAINER = "stage2_distillation"
 STAGE2_PROFILE = "baseline"
+STAGE2_H100_LONGRUN_PROFILE = "h100_micro1_acc8_longrun"
 STAGE2_NEGATIVE_PROMPT_SHA256 = hashlib.sha256(
     DEFAULT_NEGATIVE_PROMPT.encode("utf-8")
 ).hexdigest()
@@ -35,6 +36,59 @@ _CORE_TARGET_PATTERNS = (
     r"^blocks\.[0-9]+\.ffn\.(0|2)$",
 )
 _CANDIDATE_BATCH_PROFILES = ((2, 4), (1, 8))
+
+
+@dataclass(frozen=True)
+class _Stage2ProfileSpec:
+    training_batch_profiles: tuple[tuple[int, int], ...]
+    phase_a_epochs: int
+    phase_b_epochs: int
+    generator_lr: float
+    fake_score_lr: float
+    checkpoint_every_generator_epochs: int
+    phase_a_milestone_epochs: tuple[int, ...]
+    phase_b_milestone_epochs: tuple[int, ...]
+
+
+_STAGE2_PROFILE_SPECS = {
+    STAGE2_PROFILE: _Stage2ProfileSpec(
+        training_batch_profiles=_CANDIDATE_BATCH_PROFILES,
+        phase_a_epochs=24,
+        phase_b_epochs=4,
+        generator_lr=2.0e-6,
+        fake_score_lr=4.0e-7,
+        checkpoint_every_generator_epochs=1,
+        phase_a_milestone_epochs=(8, 12, 16, 20, 24),
+        phase_b_milestone_epochs=(1, 2, 3, 4),
+    ),
+    STAGE2_H100_LONGRUN_PROFILE: _Stage2ProfileSpec(
+        training_batch_profiles=((1, 8),),
+        phase_a_epochs=360,
+        phase_b_epochs=40,
+        generator_lr=1.0e-5,
+        fake_score_lr=2.0e-6,
+        checkpoint_every_generator_epochs=4,
+        phase_a_milestone_epochs=(
+            4,
+            8,
+            12,
+            16,
+            20,
+            24,
+            40,
+            60,
+            80,
+            120,
+            160,
+            200,
+            240,
+            280,
+            320,
+            360,
+        ),
+        phase_b_milestone_epochs=(1, 2, 3, 4, 10, 20, 30, 40),
+    ),
+}
 _CONTRACT_LOCAL_DERIVED_FIELDS = {
     "initialization_mode",
     "architecture_root",
@@ -49,7 +103,7 @@ _CONTRACT_LOCAL_DERIVED_FIELDS = {
     "action_labels_path",
     "negative_conditioning_manifest",
     "jsonl_path",
-    # These are the two task-book-authorized post-A24 matched-arm choices.
+    # These are the two matched-arm choices after the resolved Phase-A boundary.
     # They must be excluded from both halves of the contract payload: the
     # canonical config view below and the duplicated resolved/derived view.
     "phase_b_mode",
@@ -762,7 +816,11 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
     config_schema = _string(raw["config_schema"], "config_schema")
     _locked("config_schema", config_schema, STAGE2_CONFIG_SCHEMA)
     profile = _string(raw["profile"], "profile")
-    _locked("profile", profile, STAGE2_PROFILE)
+    profile_spec = _STAGE2_PROFILE_SPECS.get(profile)
+    if profile_spec is None:
+        raise ValueError(
+            f"profile must be one of {tuple(_STAGE2_PROFILE_SPECS)}, got {profile!r}"
+        )
 
     infra = _required_section(raw, "infra", _INFRA_KEYS)
     expected_nodes = _locked_integer(infra, "expected_nodes", "infra", 1)
@@ -1196,10 +1254,10 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         "training.gradient_accumulation_steps",
         minimum=1,
     )
-    if (microbatch_size, accumulation) not in _CANDIDATE_BATCH_PROFILES:
+    if (microbatch_size, accumulation) not in profile_spec.training_batch_profiles:
         raise ValueError(
-            "training microbatch/accumulation must be one of the candidate "
-            f"Stage-2 preflight profiles {_CANDIDATE_BATCH_PROFILES}, got "
+            f"training microbatch/accumulation for profile {profile!r} must be "
+            f"one of the candidate profiles {profile_spec.training_batch_profiles}, got "
             f"{(microbatch_size, accumulation)}."
         )
     if saved_tensor_cpu_offload and (microbatch_size, accumulation) != (1, 8):
@@ -1229,11 +1287,17 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         "training",
         5,
     )
-    phase_a_epochs = _locked_integer(training, "phase_a_epochs", "training", 24)
+    phase_a_epochs = _locked_integer(
+        training,
+        "phase_a_epochs",
+        "training",
+        profile_spec.phase_a_epochs,
+    )
     phase_b_epochs = _integer(training["phase_b_epochs"], "training.phase_b_epochs")
-    if phase_b_epochs not in (0, 4):
+    if phase_b_epochs not in (0, profile_spec.phase_b_epochs):
         raise ValueError(
-            "training.phase_b_epochs must be 0 for an A-only run or 4 for a "
+            "training.phase_b_epochs must be 0 for an A-only run or "
+            f"{profile_spec.phase_b_epochs} for a "
             f"matched Phase-B run, got {phase_b_epochs}."
         )
     phase_b_mode = _string(training["phase_b_mode"], "training.phase_b_mode")
@@ -1252,7 +1316,7 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
     else:
         raise ValueError(
             "training.phase_b_mode must be 'dmd_dfd' or 'dmd_only' when "
-            "training.phase_b_epochs is 4."
+            f"training.phase_b_epochs is {profile_spec.phase_b_epochs}."
         )
     reset_optimizers_between_phases = _locked_boolean(
         training,
@@ -1270,10 +1334,14 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         _OPTIMIZER_ROLE_NAMES,
     )
     generator_optimizer = _validate_optimizer(
-        optimizers["generator"], "generator", expected_lr=2.0e-6
+        optimizers["generator"],
+        "generator",
+        expected_lr=profile_spec.generator_lr,
     )
     fake_score_optimizer = _validate_optimizer(
-        optimizers["fake_score"], "fake_score", expected_lr=4.0e-7
+        optimizers["fake_score"],
+        "fake_score",
+        expected_lr=profile_spec.fake_score_lr,
     )
 
     ema = _exact_keys(training["ema"], "training.ema", _EMA_KEYS)
@@ -1293,7 +1361,10 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
 
     checkpointing = _required_section(raw, "checkpointing", _CHECKPOINTING_KEYS)
     checkpoint_epochs = _locked_integer(
-        checkpointing, "every_generator_epochs", "checkpointing", 1
+        checkpointing,
+        "every_generator_epochs",
+        "checkpointing",
+        profile_spec.checkpoint_every_generator_epochs,
     )
     keep_last_resumable = _locked_integer(
         checkpointing, "keep_last_resumable", "checkpointing", 2
@@ -1319,12 +1390,12 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
     _locked(
         "checkpointing.phase_a_milestone_epochs",
         phase_a_milestones,
-        (8, 12, 16, 20, 24),
+        profile_spec.phase_a_milestone_epochs,
     )
     _locked(
         "checkpointing.phase_b_milestone_epochs",
         phase_b_milestones,
-        (1, 2, 3, 4),
+        profile_spec.phase_b_milestone_epochs,
     )
     atomic_success_marker = _locked_boolean(
         checkpointing, "atomic_success_marker", "checkpointing", True

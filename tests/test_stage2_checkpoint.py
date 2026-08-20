@@ -176,6 +176,22 @@ def test_checkpoint_phase_state_uses_the_resolved_config_mode_names():
         )
 
 
+def test_longrun_phase_boundaries_do_not_reuse_legacy_g280_labels():
+    kwargs = {
+        "phase_a_generator_updates": 3_600,
+        "phase_b_generator_updates": 400,
+        "phase_b_mode": "dmd_dfd",
+    }
+    assert derive_stage2_phase_state(280, **kwargs)["milestone"] is None
+    assert derive_stage2_phase_state(280, **kwargs)["phase"] == "A"
+    phase_b_entry = derive_stage2_phase_state(3_600, **kwargs)
+    assert phase_b_entry["phase"] == "B"
+    assert phase_b_entry["milestone"] == "A360"
+    terminal = derive_stage2_phase_state(4_000, **kwargs)
+    assert terminal["phase"] == "complete"
+    assert terminal["milestone"] == "B40"
+
+
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
@@ -404,6 +420,41 @@ def test_fake_score_optimizer_uses_its_distinct_locked_learning_rate():
         )
         is state
     )
+
+
+@pytest.mark.parametrize(
+    ("role", "learning_rate"),
+    (("generator", 1.0e-5), ("fake_score", 2.0e-6)),
+)
+def test_optimizer_state_accepts_explicit_longrun_resolved_spec(role, learning_rate):
+    state = _tiny_optimizer_state()
+    state["param_groups"][0]["lr"] = learning_rate
+    spec = {
+        "role": role,
+        "optimizer_type": "adamw",
+        "learning_rate": learning_rate,
+        "betas": [0.0, 0.999],
+        "eps": 1.0e-8,
+        "weight_decay": 0.0,
+        "schedule": "constant",
+    }
+    assert (
+        validate_stage2_full_optimizer_state(
+            state,
+            role=role,
+            expected_parameter_names=("lora_A", "lora_B"),
+            expected_completed_updates=5,
+            expected_optimizer_spec=spec,
+        )
+        is state
+    )
+    with pytest.raises(ValueError, match="lr mismatch"):
+        validate_stage2_full_optimizer_state(
+            state,
+            role=role,
+            expected_parameter_names=("lora_A", "lora_B"),
+            expected_completed_updates=5,
+        )
 
 
 def test_optimizer_restore_interface_broadcasts_then_audits_local_moments():

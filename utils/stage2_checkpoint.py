@@ -383,11 +383,28 @@ def validate_stage2_cycle_boundary(
     }
 
 
-def _milestone_name(completed_g: int) -> str | None:
-    if completed_g in (80, 120, 160, 200, 240):
-        return f"A{completed_g // 10}"
-    if completed_g in (250, 260, 270, 280):
-        return f"B{(completed_g - 240) // 10}"
+def _milestone_name(
+    completed_g: int,
+    *,
+    phase_a_generator_updates: int,
+    phase_b_generator_updates: int,
+) -> str | None:
+    # Preserve byte-for-byte legacy state semantics for the published A24/B4
+    # contract. New schedules label their two scientifically important arm
+    # boundaries without pretending that G250/G280 are Phase-B milestones.
+    if phase_a_generator_updates == 240 and phase_b_generator_updates in (0, 40):
+        if completed_g in (80, 120, 160, 200, 240):
+            return f"A{completed_g // 10}"
+        if phase_b_generator_updates and completed_g in (250, 260, 270, 280):
+            return f"B{(completed_g - 240) // 10}"
+        return None
+    if completed_g == phase_a_generator_updates:
+        return f"A{completed_g // STAGE2_GENERATOR_UPDATES_PER_EPOCH}"
+    if (
+        phase_b_generator_updates
+        and completed_g == phase_a_generator_updates + phase_b_generator_updates
+    ):
+        return f"B{phase_b_generator_updates // STAGE2_GENERATOR_UPDATES_PER_EPOCH}"
     return None
 
 
@@ -448,7 +465,11 @@ def derive_stage2_phase_state(
         "completed_generator_epochs": completed // 10,
         "generator_update_cursor_in_epoch": cursor,
         "next_dfd_probability": next_probability,
-        "milestone": _milestone_name(completed),
+        "milestone": _milestone_name(
+            completed,
+            phase_a_generator_updates=phase_a,
+            phase_b_generator_updates=phase_b,
+        ),
     }
 
 
@@ -976,6 +997,7 @@ def _validate_stage2_optimizer_param_groups(
     groups: Any,
     *,
     role: str,
+    expected_optimizer_spec: Any | None = None,
 ) -> Sequence[Mapping[str, Any]]:
     if role not in _STAGE2_OPTIMIZER_CONTRACT:
         raise ValueError(f"invalid Stage-2 optimizer role {role!r}")
@@ -986,7 +1008,10 @@ def _validate_stage2_optimizer_param_groups(
             f"Stage-2 {role} optimizer must contain exactly one param group"
         )
     group = groups[0]
-    expected = _STAGE2_OPTIMIZER_CONTRACT[role]
+    expected = _stage2_optimizer_contract(
+        role,
+        expected_optimizer_spec=expected_optimizer_spec,
+    )
     for key in ("lr", "eps", "weight_decay"):
         value = group.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1014,6 +1039,94 @@ def _validate_stage2_optimizer_param_groups(
     return groups
 
 
+def _stage2_optimizer_contract(
+    role: str,
+    *,
+    expected_optimizer_spec: Any | None = None,
+) -> dict[str, Any]:
+    """Normalize a resolved optimizer spec while preserving the legacy default."""
+
+    if role not in _STAGE2_OPTIMIZER_CONTRACT:
+        raise ValueError(f"invalid Stage-2 optimizer role {role!r}")
+    if expected_optimizer_spec is None:
+        return dict(_STAGE2_OPTIMIZER_CONTRACT[role])
+    if isinstance(expected_optimizer_spec, Mapping):
+        spec = expected_optimizer_spec
+        spec_role = spec.get("role", role)
+        optimizer_type = spec.get("optimizer_type", spec.get("type", "adamw"))
+        schedule = spec.get("schedule", "constant")
+        learning_rate = spec.get("learning_rate", spec.get("lr"))
+        betas = spec.get("betas")
+        eps = spec.get("eps")
+        weight_decay = spec.get("weight_decay")
+    else:
+        spec_role = getattr(expected_optimizer_spec, "role", role)
+        optimizer_type = getattr(expected_optimizer_spec, "optimizer_type", None)
+        schedule = getattr(expected_optimizer_spec, "schedule", None)
+        learning_rate = getattr(expected_optimizer_spec, "learning_rate", None)
+        betas = getattr(expected_optimizer_spec, "betas", None)
+        eps = getattr(expected_optimizer_spec, "eps", None)
+        weight_decay = getattr(expected_optimizer_spec, "weight_decay", None)
+    if spec_role != role:
+        raise ValueError(
+            f"Stage-2 optimizer spec role mismatch: {spec_role!r} != {role!r}"
+        )
+    if optimizer_type != "adamw" or schedule != "constant":
+        raise ValueError(f"Stage-2 {role} optimizer spec must be constant AdamW")
+    numeric = {
+        "lr": learning_rate,
+        "eps": eps,
+        "weight_decay": weight_decay,
+    }
+    for key, value in numeric.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise TypeError(f"Stage-2 {role} optimizer spec {key} must be finite")
+    if float(learning_rate) <= 0.0 or float(eps) <= 0.0 or float(weight_decay) < 0.0:
+        raise ValueError(f"Stage-2 {role} optimizer spec has invalid numeric values")
+    if (
+        isinstance(betas, (str, bytes))
+        or not isinstance(betas, Sequence)
+        or len(betas) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in betas
+        )
+    ):
+        raise TypeError(f"Stage-2 {role} optimizer spec betas are invalid")
+    return {
+        "lr": float(learning_rate),
+        "betas": tuple(float(value) for value in betas),
+        "eps": float(eps),
+        "weight_decay": float(weight_decay),
+    }
+
+
+def _optimizer_spec_from_resolved_config(
+    resolved_config: Any,
+    *,
+    role: str,
+) -> Any | None:
+    """Read the authenticated resolved optimizer spec when one is available."""
+
+    value = (
+        resolved_config.to_dict()
+        if callable(getattr(resolved_config, "to_dict", None))
+        else resolved_config
+    )
+    if not isinstance(value, Mapping):
+        raise TypeError("resolved Stage-2 config must be a mapping")
+    derived = value.get("derived")
+    if not isinstance(derived, Mapping):
+        return None
+    return derived.get(f"{role}_optimizer")
+
+
 def audit_stage2_lora_optimizer(
     module: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -1022,6 +1135,7 @@ def audit_stage2_lora_optimizer(
     expected_schema: Mapping[str, LoraTensorSpec] | None = None,
     require_initialized_moments: bool = False,
     expected_completed_updates: int | None = None,
+    expected_optimizer_spec: Any | None = None,
 ) -> tuple[str, ...]:
     """Assert one optimizer owns exactly one role's FP32 LoRA parameters."""
 
@@ -1075,7 +1189,11 @@ def audit_stage2_lora_optimizer(
         )
     if any(id(parameter) not in expected_ids for parameter in optimizer.state):
         raise ValueError(f"Stage-2 {role} optimizer state contains another role")
-    _validate_stage2_optimizer_param_groups(optimizer.param_groups, role=role)
+    _validate_stage2_optimizer_param_groups(
+        optimizer.param_groups,
+        role=role,
+        expected_optimizer_spec=expected_optimizer_spec,
+    )
     if require_initialized_moments:
         if set(map(id, optimizer.state)) != expected_ids:
             raise ValueError(f"Stage-2 {role} optimizer moments are incomplete")
@@ -1144,6 +1262,7 @@ def validate_stage2_full_optimizer_state(
     role: str,
     expected_parameter_names: Sequence[str],
     expected_completed_updates: int,
+    expected_optimizer_spec: Any | None = None,
 ) -> Mapping[str, Any]:
     """Validate one rank-0 DCP full optimizer-only CPU state."""
 
@@ -1158,7 +1277,11 @@ def validate_stage2_full_optimizer_state(
     groups = value["param_groups"]
     if not isinstance(moments, Mapping) or not isinstance(groups, Sequence):
         raise TypeError(f"Stage-2 {role} optimizer containers are invalid")
-    _validate_stage2_optimizer_param_groups(groups, role=role)
+    _validate_stage2_optimizer_param_groups(
+        groups,
+        role=role,
+        expected_optimizer_spec=expected_optimizer_spec,
+    )
     expected = set(expected_parameter_names)
     if not expected or len(expected) != len(tuple(expected_parameter_names)):
         raise ValueError(f"Stage-2 {role} expected parameter names are invalid")
@@ -1319,6 +1442,7 @@ def gather_stage2_optimizer_state(
     role: str,
     expected_schema: Mapping[str, LoraTensorSpec],
     expected_completed_updates: int,
+    expected_optimizer_spec: Any | None = None,
     collectives: Stage2CollectiveOps | None = None,
     get_optimizer_state_dict_fn: Callable[..., Mapping[str, Any]] | None = None,
     options_factory: Callable[..., Any] | None = None,
@@ -1339,6 +1463,7 @@ def gather_stage2_optimizer_state(
             expected_schema=expected_schema,
             require_initialized_moments=True,
             expected_completed_updates=expected_completed_updates,
+            expected_optimizer_spec=expected_optimizer_spec,
         ),
         ops,
     )
@@ -1366,6 +1491,7 @@ def gather_stage2_optimizer_state(
                 role=role,
                 expected_parameter_names=names,
                 expected_completed_updates=expected_completed_updates,
+                expected_optimizer_spec=expected_optimizer_spec,
             )
         except Exception as exc:
             local_error = exc
@@ -1385,6 +1511,7 @@ def restore_stage2_optimizer_state(
     role: str,
     expected_schema: Mapping[str, LoraTensorSpec],
     expected_completed_updates: int,
+    expected_optimizer_spec: Any | None = None,
     collectives: Stage2CollectiveOps | None = None,
     set_optimizer_state_dict_fn: Callable[..., None] | None = None,
     options_factory: Callable[..., Any] | None = None,
@@ -1403,6 +1530,7 @@ def restore_stage2_optimizer_state(
             optimizer,
             role=role,
             expected_schema=expected_schema,
+            expected_optimizer_spec=expected_optimizer_spec,
         ),
         ops,
     )
@@ -1422,6 +1550,7 @@ def restore_stage2_optimizer_state(
                 role=role,
                 expected_parameter_names=names,
                 expected_completed_updates=expected_completed_updates,
+                expected_optimizer_spec=expected_optimizer_spec,
             )
             runtime_optimizer_state = _optimizer_state_for_runtime(
                 canonical_optimizer_state,
@@ -1464,6 +1593,7 @@ def restore_stage2_optimizer_state(
             expected_schema=expected_schema,
             require_initialized_moments=True,
             expected_completed_updates=expected_completed_updates,
+            expected_optimizer_spec=expected_optimizer_spec,
         ),
         ops,
     )
@@ -2049,6 +2179,8 @@ def _validate_prepared_payloads(
     rank_ema_states: Mapping[int, Mapping[str, Any]],
     rank_rng_states: Mapping[int, Mapping[str, Any]],
     topology: Mapping[str, Any],
+    generator_optimizer_spec: Any | None = None,
+    fake_score_optimizer_spec: Any | None = None,
 ) -> tuple[
     OrderedDict[str, torch.Tensor],
     OrderedDict[str, torch.Tensor],
@@ -2101,12 +2233,14 @@ def _validate_prepared_payloads(
         role="generator",
         expected_parameter_names=generator_names,
         expected_completed_updates=completed_g,
+        expected_optimizer_spec=generator_optimizer_spec,
     )
     validate_stage2_full_optimizer_state(
         canonical_fake_optimizer,
         role="fake_score",
         expected_parameter_names=fake_names,
         expected_completed_updates=completed_f,
+        expected_optimizer_spec=fake_score_optimizer_spec,
     )
     _validate_rank_state_maps(
         rank_ema_states=rank_ema_states,
@@ -2175,6 +2309,16 @@ def save_stage2_checkpoint_from_payloads(
     renamed = False
     quarantined_uncommitted: Path | None = None
     try:
+        if not isinstance(resolved_config, Mapping):
+            raise TypeError("resolved_config must be a mapping")
+        generator_optimizer_spec = _optimizer_spec_from_resolved_config(
+            resolved_config,
+            role="generator",
+        )
+        fake_score_optimizer_spec = _optimizer_spec_from_resolved_config(
+            resolved_config,
+            role="fake_score",
+        )
         (
             raw_g,
             raw_f,
@@ -2194,9 +2338,9 @@ def save_stage2_checkpoint_from_payloads(
             rank_ema_states=rank_ema_states,
             rank_rng_states=rank_rng_states,
             topology=topology,
+            generator_optimizer_spec=generator_optimizer_spec,
+            fake_score_optimizer_spec=fake_score_optimizer_spec,
         )
-        if not isinstance(resolved_config, Mapping):
-            raise TypeError("resolved_config must be a mapping")
         provenance = validate_stage2_provenance(
             provenance,
             add_code_version=True,
@@ -2547,12 +2691,11 @@ def validate_stage2_checkpoint(
         if expected_phase_b_mode not in {"disabled", "dmd_dfd", "dmd_only"}:
             raise ValueError("expected_phase_b_mode is invalid")
         checkpoint_mode = trainer["phase_state"]["phase_b_mode"]
-        if (
-            completed_g > STAGE2_PHASE_A_GENERATOR_UPDATES
-            and checkpoint_mode != expected_phase_b_mode
-        ):
+        phase_a_boundary = trainer["phase_state"]["phase_a_generator_updates"]
+        if completed_g > phase_a_boundary and checkpoint_mode != expected_phase_b_mode:
             raise RuntimeError(
-                "Stage-2 post-A24 checkpoint belongs to a different Phase-B arm"
+                "Stage-2 checkpoint after the resolved Phase-A boundary belongs "
+                "to a different Phase-B arm"
             )
     if (
         trainer["completed_generator_updates"] != completed_g
@@ -2571,6 +2714,16 @@ def validate_stage2_checkpoint(
     ):
         raise RuntimeError("checkpoint provenance self binding mismatch")
     validate_stage2_provenance(provenance)
+    with (path / "resolved_config.json").open("r", encoding="utf-8") as handle:
+        resolved_config = json.load(handle)
+    generator_optimizer_spec = _optimizer_spec_from_resolved_config(
+        resolved_config,
+        role="generator",
+    )
+    fake_score_optimizer_spec = _optimizer_spec_from_resolved_config(
+        resolved_config,
+        role="fake_score",
+    )
     generator_state = _torch_load_cpu(path / "optimizer_generator.pt")
     fake_state = _torch_load_cpu(path / "optimizer_fake_score.pt")
     generator_names = tuple(
@@ -2599,12 +2752,14 @@ def validate_stage2_checkpoint(
         role="generator",
         expected_parameter_names=generator_names,
         expected_completed_updates=completed_g,
+        expected_optimizer_spec=generator_optimizer_spec,
     )
     validate_stage2_full_optimizer_state(
         fake_state,
         role="fake_score",
         expected_parameter_names=fake_names,
         expected_completed_updates=5 * completed_g,
+        expected_optimizer_spec=fake_score_optimizer_spec,
     )
     return manifest
 
@@ -3143,6 +3298,7 @@ def save_stage2_checkpoint(
     gather_rank_object_fn: Callable[..., None] | None = None,
     io_include_cuda: bool = True,
     keep_last: int = 2,
+    milestone_updates: Iterable[int] = STAGE2_CHECKPOINT_MILESTONES,
     apply_retention: bool = True,
     failure_injector: Callable[[str], None] | None = None,
 ) -> Path:
@@ -3184,6 +3340,21 @@ def save_stage2_checkpoint(
         completed_g = int(trainer_state["completed_generator_updates"])
         completed_f = int(trainer_state["completed_fake_updates"])
         _validate_topology(topology)
+        config_value = (
+            resolved_config.to_dict()
+            if callable(getattr(resolved_config, "to_dict", None))
+            else resolved_config
+        )
+        if not isinstance(config_value, Mapping):
+            raise TypeError("resolved Stage-2 config must serialize to a mapping")
+        generator_optimizer_spec = _optimizer_spec_from_resolved_config(
+            config_value,
+            role="generator",
+        )
+        fake_score_optimizer_spec = _optimizer_spec_from_resolved_config(
+            config_value,
+            role="fake_score",
+        )
 
         def audit_runtime_boundary() -> None:
             pending_gradients = [
@@ -3235,6 +3406,7 @@ def save_stage2_checkpoint(
             role="generator",
             expected_schema=generator_schema,
             expected_completed_updates=completed_g,
+            expected_optimizer_spec=generator_optimizer_spec,
             collectives=ops,
         )
         fake_score_optimizer_state = gather_stage2_optimizer_state(
@@ -3243,6 +3415,7 @@ def save_stage2_checkpoint(
             role="fake_score",
             expected_schema=fake_score_schema,
             expected_completed_updates=completed_f,
+            expected_optimizer_spec=fake_score_optimizer_spec,
             collectives=ops,
         )
         expected_ema_initialized = completed_g >= STAGE2_EMA_START_GENERATOR_UPDATE
@@ -3316,13 +3489,6 @@ def save_stage2_checkpoint(
                 raise RuntimeError("rank0 is missing canonical raw adapters")
             if generator_optimizer_state is None or fake_score_optimizer_state is None:
                 raise RuntimeError("rank0 is missing full optimizer state")
-            config_value = (
-                resolved_config.to_dict()
-                if callable(getattr(resolved_config, "to_dict", None))
-                else resolved_config
-            )
-            if not isinstance(config_value, Mapping):
-                raise TypeError("resolved Stage-2 config must serialize to a mapping")
             destination = save_stage2_checkpoint_from_payloads(
                 root,
                 trainer_state=trainer_state,
@@ -3343,7 +3509,11 @@ def save_stage2_checkpoint(
                 failure_injector=failure_injector,
             )
             if apply_retention:
-                apply_stage2_checkpoint_retention(root, keep_last=keep_last)
+                apply_stage2_checkpoint_retention(
+                    root,
+                    keep_last=keep_last,
+                    milestone_updates=milestone_updates,
+                )
             return str(destination)
 
         destination_value = _consensus_call(

@@ -50,7 +50,7 @@ def _adapter(schema, value):
     }
 
 
-def _optimizer(schema, step):
+def _optimizer(schema, step, *, learning_rate=None):
     names = [spec.raw_parameter_name for spec in schema.values()]
     role = "generator" if schema is GENERATOR_SCHEMA else "fake_score"
     return {
@@ -79,7 +79,11 @@ def _optimizer(schema, step):
         "param_groups": [
             {
                 "params": names,
-                "lr": 2e-6 if role == "generator" else 4e-7,
+                "lr": (
+                    learning_rate
+                    if learning_rate is not None
+                    else (2e-6 if role == "generator" else 4e-7)
+                ),
                 "betas": (0.0, 0.999),
                 "eps": 1e-8,
                 "weight_decay": 0.0,
@@ -299,6 +303,9 @@ def _save(
     phase_b_mode="dmd_dfd",
     metrics_snapshot=None,
     optimizer_runtime_prefix=None,
+    resolved_config=None,
+    generator_lr=None,
+    fake_score_lr=None,
 ):
     ema_states, rng_states = _rank_states(g)
     return save_stage2_checkpoint_from_payloads(
@@ -313,18 +320,22 @@ def _save(
         generator_schema=GENERATOR_SCHEMA,
         fake_score_schema=FAKE_SCHEMA,
         generator_optimizer_state=(
-            _optimizer(GENERATOR_SCHEMA, g)
+            _optimizer(GENERATOR_SCHEMA, g, learning_rate=generator_lr)
             if optimizer_runtime_prefix is None
             else _prefixed_optimizer(GENERATOR_SCHEMA, g, optimizer_runtime_prefix)
         ),
         fake_score_optimizer_state=(
-            _optimizer(FAKE_SCHEMA, 5 * g)
+            _optimizer(FAKE_SCHEMA, 5 * g, learning_rate=fake_score_lr)
             if optimizer_runtime_prefix is None
             else _prefixed_optimizer(FAKE_SCHEMA, 5 * g, optimizer_runtime_prefix)
         ),
         rank_ema_states=ema_states,
         rank_rng_states=rng_states,
-        resolved_config={"contract": "fixture", "g": g},
+        resolved_config=(
+            {"contract": "fixture", "g": g}
+            if resolved_config is None
+            else resolved_config
+        ),
         provenance=_provenance() if provenance is None else provenance,
         topology=_topology(),
         io_include_cuda=False,
@@ -399,6 +410,40 @@ def test_atomic_checkpoint_roundtrip_and_exact_file_mapping(tmp_path):
         torch.full((2, 3), 40.0),
     )
     assert set(payload.rank_rng_states) == set(range(8))
+
+
+def test_checkpoint_roundtrip_authenticates_longrun_optimizer_learning_rates(tmp_path):
+    def spec(role, learning_rate):
+        return {
+            "role": role,
+            "optimizer_type": "adamw",
+            "learning_rate": learning_rate,
+            "betas": [0.0, 0.999],
+            "eps": 1.0e-8,
+            "weight_decay": 0.0,
+            "max_grad_norm": 10.0,
+            "schedule": "constant",
+        }
+
+    resolved_config = {
+        "config": {"profile": "h100_micro1_acc8_longrun"},
+        "derived": {
+            "generator_optimizer": spec("generator", 1.0e-5),
+            "fake_score_optimizer": spec("fake_score", 2.0e-6),
+        },
+    }
+    directory = _save(
+        tmp_path,
+        40,
+        resolved_config=resolved_config,
+        generator_lr=1.0e-5,
+        fake_score_lr=2.0e-6,
+    )
+    validate_stage2_checkpoint(directory)
+    payload = load_stage2_checkpoint(directory)
+    assert payload.resolved_config == resolved_config
+    assert payload.generator_optimizer_state["param_groups"][0]["lr"] == 1.0e-5
+    assert payload.fake_score_optimizer_state["param_groups"][0]["lr"] == 2.0e-6
 
 
 def test_c0_publication_canonicalizes_runtime_optimizer_names_before_revalidation(
@@ -1013,6 +1058,22 @@ def test_retention_keeps_latest_two_and_every_milestone_full(tmp_path):
     assert {80, 120}.issubset(STAGE2_CHECKPOINT_MILESTONES)
     for step in (80, 100, 120):
         validate_stage2_checkpoint(checkpoint_directory(tmp_path, step))
+
+
+def test_retention_uses_resolved_milestones_instead_of_legacy_global_set(tmp_path):
+    for step in (10, 20, 30, 40):
+        _save(tmp_path, step)
+    removed = apply_stage2_checkpoint_retention(
+        tmp_path,
+        keep_last=2,
+        milestone_updates=(10,),
+    )
+    assert removed == [20]
+    assert {
+        step
+        for step in (10, 20, 30, 40)
+        if checkpoint_directory(tmp_path, step).exists()
+    } == {10, 30, 40}
 
 
 def test_retention_validates_every_candidate_before_deleting_anything(tmp_path):

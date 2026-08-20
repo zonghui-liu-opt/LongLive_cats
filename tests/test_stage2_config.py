@@ -14,6 +14,7 @@ import pytest
 from utils.config import DEFAULT_NEGATIVE_PROMPT, normalize_config
 from utils.stage2_config import (
     STAGE2_CONFIG_SCHEMA,
+    STAGE2_H100_LONGRUN_PROFILE,
     STAGE2_METRICS_SCHEMA,
     STAGE2_NEGATIVE_PROMPT_SHA256,
     STAGE2_PROFILE,
@@ -24,6 +25,9 @@ from utils.stage2_config import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats.yaml"
+LONG_CONFIG_PATH = (
+    PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats_micro1_acc8.yaml"
+)
 
 
 def _config() -> dict:
@@ -31,6 +35,111 @@ def _config() -> dict:
     plain = OmegaConf.to_container(loaded, resolve=True)
     assert isinstance(plain, dict)
     return plain
+
+
+def _long_config() -> dict:
+    loaded = OmegaConf.load(LONG_CONFIG_PATH)
+    plain = OmegaConf.to_container(loaded, resolve=True)
+    assert isinstance(plain, dict)
+    return plain
+
+
+def test_h100_micro1_acc8_longrun_contract_resolves_exact_requested_budget():
+    resolved = load_stage2_config(LONG_CONFIG_PATH)
+
+    assert resolved.profile == STAGE2_H100_LONGRUN_PROFILE
+    assert (
+        resolved.microbatch_size_per_device,
+        resolved.gradient_accumulation_steps,
+    ) == (
+        1,
+        8,
+    )
+    assert resolved.effective_global_batch == 64
+    assert (resolved.phase_a_epochs, resolved.phase_b_epochs) == (360, 40)
+    assert resolved.generator_optimizer.learning_rate == 1.0e-5
+    assert resolved.fake_score_optimizer.learning_rate == 2.0e-6
+    assert (resolved.phase_a_generator_updates, resolved.phase_a_fake_updates) == (
+        3_600,
+        18_000,
+    )
+    assert (resolved.phase_b_generator_updates, resolved.phase_b_fake_updates) == (
+        400,
+        2_000,
+    )
+    assert (resolved.total_generator_updates, resolved.total_fake_updates) == (
+        4_000,
+        20_000,
+    )
+    assert resolved.total_optimizer_substeps == 24_000
+    assert resolved.checkpoint_interval_generator_updates == 40
+    assert resolved.milestone_generator_updates == (
+        40,
+        80,
+        120,
+        160,
+        200,
+        240,
+        400,
+        600,
+        800,
+        1_200,
+        1_600,
+        2_000,
+        2_400,
+        2_800,
+        3_200,
+        3_600,
+        3_610,
+        3_620,
+        3_630,
+        3_640,
+        3_700,
+        3_800,
+        3_900,
+        4_000,
+    )
+    assert (
+        resolved.contract_hash()
+        == "f5e7135e353fff1efd3edc9d8d573322797131a31df5f893185f5b4db98ca5ff"
+    )
+    assert resolved.contract_hash() != load_stage2_config(CONFIG_PATH).contract_hash()
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    (
+        ("training.phase_a_epochs", 359, "phase_a_epochs"),
+        ("training.phase_b_epochs", 39, "phase_b_epochs"),
+        ("training.optimizers.generator.lr", 2.0e-6, "generator.lr"),
+        ("training.optimizers.fake_score.lr", 4.0e-7, "fake_score.lr"),
+        ("training.microbatch_size_per_device", 2, "candidate"),
+    ),
+)
+def test_h100_longrun_profile_rejects_budget_lr_and_topology_drift(path, value, match):
+    config = _long_config()
+    _set_path(config, path, value)
+    with pytest.raises(ValueError, match=match):
+        resolve_stage2_config(config)
+
+
+def test_h100_longrun_b0_and_b1_share_contract_but_not_launch_hash():
+    b1_config = OmegaConf.load(LONG_CONFIG_PATH)
+    b0_config = OmegaConf.create(OmegaConf.to_container(b1_config, resolve=False))
+    b0_config.training.phase_b_mode = "dmd_only"
+    b0_config.training.phase_b_dfd_probability_max = 0.0
+
+    b1 = resolve_stage2_config(b1_config)
+    b0 = resolve_stage2_config(b0_config)
+    assert b0.contract_hash() == b1.contract_hash()
+    assert b0.launch_hash() != b1.launch_hash()
+
+
+def test_unknown_stage2_profile_fails_closed():
+    config = _long_config()
+    config["profile"] = "unregistered"
+    with pytest.raises(ValueError, match="profile must be one of"):
+        resolve_stage2_config(config)
 
 
 def _set_path(config: dict, path: str, value) -> None:

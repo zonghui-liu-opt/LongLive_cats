@@ -302,6 +302,39 @@ def test_phase25_naming_sources_and_new_resolver_are_patched_as_one_transaction(
     assert second.backup_paths == ()
 
 
+def test_legacy_optimizer_restore_patch_does_not_inject_unknown_longrun_spec():
+    unit = next(
+        item
+        for item in hotfix_module._STAGE2_CHECKPOINT_PATCH_UNITS
+        if item.name == "optimizer_restore_name_transform"
+    )
+
+    transformed, changed = hotfix_module._apply_exact_unit(unit.legacy, unit)
+
+    assert changed is True
+    assert "expected_optimizer_spec" not in transformed
+
+
+def test_longrun_optimizer_restore_patch_keeps_resolved_optimizer_spec():
+    unit = next(
+        item
+        for item in hotfix_module._STAGE2_CHECKPOINT_PATCH_UNITS
+        if item.name == "optimizer_restore_name_transform"
+    )
+    signature = """    expected_completed_updates: int,
+    expected_optimizer_spec: Any | None = None,
+    collectives: Stage2CollectiveOps | None = None,
+"""
+
+    transformed, changed = hotfix_module._apply_exact_unit(
+        signature + unit.legacy,
+        unit,
+    )
+
+    assert changed is True
+    assert "expected_optimizer_spec=expected_optimizer_spec" in transformed
+
+
 def test_multifile_hotfix_rolls_back_if_one_atomic_replace_fails(
     tmp_path: Path, monkeypatch
 ):

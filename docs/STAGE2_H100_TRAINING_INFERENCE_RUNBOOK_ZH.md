@@ -6,6 +6,15 @@ C0/C1/C2、正式训练、断点恢复、训练曲线和 baseline 推理。
 
 正常执行不需要逐段复制本文。直接运行 `bash run_stage2_h100.sh help`，再按脚本显示的
 `prepare → smoke → train → control → plot → infer` 六步操作；本文只保留完整原理和故障排查命令。
+入口默认使用仓库内`configs/train_i2v_stage2_600cats_micro1_acc8.yaml`，即
+`8卡×micro1×acc8=global batch 64`。该文件是严格的
+`h100_micro1_acc8_longrun`合同：Phase A=360 epoch、Phase B=40 epoch、Generator/Fake-score
+LR=`1e-5/2e-6`，派生为A=`3600G/18000F`、B=`400G/2000F`、总计=`4000G/20000F`。
+启动前显式设置`STAGE2_CONFIG`仍可覆盖默认值，wrapper会从实际resolved config动态派生终点。
+
+这是一个全新research contract，不能从旧micro1 A24/B4的G240/G280做exact resume。必须使用本文新的
+`STAGE2_WORK_ROOT`和`STAGE2_TRAIN_ROOT`，从Stage-1 step3075冷启动；一旦开始，不要在同一lineage
+中途再改epochs、LR、milestones或路径。中断恢复只允许继续使用完全相同的config/hash和输出目录。
 
 所有命令均在同一个 shell 中执行。该流程不读取版本控制元数据，也不要求代码目录处于提交态。
 建议仍把工作产物放在独立目录，便于容量管理、归档和故障恢复。
@@ -18,8 +27,8 @@ set -euo pipefail
 export STAGE2_PROJECT_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
 export STAGE2_PYTHON=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python
 export STAGE2_TORCHRUN="$(dirname "$STAGE2_PYTHON")/torchrun"
-export STAGE2_WORK_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new
-export STAGE2_TRAIN_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training
+export STAGE2_WORK_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_h100_micro1_acc8_longrun
+export STAGE2_TRAIN_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training_h100_micro1_acc8_longrun
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
@@ -69,7 +78,7 @@ export METADATA_600=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_p
 export STAGE1_CACHE_MANIFEST=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/cache_480x832_buckets/ar_stage1_i2v_600cats/cache_manifest.json
 export ACTION_SIDECAR_600=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/action_labels_600cats.csv
 export ATTEST_STAGE2_TEACHER=1
-export STAGE2_CONFIG="$STAGE2_PROJECT_ROOT/configs/train_i2v_stage2_600cats.yaml"
+export STAGE2_CONFIG="$STAGE2_PROJECT_ROOT/configs/train_i2v_stage2_600cats_micro1_acc8.yaml"
 
 bash prepare_stage2.sh 2>&1 | tee "$STAGE2_WORK_ROOT/logs/prepare_release.log"
 ```
@@ -104,13 +113,13 @@ export LONG_LIVE_STAGE2_NEGATIVE_MANIFEST="$STAGE2_WORK_ROOT/negative_v1/negativ
 export ACTIVE_CONFIG="$STAGE2_CONFIG"
 ```
 
-## 3. micro2×acc4 的 C0/C1/C2
+## 3. 默认 micro1×acc8 的 C0/C1/C2
 
 选择一个从未用于正式训练的临时目录。C0 冷启动并保存，C1 只从 C0 恢复、跑纯 DMD
 并保存，C2 只从 C1 恢复、强制 DFD 且不保存。
 
 ```bash
-export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_micro2_acc4"
+export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_longrun"
 mkdir -p "$STAGE2_SMOKE_DIR"
 
 "$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
@@ -140,7 +149,7 @@ F1 前按同一生产顺序精确重放并核对 sampler batch、exit、loader R
 timestep/noise 与全部计数器，完全一致后才消费一次。任一本周期发生过 nonfinite（即使随后
 精确重放成功）也不得标记 smoke PASS。
 
-### 3.1 OOM 时不要把上一条22.9 GiB指标当成失败峰值
+### 3.1 为什么默认不再使用micro2×acc4，以及OOM时如何读峰值
 
 Stage-2 每个逻辑子步开始前会重置CUDA峰值，只有该子步成功返回后才把
 `max_memory_allocated`、`max_memory_reserved`和最小free写进JSONL。CUDA OOM在rollout内部直接
@@ -164,44 +173,32 @@ all-gather完整block。Generator因cache反向正确性明确关闭activation c
 nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory,process_name --format=csv,noheader
 ```
 
-## 4. 失败时唯一首选回退：micro1×acc8
+## 4. 旧shell迁移或显式覆盖时锁定micro1×acc8
 
-只有 micro2×acc4 未通过上述门槛时才执行本节。在仓库外复制配置，只改两个字段；然后用该
-配置重新运行 prepare 绑定新的 launch hash，并在全新的 smoke 目录重跑全部 C0/C1/C2。
+当前`run_stage2_h100.sh`已经默认使用仓库内micro1×acc8配置，不再需要从canonical配置现场复制。
+如果当前shell曾显式设置旧`STAGE2_CONFIG`，请在`prepare`前重新绑定，并为该launch hash使用
+全新的smoke目录：
 
 ```bash
-export MICRO1_CONFIG="$STAGE2_WORK_ROOT/configs/train_i2v_stage2_600cats_micro1_acc8.yaml"
-mkdir -p "$(dirname "$MICRO1_CONFIG")"
-"$STAGE2_PYTHON" -B - \
-  "$STAGE2_PROJECT_ROOT/configs/train_i2v_stage2_600cats.yaml" "$MICRO1_CONFIG" <<'PY'
-from pathlib import Path
-import sys
-from omegaconf import OmegaConf
-
-source, destination = map(Path, sys.argv[1:])
-config = OmegaConf.load(source)
-config.training.microbatch_size_per_device = 1
-config.training.gradient_accumulation_steps = 8
-OmegaConf.save(config, destination)
-PY
-
+export MICRO1_CONFIG="$STAGE2_PROJECT_ROOT/configs/train_i2v_stage2_600cats_micro1_acc8.yaml"
 export STAGE2_CONFIG="$MICRO1_CONFIG"
 export ACTIVE_CONFIG="$MICRO1_CONFIG"
-export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_micro1_acc8_v1"
+export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_longrun"
 
 # 必须在新的torchrun进程启动前设置，只缓解碎片，不能替代micro1。
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 重新绑定micro1 launch hash；prepare会安全复用已认证的昂贵资产。
+# 绑定micro1 launch hash；prepare会安全复用已认证的昂贵资产。
 bash run_stage2_h100.sh prepare
 
 # 使用全新目录从C0开始，依次完成C0/C1/C2及显存门禁。
 bash run_stage2_h100.sh smoke
 ```
 
-必须看到`STAGE2_GUIDE_PREPARE=PASS`和`STAGE2_GUIDE_SMOKE=PASS`。micro1把单次主导激活近似
-减半，而acc8保持`1×8×8=64`的global batch；不要复用已经OOM的micro2目录或任何partial smoke
-lineage。后续正式训练也必须在同一shell中继续使用这个`STAGE2_CONFIG`/`ACTIVE_CONFIG`。
+必须看到`STAGE2_GUIDE_PREPARE=PASS`和`STAGE2_GUIDE_SMOKE=PASS`。micro1把相对micro2的单次
+主导激活近似减半，而acc8保持`1×8×8=64`的global batch；不要复用已经OOM的micro2目录或
+任何partial smoke lineage。后续正式训练也必须在同一shell中继续使用这个
+`STAGE2_CONFIG`/`ACTIVE_CONFIG`。
 
 ### 4.1 micro1仍OOM时的唯一二级显存候选
 
@@ -235,11 +232,11 @@ bash run_stage2_h100.sh smoke
 ## 5. 正式冷启动与自动断点恢复
 
 正式目录必须与 smoke 目录不同且首次启动时为空。正式训练绝不能带 `--stage2-smoke`，也不能
-恢复 C0/C1 产物。下面命令从 Stage-1 step 3075 初始化，完成 G=280、F=1400；选择通过门禁的
+恢复 C0/C1 产物。下面命令从 Stage-1 step 3075 初始化，完成 G=4000、F=20000；选择通过门禁的
 `ACTIVE_CONFIG`。
 
 ```bash
-export STAGE2_FORMAL_DIR="$STAGE2_TRAIN_ROOT/formal_baseline"
+export STAGE2_FORMAL_DIR="$STAGE2_TRAIN_ROOT/formal_b1_longrun"
 mkdir -p "$STAGE2_FORMAL_DIR"
 
 "$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
@@ -255,28 +252,32 @@ mkdir -p "$STAGE2_FORMAL_DIR"
 不是跳过校验。checkpoint 会把 Stage-2 源码 SHA-256 写入 code provenance 供审计；恢复前可
 直接核对该摘要，不需要版本控制元数据。
 
+长程profile每40G做一次常规checkpoint，并额外发布配置中的显式milestone；retention永久保留这些
+milestone和最近两个可恢复点。因此G3600共同父点与G4000终点不会被Phase B清理。不要在训练运行时
+手工移动formal目录内的checkpoint；若要做只读快照，先确认`_SUCCESS`再复制到独立root。
+
 训练完整结束后必须存在：
 
 ```bash
-test -f "$STAGE2_FORMAL_DIR/checkpoint_stage2_g000280/_SUCCESS"
+test -f "$STAGE2_FORMAL_DIR/checkpoint_stage2_g004000/_SUCCESS"
 test -f "$STAGE2_FORMAL_DIR/metrics/stage2_train_metrics.jsonl"
 ```
 
-## 6. 从同一 A24/G240 分叉 B0 matched control
+## 6. 从同一 A360/G3600 分叉 B0 matched control
 
-baseline 正式任务是 B1（Phase B 使用 DMD/DFD）。它完成后保留的 G240 是 A24 共同父点；B0
-必须从这个 checkpoint 继续跑 4 个纯 DMD epoch，不能拿 A24 终点直接与 B1 的 A24+B4 比较。
+正式任务是 B1（Phase B 使用 DMD/DFD）。它完成后永久保留的 G3600 是 A360 共同父点；B0
+必须从这个 checkpoint 继续跑 40 个纯 DMD epoch，不能拿 A360 终点直接与 B1 的 A360+B40 比较。
 复制本轮实际通过门禁的 `ACTIVE_CONFIG`，只做以下四项字段变换：
 
 ```bash
-export STAGE2_A24_ANCHOR="$STAGE2_FORMAL_DIR/checkpoint_stage2_g000240"
+export STAGE2_A360_ANCHOR="$STAGE2_FORMAL_DIR/checkpoint_stage2_g003600"
 export STAGE2_B0_CONFIG="$STAGE2_WORK_ROOT/configs/train_i2v_stage2_600cats_b0.yaml"
 export STAGE2_B0_DIR="$STAGE2_TRAIN_ROOT/formal_matched_b0"
-test -f "$STAGE2_A24_ANCHOR/_SUCCESS"
+test -f "$STAGE2_A360_ANCHOR/_SUCCESS"
 mkdir -p "$(dirname "$STAGE2_B0_CONFIG")" "$STAGE2_B0_DIR"
 
 "$STAGE2_PYTHON" -B - \
-  "$ACTIVE_CONFIG" "$STAGE2_B0_CONFIG" "$STAGE2_A24_ANCHOR" <<'PY'
+  "$ACTIVE_CONFIG" "$STAGE2_B0_CONFIG" "$STAGE2_A360_ANCHOR" <<'PY'
 from pathlib import Path
 import sys
 from omegaconf import OmegaConf
@@ -296,13 +297,13 @@ PY
   --no-visualize \
   2>&1 | tee "$STAGE2_B0_DIR/formal.log"
 
-test -f "$STAGE2_B0_DIR/checkpoint_stage2_g000280/_SUCCESS"
+test -f "$STAGE2_B0_DIR/checkpoint_stage2_g004000/_SUCCESS"
 ```
 
-首次启动时，trainer 会从 checkpoint 内已认证的 `metrics_lineage.jsonl` 导入 A24 前缀，因此
+首次启动时，trainer 会从 checkpoint 内已认证的 `metrics_lineage.jsonl` 导入 A360 前缀，因此
 B0 目录必须是新的且不能预放一份别的 metrics 文件。中断后重新执行同一条 B0 torchrun 命令：
-显式 G240 仍作为 immutable ancestry anchor，但 auto-resume 会选择 B0 目录内最新完整 child，并逐边
-校验 canonical parent path 与 manifest SHA‑256；不会反复从 G240 开始，也不会接受另一条本地
+显式 G3600 仍作为 immutable ancestry anchor，但 auto-resume 会选择 B0 目录内最新完整 child，并逐边
+校验 canonical parent path 与 manifest SHA‑256；不会反复从 G3600 开始，也不会接受另一条本地
 lineage。
 
 ## 7. 从两条正式 JSONL 生成训练图
@@ -325,52 +326,45 @@ lineage。
 `orchestration_seconds_max`单列梯度/参数finite审计、optimizer state审计、分布式状态一致性和
 控制流开销；这些真实耗时不再误算为closure error，原5%门禁没有放宽。
 
-## 8. B1 G280 Generator-EMA baseline 推理
+## 8. B1 多权重 Generator-EMA baseline 批量推理
 
 推理不读取版本控制状态。runner 会校验各 rank 的 Stage-2 源码 SHA-256 一致，并在结束前再次
-确认源码快照未变化；每个 rank 只加载一次 T5、Generator EMA 和 VAE，使用 seeds 1–4；同一 `(样本, seed)` 的 A/B noise 来自一条连续
+确认源码快照未变化；每个 checkpoint 的每个 rank 只加载一次 T5、Generator EMA 和 VAE，使用 seeds 1–4；同一 `(样本, seed)` 的 A/B noise 来自一条连续
 48-frame RNG 流：A 取前 24、B 取后 24，不在 B 前重置 seed。
 
 ```bash
 cd "$STAGE2_PROJECT_ROOT"
 
-export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$STAGE2_FORMAL_DIR/checkpoint_stage2_g000280"
-export LONG_LIVE_STAGE2_ARCHITECTURE_ROOT="$ARCH_ROOT"
-export LONG_LIVE_STAGE2_T5_CHECKPOINT="$ARCH_ROOT/models_t5_umt5-xxl-enc-bf16.pth"
-export LONG_LIVE_STAGE2_TOKENIZER_DIR="$ARCH_ROOT/google/umt5-xxl"
-export LONG_LIVE_STAGE2_VAE_CHECKPOINT="$ARCH_ROOT/Wan2.2_VAE.pth"
-export LONG_LIVE_STAGE2_INFERENCE_OUTPUT="$STAGE2_TRAIN_ROOT/inference_g280_baseline"
+# 推理formal_b1_longrun下所有带_SUCCESS且G>=40的权重：
+bash run_stage2_h100.sh infer all
 
-bash infer_stage2_baseline.sh \
-  2>&1 | tee "$STAGE2_TRAIN_ROOT/inference_g280_baseline.log"
+# 或者只推理指定step；可任意顺序输入，脚本会数字排序并去重：
+bash run_stage2_h100.sh infer 40 80 120 160 200 240 400 800 1200 1600 2400 3200 3600 4000
+
+# 若其他完整long-run权重已保全到独立快照根，可单独扫描该根：
+STAGE2_INFERENCE_CHECKPOINT_ROOT="$STAGE2_TRAIN_ROOT/early_checkpoint_snapshots" \
+  bash run_stage2_h100.sh infer all
+
+# 无参数时推理当前resolved config的最终权重（默认G4000）：
+bash run_stage2_h100.sh infer
 ```
 
-baseline 矩阵应得到 56 个 MP4 和 56 个 JSON trace：单动作 `6×4=24` 个 96 帧视频，
-双动作 `8×4=32` 个 192 帧视频；最后才发布 `manifest.json` 和 `index.html`。执行最终复验：
+`infer all`只扫描`$STAGE2_FORMAL_DIR/checkpoint_stage2_gXXXXXX/_SUCCESS`，并对每个
+checkpoint的contract、phase arm、step和`generator_ema.safetensors`做严格验证。批量结果与日志分别位于：
 
-```bash
-test "$(find "$LONG_LIVE_STAGE2_INFERENCE_OUTPUT/videos" -type f -name '*.mp4' | wc -l)" -eq 56
-test "$(find "$LONG_LIVE_STAGE2_INFERENCE_OUTPUT/traces" -type f -name '*.json' | wc -l)" -eq 56
-test -f "$LONG_LIVE_STAGE2_INFERENCE_OUTPUT/manifest.json"
-test -f "$LONG_LIVE_STAGE2_INFERENCE_OUTPUT/index.html"
-"$STAGE2_PYTHON" -B - "$LONG_LIVE_STAGE2_INFERENCE_OUTPUT/manifest.json" <<'PY'
-import json
-from pathlib import Path
-import sys
-from utils.stage2_inference_artifacts import validate_stage2_inference_manifest
-
-manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-validated = validate_stage2_inference_manifest(manifest)
-assert validated["status"] == "complete"
-assert validated["expected_sample_count"] == 56
-print("STAGE2_BASELINE_INFERENCE_ARTIFACTS=PASS")
-PY
+```text
+$STAGE2_INFERENCE_ROOT/inference_gXXXXXX_baseline/
+$STAGE2_INFERENCE_ROOT/logs/inference_gXXXXXX_baseline.log
 ```
 
-正常异常会在各 rank 间同步并返回非零；但 `SIGKILL`、断电等硬中断若恰好发生在 MP4 与 trace
-分别提交的夹缝，可能留下孤立文件或原子临时文件。runner 会 fail closed，不会把它当作可续跑
-pair。此时先由操作者保留现场，归档整个 inference 输出目录，再换一个全新的仓库外
-`LONG_LIVE_STAGE2_INFERENCE_OUTPUT` 重跑；不要手工拼接或删除单个产物后宣称同一批次 complete。
+每个权重都必须得到56个MP4和56个JSON trace：单动作`6×4=24`个96帧视频，
+双动作`8×4=32`个192帧视频；最后才发布`manifest.json`和`index.html`。只有看到
+`STAGE2_GUIDE_INFER=PASS checkpoints=N samples_per_checkpoint=56 total_samples=56*N`才表示整批完成。
+
+重复执行同一命令会严格复验已完成的video+trace pair并跳过，然后继续剩余样本或权重。
+`SIGKILL`、断电或旧版root identity误报后不要删除输出目录；直接重跑。若留下已通过ffprobe的
+video-only单边产物，runner会先保留到`.stage2-incomplete/`，再确定性重生video+trace。坏视频、
+symlink、trace-only或已有最终manifest的损坏批次仍会fail closed，此时按报错保留现场，不要手工拼接产物。
 
 技术 trace/manifest 通过只证明帧数、seed/noise、profile、scheduler/cache、checkpoint、配置和文件
 hash 正确，不代表视觉质量自动合格。启动时rank0会依据checkpoint绑定的source manifest只做一次

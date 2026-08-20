@@ -11,8 +11,8 @@ export STAGE2_PROJECT_ROOT="$SCRIPT_ROOT"
 
 export STAGE2_PYTHON="${STAGE2_PYTHON:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python}"
 export STAGE2_TORCHRUN="${STAGE2_TORCHRUN:-$(dirname -- "$STAGE2_PYTHON")/torchrun}"
-export STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new}"
-export STAGE2_TRAIN_ROOT="${STAGE2_TRAIN_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training}"
+export STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_h100_micro1_acc8_longrun}"
+export STAGE2_TRAIN_ROOT="${STAGE2_TRAIN_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training_h100_micro1_acc8_longrun}"
 
 export ARCH_ROOT="${ARCH_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}"
 export TEACHER_CKPT="${TEACHER_CKPT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts}"
@@ -23,20 +23,27 @@ export METADATA_600="${METADATA_600:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00
 export STAGE1_CACHE_MANIFEST="${STAGE1_CACHE_MANIFEST:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/cache_480x832_buckets/ar_stage1_i2v_600cats/cache_manifest.json}"
 export ACTION_SIDECAR_600="${ACTION_SIDECAR_600:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/action_labels_600cats.csv}"
 export ATTEST_STAGE2_TEACHER="${ATTEST_STAGE2_TEACHER:-1}"
-export STAGE2_CONFIG="${STAGE2_CONFIG:-$SCRIPT_ROOT/configs/train_i2v_stage2_600cats.yaml}"
+export STAGE2_CONFIG="${STAGE2_CONFIG:-$SCRIPT_ROOT/configs/train_i2v_stage2_600cats_micro1_acc8.yaml}"
 export ACTIVE_CONFIG="$STAGE2_CONFIG"
 
-export STAGE2_SMOKE_DIR="${STAGE2_SMOKE_DIR:-$STAGE2_TRAIN_ROOT/smoke_micro2_acc4}"
-export STAGE2_FORMAL_DIR="${STAGE2_FORMAL_DIR:-$STAGE2_TRAIN_ROOT/formal_baseline}"
+STAGE2_INFERENCE_OUTPUT_EXPLICIT="${STAGE2_INFERENCE_OUTPUT:+1}"
+
+export STAGE2_SMOKE_DIR="${STAGE2_SMOKE_DIR:-$STAGE2_TRAIN_ROOT/smoke_longrun}"
+export STAGE2_FORMAL_DIR="${STAGE2_FORMAL_DIR:-$STAGE2_TRAIN_ROOT/formal_b1_longrun}"
 export STAGE2_B0_DIR="${STAGE2_B0_DIR:-$STAGE2_TRAIN_ROOT/formal_matched_b0}"
 export STAGE2_B0_CONFIG="${STAGE2_B0_CONFIG:-$STAGE2_WORK_ROOT/configs/train_i2v_stage2_600cats_b0.yaml}"
-export STAGE2_INFERENCE_OUTPUT="${STAGE2_INFERENCE_OUTPUT:-$STAGE2_TRAIN_ROOT/inference_g280_baseline}"
+export STAGE2_INFERENCE_OUTPUT="${STAGE2_INFERENCE_OUTPUT:-$STAGE2_TRAIN_ROOT/inference_g004000_longrun}"
+export STAGE2_INFERENCE_ROOT="${STAGE2_INFERENCE_ROOT:-$STAGE2_TRAIN_ROOT/inference_batch_longrun}"
+export STAGE2_INFERENCE_CHECKPOINT_ROOT="${STAGE2_INFERENCE_CHECKPOINT_ROOT:-$STAGE2_FORMAL_DIR}"
+export STAGE2_LIVE_PLOT_DIR="${STAGE2_LIVE_PLOT_DIR:-$STAGE2_FORMAL_DIR/plots_live}"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$STAGE2_WORK_ROOT/pycache}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export STAGE2_INFERENCE_NPROC="${STAGE2_INFERENCE_NPROC:-8}"
+export STAGE2_INFERENCE_HEARTBEAT_SECONDS="${STAGE2_INFERENCE_HEARTBEAT_SECONDS:-30}"
 
 # prepare_stage2.sh runs in a child shell, so every invocation of this wrapper
 # explicitly reconstructs the resolved runtime asset environment.
@@ -51,7 +58,7 @@ export LONG_LIVE_STAGE2_ACTION_LABELS_PATH="$ACTION_SIDECAR_600"
 export LONG_LIVE_STAGE2_CACHE_DIR="$STAGE2_WORK_ROOT/stage2_600cats_f25_v1"
 export LONG_LIVE_STAGE2_NEGATIVE_MANIFEST="$STAGE2_WORK_ROOT/negative_v1/negative_conditioning_manifest.json"
 
-export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$STAGE2_FORMAL_DIR/checkpoint_stage2_g000280"
+export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$STAGE2_FORMAL_DIR/checkpoint_stage2_g004000"
 export LONG_LIVE_STAGE2_T5_CHECKPOINT="$ARCH_ROOT/models_t5_umt5-xxl-enc-bf16.pth"
 export LONG_LIVE_STAGE2_TOKENIZER_DIR="$ARCH_ROOT/google/umt5-xxl"
 export LONG_LIVE_STAGE2_VAE_CHECKPOINT="$ARCH_ROOT/Wan2.2_VAE.pth"
@@ -64,6 +71,10 @@ usage() {
   cat <<'EOF'
 Stage-2 H100 简明指导脚本
 
+默认训练配置：configs/train_i2v_stage2_600cats_micro1_acc8.yaml
+长程合同：8卡×micro1×acc8=global64，A360/B40，G/F LR=1e-5/2e-6。
+如需使用其他已审计配置，请在启动前显式设置 STAGE2_CONFIG。
+
 按顺序运行下面 6 条命令；每条只有看到对应 PASS 才能继续：
 
   1. bash run_stage2_h100.sh prepare
@@ -75,11 +86,11 @@ Stage-2 H100 简明指导脚本
      正确：STAGE2_GUIDE_SMOKE=PASS
 
   3. bash run_stage2_h100.sh train
-     作用：正式训练 B1；中断后重复同一命令会自动恢复，最终到 G280。
+     作用：正式训练 B1；中断后重复同一命令会自动恢复，最终到 G4000。
      正确：STAGE2_GUIDE_TRAIN_B1=PASS
 
   4. bash run_stage2_h100.sh control
-     作用：从 B1 的同一个 G240 分叉并训练纯DMD matched-control B0。
+     作用：从 B1 的同一个 G3600 分叉并训练纯DMD matched-control B0。
      正确：STAGE2_GUIDE_TRAIN_B0=PASS
 
   5. bash run_stage2_h100.sh plot
@@ -87,16 +98,28 @@ Stage-2 H100 简明指导脚本
      正确：STAGE2_GUIDE_PLOT=PASS
 
   6. bash run_stage2_h100.sh infer
-     作用：使用 B1 G280 Generator-EMA 生成56个视频和56份trace。
+     作用：使用 B1 G4000 Generator-EMA 生成56个视频和56份trace。
      正确：STAGE2_GUIDE_INFER=PASS samples=56
+
+训练结束后批量推理多个B1权重（数字排序、自动去重、可断点续跑）：
+  bash run_stage2_h100.sh infer all
+  bash run_stage2_h100.sh infer 40 80 120 160 200 240 400 800 1200 1600 2400 3200 3600 4000
+  权重根：$STAGE2_INFERENCE_CHECKPOINT_ROOT（默认为formal_b1_longrun）
+  输出：$STAGE2_INFERENCE_ROOT/inference_gXXXXXX_baseline/
+  正确：STAGE2_GUIDE_INFER=PASS checkpoints=N samples_per_checkpoint=56 total_samples=56*N
 
 随时查看进度：
   bash run_stage2_h100.sh status
 
+B1训练中查看loss（另开终端运行，可重复刷新）：
+  bash run_stage2_h100.sh plot-live
+  输出：$STAGE2_LIVE_PLOT_DIR/index.html（训练未完成时标记为partial，不替代第5步正式验收图）
+
 只查看将执行的命令（不会创建目录或启动GPU）：
   bash run_stage2_h100.sh --dry-run smoke
 
-注意：没有 all 子命令。smoke、长训练、推理之间必须由操作者确认上一条 PASS。
+注意：仍没有顶层 all 子命令；只有 infer all 表示批量发现权重。
+smoke、长训练、推理之间必须由操作者确认上一条 PASS。
 任一步没有打印规定的 PASS 就立刻停止；保留该阶段日志，不要删除或手工拼接产物。
 EOF
 }
@@ -114,6 +137,74 @@ unexpected_error() {
   exit "$status"
 }
 trap unexpected_error ERR
+
+STAGE2_SCHEDULE_LOADED=0
+STAGE2_PROFILE_NAME=""
+STAGE2_CONTRACT_SHORT=""
+STAGE2_PHASE_A_EPOCHS=0
+STAGE2_PHASE_B_EPOCHS=0
+STAGE2_A_END_G=0
+STAGE2_FINAL_G=0
+STAGE2_FINAL_F=0
+STAGE2_A_END_STEP=""
+STAGE2_FINAL_STEP=""
+
+load_stage2_schedule() {
+  [[ "$STAGE2_SCHEDULE_LOADED" -eq 0 ]] || return 0
+  [[ -x "$STAGE2_PYTHON" ]] || fail "Python不可执行，无法解析训练合同：$STAGE2_PYTHON"
+  [[ -f "$ACTIVE_CONFIG" ]] || fail "训练配置不存在：$ACTIVE_CONFIG"
+  local payload
+  if ! payload="$(
+    "$STAGE2_PYTHON" -I -B - "$SCRIPT_ROOT" "$ACTIVE_CONFIG" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from omegaconf import OmegaConf
+from utils.stage2_config import resolve_stage2_config
+
+resolved = resolve_stage2_config(OmegaConf.load(Path(sys.argv[2]).resolve(strict=True)))
+print(
+    "\t".join(
+        str(value)
+        for value in (
+            resolved.profile,
+            resolved.contract_hash()[:12],
+            resolved.phase_a_epochs,
+            resolved.phase_b_epochs,
+            resolved.phase_a_generator_updates,
+            resolved.total_generator_updates,
+            resolved.total_fake_updates,
+        )
+    )
+)
+PY
+  )"; then
+    fail "无法解析Stage-2训练合同：$ACTIVE_CONFIG"
+  fi
+  IFS=$'\t' read -r \
+    STAGE2_PROFILE_NAME STAGE2_CONTRACT_SHORT \
+    STAGE2_PHASE_A_EPOCHS STAGE2_PHASE_B_EPOCHS \
+    STAGE2_A_END_G STAGE2_FINAL_G STAGE2_FINAL_F <<<"$payload"
+  [[ -n "$STAGE2_PROFILE_NAME" && "$STAGE2_CONTRACT_SHORT" =~ ^[0-9a-f]{12}$ ]] || \
+    fail "Stage-2训练合同标识非法：$payload"
+  local value
+  for value in \
+    "$STAGE2_PHASE_A_EPOCHS" "$STAGE2_PHASE_B_EPOCHS" \
+    "$STAGE2_A_END_G" "$STAGE2_FINAL_G" "$STAGE2_FINAL_F"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || fail "Stage-2训练合同计数非法：$payload"
+  done
+  [[ "$STAGE2_A_END_G" -gt 0 && "$STAGE2_FINAL_G" -ge "$STAGE2_A_END_G" ]] || \
+    fail "Stage-2训练合同phase边界非法：$payload"
+  printf -v STAGE2_A_END_STEP '%06d' "$STAGE2_A_END_G"
+  printf -v STAGE2_FINAL_STEP '%06d' "$STAGE2_FINAL_G"
+  if [[ -z "$STAGE2_INFERENCE_OUTPUT_EXPLICIT" ]]; then
+    export STAGE2_INFERENCE_OUTPUT="$STAGE2_TRAIN_ROOT/inference_g${STAGE2_FINAL_STEP}_${STAGE2_PROFILE_NAME}"
+    export LONG_LIVE_STAGE2_INFERENCE_OUTPUT="$STAGE2_INFERENCE_OUTPUT"
+  fi
+  export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$STAGE2_FORMAL_DIR/checkpoint_stage2_g$STAGE2_FINAL_STEP"
+  STAGE2_SCHEDULE_LOADED=1
+}
 
 print_command() {
   printf '  '
@@ -204,7 +295,7 @@ PY
 require_distinct_run_paths() {
   "$STAGE2_PYTHON" -I -B - \
     "$STAGE2_SMOKE_DIR" "$STAGE2_FORMAL_DIR" "$STAGE2_B0_DIR" \
-    "$STAGE2_INFERENCE_OUTPUT" <<'PY'
+    "$STAGE2_INFERENCE_OUTPUT" "$STAGE2_INFERENCE_ROOT" <<'PY'
 from itertools import combinations
 from pathlib import Path
 import sys
@@ -441,13 +532,13 @@ config = Path(sys.argv[3]).resolve(strict=True)
 expected_phase_b_mode = sys.argv[4]
 resolved = resolve_stage2_config(OmegaConf.load(config))
 assert resolved.phase_b_mode == expected_phase_b_mode
-checkpoint = root / "checkpoint_stage2_g000280"
+checkpoint = root / f"checkpoint_stage2_g{resolved.total_generator_updates:06d}"
 checkpoint_manifest = validate_stage2_checkpoint(
     checkpoint,
     expected_contract_hash=resolved.contract_hash(),
     expected_phase_b_mode=expected_phase_b_mode,
 )
-assert checkpoint_manifest["completed_generator_updates"] == 280
+assert checkpoint_manifest["completed_generator_updates"] == resolved.total_generator_updates
 records = load_stage2_metrics(root / "metrics" / "stage2_train_metrics.jsonl")
 ends = stage2_records_for_latest_lineage(records, record_type="run_end")
 assert ends
@@ -455,9 +546,9 @@ record = ends[-1]
 assert record.get("status") == "complete"
 assert record.get("dry_run") is False
 assert record.get("smoke_mode") is None
-assert record.get("completed_generator_updates") == 280
-assert record.get("completed_fake_updates") == 1400
-assert record.get("completed_cycles") == 280
+assert record.get("completed_generator_updates") == resolved.total_generator_updates
+assert record.get("completed_fake_updates") == resolved.total_fake_updates
+assert record.get("completed_cycles") == resolved.total_cycles
 run_starts = {
     item["run_id"]: item for item in records if item.get("record_type") == "run_start"
 }
@@ -472,12 +563,14 @@ generator = [item for item in train_steps if item.get("role") == "generator"]
 fake_score = [item for item in train_steps if item.get("role") == "fake_score"]
 cycles = stage2_records_for_latest_lineage(records, record_type="cycle_summary")
 assert [item["completed_generator_updates"] for item in generator] == list(
-    range(1, 281)
+    range(1, resolved.total_generator_updates + 1)
 )
 assert [item["completed_fake_updates"] for item in fake_score] == list(
-    range(1, 1401)
+    range(1, resolved.total_fake_updates + 1)
 )
-assert [item["completed_cycles"] for item in cycles] == list(range(1, 281))
+assert [item["completed_cycles"] for item in cycles] == list(
+    range(1, resolved.total_cycles + 1)
+)
 checkpoint_metrics = (checkpoint / "metrics_lineage.jsonl").read_bytes()
 live_metrics = (root / "metrics" / "stage2_train_metrics.jsonl").read_bytes()
 assert live_metrics.startswith(checkpoint_metrics)
@@ -488,7 +581,8 @@ formal_complete() {
   local root="$1"
   local config="$2"
   local expected_phase_b_mode="$3"
-  [[ -f "$root/checkpoint_stage2_g000280/_SUCCESS" ]] || return 1
+  load_stage2_schedule
+  [[ -f "$root/checkpoint_stage2_g$STAGE2_FINAL_STEP/_SUCCESS" ]] || return 1
   validate_formal_metrics "$root" "$config" "$expected_phase_b_mode" >/dev/null 2>&1
 }
 
@@ -506,11 +600,12 @@ plots_complete() {
 }
 
 inference_complete() {
-  local root="$STAGE2_INFERENCE_OUTPUT"
+  local root="$1"
+  local checkpoint="$2"
+  local expected_step="$3"
   [[ -f "$root/manifest.json" && -f "$root/index.html" ]] || return 1
   "$STAGE2_PYTHON" -I -B - \
-    "$SCRIPT_ROOT" "$root" "$ACTIVE_CONFIG" \
-    "$STAGE2_FORMAL_DIR/checkpoint_stage2_g000280" \
+    "$SCRIPT_ROOT" "$root" "$ACTIVE_CONFIG" "$checkpoint" "$expected_step" \
     "$SCRIPT_ROOT/configs/infer_i2v_stage2_baseline.yaml" <<'PY'
 import json
 from pathlib import Path
@@ -527,7 +622,8 @@ from utils.stage2_inference_artifacts import validate_stage2_inference_manifest_
 root = Path(sys.argv[2]).resolve(strict=True)
 resolved = resolve_stage2_config(OmegaConf.load(Path(sys.argv[3]).resolve(strict=True)))
 checkpoint = Path(sys.argv[4]).resolve(strict=True)
-inference_config = load_stage2_inference_config(Path(sys.argv[5]).resolve(strict=True))
+expected_step = int(sys.argv[5])
+inference_config = load_stage2_inference_config(Path(sys.argv[6]).resolve(strict=True))
 samples = build_stage2_inference_samples(
     single_metadata=inference_config.single_metadata,
     two_action_metadata=inference_config.two_action_metadata,
@@ -539,6 +635,7 @@ checkpoint_manifest = validate_stage2_checkpoint(
     expected_contract_hash=resolved.contract_hash(),
     expected_phase_b_mode="dmd_dfd",
 )
+assert checkpoint_manifest["completed_generator_updates"] == expected_step
 ema_entries = [
     item
     for item in checkpoint_manifest["files"]
@@ -548,7 +645,7 @@ assert len(ema_entries) == 1
 expected_checkpoint = {
     "directory": str(checkpoint),
     "manifest_sha256": checkpoint_manifest["manifest_sha256"],
-    "completed_generator_updates": 280,
+    "completed_generator_updates": expected_step,
     "contract_hash": resolved.contract_hash(),
     "generator_ema_sha256": ema_entries[0]["sha256"],
 }
@@ -563,6 +660,111 @@ validated = validate_stage2_inference_manifest_artifacts(
 assert validated["status"] == "complete"
 assert validated["expected_sample_count"] == 56
 PY
+}
+
+validate_inference_checkpoint() {
+  local checkpoint="$1"
+  local expected_step="$2"
+  [[ -d "$checkpoint" && ! -L "$checkpoint" ]] || \
+    fail "checkpoint不是真实目录：$checkpoint"
+  [[ -f "$checkpoint/_SUCCESS" && ! -L "$checkpoint/_SUCCESS" ]] || \
+    fail "checkpoint缺少完整_SUCCESS标记：$checkpoint"
+  "$STAGE2_PYTHON" -I -B - \
+    "$SCRIPT_ROOT" "$checkpoint" "$ACTIVE_CONFIG" "$expected_step" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from omegaconf import OmegaConf
+from utils.stage2_checkpoint import validate_stage2_checkpoint
+from utils.stage2_config import resolve_stage2_config
+
+checkpoint = Path(sys.argv[2]).resolve(strict=True)
+resolved = resolve_stage2_config(OmegaConf.load(Path(sys.argv[3]).resolve(strict=True)))
+expected_step = int(sys.argv[4])
+manifest = validate_stage2_checkpoint(
+    checkpoint,
+    expected_contract_hash=resolved.contract_hash(),
+    expected_phase_b_mode="dmd_dfd",
+)
+assert manifest["completed_generator_updates"] == expected_step
+ema_entries = [
+    item for item in manifest["files"]
+    if item.get("name") == "generator_ema.safetensors"
+]
+assert len(ema_entries) == 1
+PY
+}
+
+normalize_inference_step() {
+  local raw="${1#g}"
+  raw="${raw#G}"
+  [[ "$raw" =~ ^[0-9]{1,6}$ ]] || \
+    fail "权重步数必须是0-999999，例如80、G${STAGE2_FINAL_G}"
+  local value="$((10#$raw))"
+  [[ "$value" -ge 40 ]] || \
+    fail "Stage-2 Generator EMA从G40开始可推理，收到：G$value"
+  printf '%06d\n' "$value"
+}
+
+resolve_inference_steps() {
+  local checkpoint_root="$1"
+  shift
+  INFERENCE_STEPS=()
+  local requested
+  local normalized
+  if [[ "$#" -eq 1 && "$1" == "all" ]]; then
+    local candidate
+    local candidate_name
+    for candidate in "$checkpoint_root"/checkpoint_stage2_g*; do
+      [[ -e "$candidate" || -L "$candidate" ]] || continue
+      [[ -f "$candidate/_SUCCESS" || -L "$candidate/_SUCCESS" ]] || continue
+      [[ ! -L "$candidate" && -d "$candidate" ]] || \
+        fail "自动发现到非真实checkpoint目录：$candidate"
+      candidate_name="$(basename -- "$candidate")"
+      [[ "$candidate_name" =~ ^checkpoint_stage2_g([0-9]{6})$ ]] || \
+        fail "自动发现到非法checkpoint名：$candidate_name"
+      normalized="${BASH_REMATCH[1]}"
+      [[ "$((10#$normalized))" -ge 40 ]] || continue
+      INFERENCE_STEPS+=("$normalized")
+    done
+    [[ "${#INFERENCE_STEPS[@]}" -gt 0 ]] || \
+      fail "没有发现带_SUCCESS且G>=40的checkpoint：$checkpoint_root"
+  else
+    [[ "$#" -gt 0 ]] || fail "内部错误：未提供推理权重"
+    for requested in "$@"; do
+      [[ "$requested" != "all" ]] || \
+        fail "all不能与显式步数混用"
+      normalized="$(normalize_inference_step "$requested")"
+      INFERENCE_STEPS+=("$normalized")
+    done
+  fi
+
+  local sorted_steps=()
+  while IFS= read -r normalized; do
+    [[ -n "$normalized" ]] && sorted_steps+=("$normalized")
+  done < <(printf '%s\n' "${INFERENCE_STEPS[@]}" | LC_ALL=C sort -n -u)
+  INFERENCE_STEPS=("${sorted_steps[@]}")
+}
+
+inference_output_for_step() {
+  local step="$1"
+  local legacy_final="$2"
+  if [[ "$legacy_final" -eq 1 ]]; then
+    printf '%s\n' "$STAGE2_INFERENCE_OUTPUT"
+  else
+    printf '%s/inference_g%s_baseline\n' "$STAGE2_INFERENCE_ROOT" "$step"
+  fi
+}
+
+inference_log_for_step() {
+  local step="$1"
+  local legacy_final="$2"
+  if [[ "$legacy_final" -eq 1 ]]; then
+    printf '%s/inference_g%s_longrun.log\n' "$STAGE2_TRAIN_ROOT" "$STAGE2_FINAL_STEP"
+  else
+    printf '%s/logs/inference_g%s_baseline.log\n' "$STAGE2_INFERENCE_ROOT" "$step"
+  fi
 }
 
 run_prepare() {
@@ -622,7 +824,7 @@ run_smoke() {
 run_train_b1() {
   CURRENT_STAGE="train-b1"
   announce \
-    "正式训练B1到G280；重复本命令会从同目录最新完整checkpoint自动恢复" \
+    "正式训练B1到G${STAGE2_FINAL_G}；重复本命令会从同目录最新完整checkpoint自动恢复" \
     "STAGE2_GUIDE_TRAIN_B1=PASS"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     torchrun_train_command "$ACTIVE_CONFIG" "$STAGE2_FORMAL_DIR"
@@ -641,13 +843,13 @@ run_train_b1() {
       "$ACTIVE_CONFIG" "$STAGE2_FORMAL_DIR"
   fi
   formal_complete "$STAGE2_FORMAL_DIR" "$ACTIVE_CONFIG" dmd_dfd || \
-    fail "B1未到G280、phase arm错误或run_end不是complete。"
+    fail "B1未到G${STAGE2_FINAL_G}、phase arm错误或run_end不是complete。"
   echo "STAGE2_GUIDE_TRAIN_B1=PASS"
   echo "NEXT: bash run_stage2_h100.sh control"
 }
 
 ensure_b0_config() {
-  local anchor="$STAGE2_FORMAL_DIR/checkpoint_stage2_g000240"
+  local anchor="$STAGE2_FORMAL_DIR/checkpoint_stage2_g$STAGE2_A_END_STEP"
   "$STAGE2_PYTHON" -I -B - \
     "$ACTIVE_CONFIG" "$STAGE2_B0_CONFIG" "$anchor" <<'PY'
 from pathlib import Path
@@ -678,11 +880,11 @@ PY
 run_train_b0() {
   CURRENT_STAGE="train-b0"
   announce \
-    "从B1的同一G240分叉，正式训练纯DMD matched-control B0到G280" \
+    "从B1的同一G${STAGE2_A_END_G}分叉，正式训练纯DMD matched-control B0到G${STAGE2_FINAL_G}" \
     "STAGE2_GUIDE_TRAIN_B0=PASS"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "  生成B0配置：$STAGE2_B0_CONFIG"
-    echo "  固定变换：init_from_stage1=null, resume_stage2=G240, phase_b_mode=dmd_only, dfd_probability=0"
+    echo "  固定变换：init_from_stage1=null, resume_stage2=G${STAGE2_A_END_G}, phase_b_mode=dmd_only, dfd_probability=0"
     torchrun_train_command "$STAGE2_B0_CONFIG" "$STAGE2_B0_DIR"
     return 0
   fi
@@ -690,9 +892,9 @@ run_train_b0() {
   require_distinct_run_paths
   require_prepared
   formal_complete "$STAGE2_FORMAL_DIR" "$ACTIVE_CONFIG" dmd_dfd || \
-    fail "B1尚未完整到G280。"
-  [[ -f "$STAGE2_FORMAL_DIR/checkpoint_stage2_g000240/_SUCCESS" ]] || \
-    fail "缺少B1共同父点G240。"
+    fail "B1尚未完整到G${STAGE2_FINAL_G}。"
+  [[ -f "$STAGE2_FORMAL_DIR/checkpoint_stage2_g$STAGE2_A_END_STEP/_SUCCESS" ]] || \
+    fail "缺少B1共同父点G${STAGE2_A_END_G}。"
   ensure_b0_config
   if formal_complete "$STAGE2_B0_DIR" "$STAGE2_B0_CONFIG" dmd_only; then
     echo "STAGE2_TRAIN_B0=ALREADY_PASS"
@@ -702,7 +904,7 @@ run_train_b0() {
       "$STAGE2_B0_CONFIG" "$STAGE2_B0_DIR"
   fi
   formal_complete "$STAGE2_B0_DIR" "$STAGE2_B0_CONFIG" dmd_only || \
-    fail "B0未到G280、phase arm错误或run_end不是complete。"
+    fail "B0未到G${STAGE2_FINAL_G}、phase arm错误或run_end不是complete。"
   echo "STAGE2_GUIDE_TRAIN_B0=PASS"
   echo "NEXT: bash run_stage2_h100.sh plot"
 }
@@ -742,33 +944,112 @@ run_plot() {
   echo "NEXT: bash run_stage2_h100.sh infer"
 }
 
-run_infer() {
-  CURRENT_STAGE="infer"
+run_plot_live() {
+  CURRENT_STAGE="plot-live"
+  local metrics="$STAGE2_FORMAL_DIR/metrics/stage2_train_metrics.jsonl"
   announce \
-    "加载B1 G280 Generator-EMA，生成24个单动作和32个双动作视频" \
-    "STAGE2_GUIDE_INFER=PASS samples=56"
+    "从B1训练中的只读JSONL快照生成临时曲线；不要求G${STAGE2_FINAL_G}，不覆盖正式验收图" \
+    "STAGE2_GUIDE_PLOT_LIVE=PASS"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    print_command bash "$SCRIPT_ROOT/infer_stage2_baseline.sh"
+    print_command "$STAGE2_PYTHON" -B "$SCRIPT_ROOT/scripts/plot_stage2_training.py" \
+      --jsonl "$metrics" --output-dir "$STAGE2_LIVE_PLOT_DIR" --formats png svg
     return 0
   fi
+  [[ -x "$STAGE2_PYTHON" ]] || fail "Python不可执行：$STAGE2_PYTHON"
+  [[ -f "$SCRIPT_ROOT/scripts/plot_stage2_training.py" ]] || \
+    fail "缺少scripts/plot_stage2_training.py"
+  [[ -s "$metrics" ]] || \
+    fail "B1 metrics尚未产生；请等待训练至少完成第一个F1 update后重试：$metrics"
+  "$STAGE2_PYTHON" -B "$SCRIPT_ROOT/scripts/plot_stage2_training.py" \
+    --jsonl "$metrics" --output-dir "$STAGE2_LIVE_PLOT_DIR" --formats png svg
+  plot_set_complete "$STAGE2_LIVE_PLOT_DIR" || \
+    fail "训练中绘图结束，但9×PNG/9×SVG/index.html不完整。"
+  echo "STAGE2_GUIDE_PLOT_LIVE=PASS"
+  echo "LIVE_HTML=$STAGE2_LIVE_PLOT_DIR/index.html"
+  echo "提示：训练继续后可重复运行同一命令刷新；最终验收仍运行：bash run_stage2_h100.sh plot"
+}
+
+run_infer() {
+  CURRENT_STAGE="infer"
+  local legacy_final=0
+  if [[ "$#" -eq 0 ]]; then
+    legacy_final=1
+    set -- "$STAGE2_FINAL_G"
+  fi
+  local checkpoint_root="$STAGE2_INFERENCE_CHECKPOINT_ROOT"
+  if [[ "$legacy_final" -eq 1 ]]; then
+    checkpoint_root="$STAGE2_FORMAL_DIR"
+  fi
+  resolve_inference_steps "$checkpoint_root" "$@"
+
+  local checkpoint_count="${#INFERENCE_STEPS[@]}"
+  local total_samples="$((checkpoint_count * 56))"
+  if [[ "$legacy_final" -eq 1 ]]; then
+    announce \
+      "加载B1 G${STAGE2_FINAL_G} Generator-EMA，生成24个单动作和32个双动作视频" \
+      "STAGE2_GUIDE_INFER=PASS samples=56"
+  else
+    announce \
+      "按数字顺序批量加载${checkpoint_count}个B1 Generator-EMA；每个生成56个视频" \
+      "STAGE2_GUIDE_INFER=PASS checkpoints=$checkpoint_count samples_per_checkpoint=56 total_samples=$total_samples"
+  fi
+
+  local step
+  local checkpoint
+  local output
+  local log_path
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    for step in "${INFERENCE_STEPS[@]}"; do
+      checkpoint="$checkpoint_root/checkpoint_stage2_g${step}"
+      output="$(inference_output_for_step "$step" "$legacy_final")"
+      echo "  G${step}: checkpoint=$checkpoint"
+      echo "  G${step}: output=$output"
+      print_command env \
+        "LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT=$checkpoint" \
+        "LONG_LIVE_STAGE2_INFERENCE_OUTPUT=$output" \
+        "STAGE2_INFERENCE_NPROC=$STAGE2_INFERENCE_NPROC" \
+        bash "$SCRIPT_ROOT/infer_stage2_baseline.sh"
+    done
+    return 0
+  fi
+
   require_runtime
   require_distinct_run_paths
   require_prepared
   formal_complete "$STAGE2_FORMAL_DIR" "$ACTIVE_CONFIG" dmd_dfd || \
-    fail "B1尚未完整到G280。"
-  if inference_complete >/dev/null 2>&1; then
-    echo "STAGE2_INFERENCE=ALREADY_PASS"
-  else
-    if [[ -d "$STAGE2_INFERENCE_OUTPUT" ]] && \
-       find "$STAGE2_INFERENCE_OUTPUT" -mindepth 1 -print -quit | grep -q .; then
-      fail "推理目录非空但不是完整批次；请保留/归档整个目录，并用新的STAGE2_INFERENCE_OUTPUT重跑。"
+    fail "B1尚未完整到G${STAGE2_FINAL_G}。"
+
+  for step in "${INFERENCE_STEPS[@]}"; do
+    checkpoint="$checkpoint_root/checkpoint_stage2_g${step}"
+    output="$(inference_output_for_step "$step" "$legacy_final")"
+    log_path="$(inference_log_for_step "$step" "$legacy_final")"
+    validate_inference_checkpoint "$checkpoint" "$((10#$step))"
+    export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$checkpoint"
+    export LONG_LIVE_STAGE2_INFERENCE_OUTPUT="$output"
+
+    echo "STAGE2_INFERENCE_G${step}=START checkpoint=$checkpoint"
+    echo "STAGE2_INFERENCE_G${step}_OUTPUT=$output"
+    echo "STAGE2_INFERENCE_G${step}_LOG=$log_path"
+    if inference_complete "$output" "$checkpoint" "$((10#$step))" \
+        >/dev/null 2>&1; then
+      echo "STAGE2_INFERENCE_G${step}=ALREADY_PASS samples=56"
+    else
+      if [[ -d "$output" ]]; then
+        echo "STAGE2_INFERENCE_G${step}=RESUME existing_output=$output"
+      fi
+      run_logged "$log_path" bash "$SCRIPT_ROOT/infer_stage2_baseline.sh"
     fi
-    run_logged "$STAGE2_TRAIN_ROOT/inference_g280_baseline.log" \
-      bash "$SCRIPT_ROOT/infer_stage2_baseline.sh"
+    inference_complete "$output" "$checkpoint" "$((10#$step))" || \
+      fail "G${step}推理结束，但56个MP4、56个trace或manifest/index复验失败。"
+    echo "STAGE2_INFERENCE_G${step}=PASS samples=56"
+    echo "OPEN_FOR_VISUAL_REVIEW_G${step}=$output/index.html"
+  done
+
+  if [[ "$legacy_final" -eq 1 ]]; then
+    echo "STAGE2_GUIDE_INFER=PASS samples=56"
+  else
+    echo "STAGE2_GUIDE_INFER=PASS checkpoints=$checkpoint_count samples_per_checkpoint=56 total_samples=$total_samples"
   fi
-  inference_complete || fail "推理结束，但56个MP4、56个trace或manifest/index复验失败。"
-  echo "STAGE2_GUIDE_INFER=PASS samples=56"
-  echo "OPEN_FOR_VISUAL_REVIEW=$STAGE2_INFERENCE_OUTPUT/index.html"
 }
 
 status_item() {
@@ -794,7 +1075,10 @@ run_status() {
   status_item TRAIN_B0 formal_complete \
     "$STAGE2_B0_DIR" "$STAGE2_B0_CONFIG" dmd_only || all_complete=1
   status_item PLOT plots_complete || all_complete=1
-  status_item INFER inference_complete || all_complete=1
+  status_item INFER inference_complete \
+    "$STAGE2_INFERENCE_OUTPUT" \
+    "$STAGE2_FORMAL_DIR/checkpoint_stage2_g$STAGE2_FINAL_STEP" \
+    "$STAGE2_FINAL_G" || all_complete=1
   if [[ "$all_complete" -eq 0 ]]; then
     echo "STAGE2_STATUS=COMPLETE"
   else
@@ -809,18 +1093,28 @@ fi
 
 COMMAND="${1:-help}"
 shift || true
-[[ "$#" -eq 0 ]] || fail "不接受额外参数：$*"
 
 cd -- "$SCRIPT_ROOT"
 case "$COMMAND" in
-  help|-h|--help) usage ;;
-  prepare|1-prepare) run_prepare ;;
-  smoke|2-smoke) run_smoke ;;
-  train|3-train) run_train_b1 ;;
-  control|b0|4-control) run_train_b0 ;;
-  plot|5-plot) run_plot ;;
-  infer|6-infer) run_infer ;;
-  status) run_status ;;
+  prepare|1-prepare|smoke|2-smoke|train|3-train|control|b0|4-control|plot-live|live-plot|plot|5-plot|infer|6-infer|status)
+    load_stage2_schedule
+    ;;
+esac
+case "$COMMAND" in
+  infer|6-infer) run_infer "$@" ;;
+  help|-h|--help|prepare|1-prepare|smoke|2-smoke|train|3-train|control|b0|4-control|plot-live|live-plot|plot|5-plot|status)
+    [[ "$#" -eq 0 ]] || fail "不接受额外参数：$*"
+    case "$COMMAND" in
+      help|-h|--help) usage ;;
+      prepare|1-prepare) run_prepare ;;
+      smoke|2-smoke) run_smoke ;;
+      train|3-train) run_train_b1 ;;
+      control|b0|4-control) run_train_b0 ;;
+      plot-live|live-plot) run_plot_live ;;
+      plot|5-plot) run_plot ;;
+      status) run_status ;;
+    esac
+    ;;
   *)
     usage >&2
     fail "未知子命令：$COMMAND"
