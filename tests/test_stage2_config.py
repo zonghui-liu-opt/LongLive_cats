@@ -106,6 +106,32 @@ def test_h100_micro1_acc8_longrun_contract_resolves_exact_requested_budget():
     assert resolved.contract_hash() != load_stage2_config(CONFIG_PATH).contract_hash()
 
 
+def test_h100_longrun_resolves_world4_micro1_acc16_from_launcher(monkeypatch):
+    monkeypatch.setenv("STAGE2_GPUS", "4")
+    monkeypatch.setenv("LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS", "16")
+    monkeypatch.setenv("LONG_LIVE_STAGE2_PREFLIGHT_MICRO2_ACCUMULATION_STEPS", "8")
+
+    resolved = load_stage2_config(LONG_CONFIG_PATH)
+
+    assert (
+        resolved.expected_world_size,
+        resolved.data_parallel_size,
+        resolved.sequence_parallel_size,
+    ) == (4, 4, 1)
+    assert (
+        resolved.microbatch_size_per_device,
+        resolved.gradient_accumulation_steps,
+    ) == (1, 16)
+    assert resolved.candidate_batch_profiles == ((2, 8), (1, 16))
+    assert resolved.candidate_profile_global_batches == (64, 64)
+    assert resolved.effective_global_batch == 64
+    assert (
+        resolved.phase_a_generator_updates,
+        resolved.total_generator_updates,
+        resolved.total_fake_updates,
+    ) == (3_600, 4_000, 20_000)
+
+
 @pytest.mark.parametrize(
     ("path", "value", "match"),
     (

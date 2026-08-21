@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Initialize and audit Stage-2 roles on 8xH100 without any forward or training."""
+"""Initialize and audit Stage-2 roles on 4/8xH100 without forward or training."""
 
 from __future__ import annotations
 
@@ -69,13 +69,18 @@ def main(argv: list[str] | None = None) -> int:
         if not dist.is_initialized():
             if "LOCAL_RANK" not in os.environ:
                 raise RuntimeError(
-                    "Stage-2 role preflight must run under torchrun with 8 processes"
+                    "Stage-2 role preflight must run under torchrun with 4 or 8 processes"
                 )
             local_rank = int(os.environ["LOCAL_RANK"])
             torch.cuda.set_device(local_rank)
             dist.init_process_group("nccl", timeout=timedelta(minutes=60))
             initialized_here = True
         rank = dist.get_rank()
+        if dist.get_world_size() != resolved.expected_world_size:
+            raise RuntimeError(
+                "Stage-2 role preflight WORLD_SIZE differs from the resolved config: "
+                f"runtime={dist.get_world_size()}, config={resolved.expected_world_size}"
+            )
 
         def world_checked(label: str, callback: Callable[[], _T]) -> _T:
             value = None

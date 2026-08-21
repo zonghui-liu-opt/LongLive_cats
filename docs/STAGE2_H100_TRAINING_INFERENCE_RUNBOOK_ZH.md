@@ -1,4 +1,4 @@
-# Stage-2：8×H100 预检、正式训练、绘图与 EMA 推理
+# Stage-2：4/8×H100 预检、正式训练、绘图与 EMA 推理
 
 本文是 Stage-2 的完整内网执行手册。短文档
 `STAGE2_H100_QUICK_DEPLOY_ZH.md` 只负责训练前 6 项检查；本文从同一组已审计资产继续执行
@@ -7,7 +7,7 @@ C0/C1/C2、正式训练、断点恢复、训练曲线和 baseline 推理。
 正常执行不需要逐段复制本文。直接运行 `bash run_stage2_h100.sh help`，再按脚本显示的
 `prepare → smoke → train → control → plot → infer` 六步操作；本文只保留完整原理和故障排查命令。
 入口默认使用仓库内`configs/train_i2v_stage2_600cats_micro1_acc8.yaml`，即
-`8卡×micro1×acc8=global batch 64`。该文件是严格的
+`8卡×micro1×acc8`或`4卡×micro1×acc16`，两者均为`global batch 64`。该文件是严格的
 `h100_micro1_acc8_longrun`合同：Phase A=360 epoch、Phase B=40 epoch、Generator/Fake-score
 LR=`1e-5/2e-6`，派生为A=`3600G/18000F`、B=`400G/2000F`、总计=`4000G/20000F`。
 启动前显式设置`STAGE2_CONFIG`仍可覆盖默认值，wrapper会从实际resolved config动态派生终点。
@@ -15,6 +15,7 @@ LR=`1e-5/2e-6`，派生为A=`3600G/18000F`、B=`400G/2000F`、总计=`4000G/2000
 这是一个全新research contract，不能从旧micro1 A24/B4的G240/G280做exact resume。必须使用本文新的
 `STAGE2_WORK_ROOT`和`STAGE2_TRAIN_ROOT`，从Stage-1 step3075冷启动；一旦开始，不要在同一lineage
 中途再改epochs、LR、milestones或路径。中断恢复只允许继续使用完全相同的config/hash和输出目录。
+4卡与8卡属于不同topology合同，不能跨拓扑exact resume。
 
 所有命令均在同一个 shell 中执行。该流程不读取版本控制元数据，也不要求代码目录处于提交态。
 建议仍把工作产物放在独立目录，便于容量管理、归档和故障恢复。
@@ -27,15 +28,18 @@ set -euo pipefail
 export STAGE2_PROJECT_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
 export STAGE2_PYTHON=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python
 export STAGE2_TORCHRUN="$(dirname "$STAGE2_PYTHON")/torchrun"
-export STAGE2_WORK_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_h100_micro1_acc8_longrun
-export STAGE2_TRAIN_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training_h100_micro1_acc8_longrun
+export STAGE2_GPUS="${STAGE2_GPUS:-8}"  # 4卡时先执行：export STAGE2_GPUS=4
+if [[ "$STAGE2_GPUS" == 4 ]]; then STAGE2_SUFFIX=_4gpus; CUDA_VISIBLE_DEVICES=0,1,2,3; else STAGE2_SUFFIX=; CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7; fi
+export CUDA_VISIBLE_DEVICES
+export LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS="$((64 / STAGE2_GPUS))"
+export LONG_LIVE_STAGE2_PREFLIGHT_MICRO2_ACCUMULATION_STEPS="$((32 / STAGE2_GPUS))"
+export STAGE2_WORK_ROOT="/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_h100_micro1_acc8_longrun${STAGE2_SUFFIX}"
+export STAGE2_TRAIN_ROOT="/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training_h100_micro1_acc8_longrun${STAGE2_SUFFIX}"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONPYCACHEPREFIX="$STAGE2_WORK_ROOT/pycache"
 export OMP_NUM_THREADS=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
 cd "$STAGE2_PROJECT_ROOT"
 [[ -x "$STAGE2_PYTHON" ]]
 [[ -x "$STAGE2_TORCHRUN" ]]
@@ -95,7 +99,7 @@ CHECK_6_FSDP2_ACCUMULATION_PASS
 STAGE2_PRETRAIN_PASS
 ```
 
-第 6 项是新增的真实 8×H100 FSDP2 release gate；以前只通过旧版 prepare 不能替代它。
+第 6 项是对应当前4/8×H100 topology的真实FSDP2 release gate；以前只通过旧版 prepare 不能替代它。
 
 prepare 的 `export` 不会反向修改父 shell。训练前在当前 shell 明确重绑同一批产物：
 
@@ -113,7 +117,7 @@ export LONG_LIVE_STAGE2_NEGATIVE_MANIFEST="$STAGE2_WORK_ROOT/negative_v1/negativ
 export ACTIVE_CONFIG="$STAGE2_CONFIG"
 ```
 
-## 3. 默认 micro1×acc8 的 C0/C1/C2
+## 3. 默认8卡micro1×acc8 / 4卡micro1×acc16的 C0/C1/C2
 
 选择一个从未用于正式训练的临时目录。C0 冷启动并保存，C1 只从 C0 恢复、跑纯 DMD
 并保存，C2 只从 C1 恢复、强制 DFD 且不保存。
@@ -122,19 +126,19 @@ export ACTIVE_CONFIG="$STAGE2_CONFIG"
 export STAGE2_SMOKE_DIR="$STAGE2_TRAIN_ROOT/smoke_longrun"
 mkdir -p "$STAGE2_SMOKE_DIR"
 
-"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
   --no-python "$STAGE2_PYTHON" -I -B train.py \
   --config_path "$ACTIVE_CONFIG" --logdir "$STAGE2_SMOKE_DIR" \
   --stage2-smoke C0 --no-visualize \
   2>&1 | tee "$STAGE2_SMOKE_DIR/C0.log"
 
-"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
   --no-python "$STAGE2_PYTHON" -I -B train.py \
   --config_path "$ACTIVE_CONFIG" --logdir "$STAGE2_SMOKE_DIR" \
   --stage2-smoke C1 --no-visualize \
   2>&1 | tee "$STAGE2_SMOKE_DIR/C1.log"
 
-"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
   --no-python "$STAGE2_PYTHON" -I -B train.py \
   --config_path "$ACTIVE_CONFIG" --logdir "$STAGE2_SMOKE_DIR" \
   --stage2-smoke C2 --no-visualize \
@@ -163,7 +167,7 @@ all-gather叠加形成的短时峰值。
 又使连续buffer更难取得。即使allocator调优让这次申请侥幸成功，69.91 GiB仍超过85%门禁约
 67.31 GiB，约77.02 GiB reserved也超过90%门禁约71.27 GiB，micro2不能进入正式训练。
 
-8卡FSDP2不会把8张卡拼成一块640GB显存。三套5B角色的参数会分片，但每个rank仍需独立容纳
+FSDP2不会把4/8张卡拼成一块共享显存。三套5B角色的参数会分片，但每个rank仍需独立容纳
 rollout activation、self/cross-KV和临时通信buffer；每个transformer block forward前还会在本卡
 all-gather完整block。Generator因cache反向正确性明确关闭activation checkpoint，micro2会近似
 翻倍主导激活。若OOM报告中“当前进程占用”已经接近整卡总量，则外部进程不是主因；若两者
@@ -173,7 +177,7 @@ all-gather完整block。Generator因cache反向正确性明确关闭activation c
 nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory,process_name --format=csv,noheader
 ```
 
-## 4. 旧shell迁移或显式覆盖时锁定micro1×acc8
+## 4. 旧shell迁移或显式覆盖时锁定micro1×global64
 
 当前`run_stage2_h100.sh`已经默认使用仓库内micro1×acc8配置，不再需要从canonical配置现场复制。
 如果当前shell曾显式设置旧`STAGE2_CONFIG`，请在`prepare`前重新绑定，并为该launch hash使用
@@ -239,7 +243,7 @@ bash run_stage2_h100.sh smoke
 export STAGE2_FORMAL_DIR="$STAGE2_TRAIN_ROOT/formal_b1_longrun"
 mkdir -p "$STAGE2_FORMAL_DIR"
 
-"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
   --no-python "$STAGE2_PYTHON" -I -B train.py \
   --config_path "$ACTIVE_CONFIG" --logdir "$STAGE2_FORMAL_DIR" \
   --no-visualize \
@@ -291,7 +295,7 @@ config.training.phase_b_dfd_probability_max = 0.0
 OmegaConf.save(config, destination)
 PY
 
-"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+"$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
   --no-python "$STAGE2_PYTHON" -I -B train.py \
   --config_path "$STAGE2_B0_CONFIG" --logdir "$STAGE2_B0_DIR" \
   --no-visualize \

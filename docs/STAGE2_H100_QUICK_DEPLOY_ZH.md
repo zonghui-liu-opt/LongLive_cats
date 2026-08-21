@@ -23,12 +23,12 @@ video,action_id
 
 ```bash
 cd /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
-
 export ACTION_SIDECAR_600=/你的绝对路径/action_labels_600.csv
 export ATTEST_STAGE2_TEACHER=1
-# 推荐使用独立工作目录，便于容量管理、归档和恢复。
-export STAGE2_WORK_ROOT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new
-
+# 4卡时取消下一行注释；不设置则默认8卡。两种拓扑必须使用不同工作目录。
+# export STAGE2_GPUS=4
+export STAGE2_WORK_ROOT="/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new_${STAGE2_GPUS:-8}gpus"
+export STAGE2_CONFIG="$PWD/configs/train_i2v_stage2_600cats_micro1_acc8.yaml"
 bash prepare_stage2.sh
 ```
 
@@ -55,5 +55,5 @@ CHECK_6_FSDP2_ACCUMULATION_PASS
 STAGE2_PRETRAIN_PASS
 ```
 
-第 6 项使用 tiny 参数在真实 8×H100 FSDP2 上对比 micro2×acc4、micro1×acc8、
+第 6 项使用 tiny 参数在当前4/8×H100 FSDP2 topology上对比两组保持global64的候选、
 sync/no-sync 与 global-batch reference 的 loss、梯度和更新后参数。这个脚本不会启动 Stage-2 训练。

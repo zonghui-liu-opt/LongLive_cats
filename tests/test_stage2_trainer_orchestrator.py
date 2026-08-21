@@ -922,6 +922,7 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
         state,
         *,
         rank,
+        expected_world_size,
         dedicated_generators,
         rank0_control_generators,
         require_cuda_topology,
@@ -930,6 +931,7 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
             {
                 "state": state,
                 "rank": rank,
+                "expected_world_size": expected_world_size,
                 "dedicated_generators": dedicated_generators,
                 "rank0_control_generators": rank0_control_generators,
                 "require_cuda_topology": require_cuda_topology,
@@ -943,6 +945,7 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
     call = rng_calls[0]
     assert call["state"] is local_rng_state
     assert call["rank"] == 0
+    assert call["expected_world_size"] == 8
     assert call["require_cuda_topology"] is True
     assert call["dedicated_generators"] == {
         "generator_rollout": generator_rollout,

@@ -825,11 +825,16 @@ _STAGE2_FSDP2_PATCH_UNITS = (
         """from utils.lora_utils import LoraTensorSpec
 
 STAGE2_FSDP2_WORLD_SIZE = 8
+STAGE2_FSDP2_MESH_SHAPE = (8,)
 """,
         """from utils.lora_utils import LoraTensorSpec
 from utils.parameter_names import map_parameter_names_to_expected
 
+STAGE2_FSDP2_WORLD_SIZES = (4, 8)
+# Retained only so the cumulative pre-Phase-35 innernet hotfix can leave an
+# older world8 checkout runnable; production logic below is topology-derived.
 STAGE2_FSDP2_WORLD_SIZE = 8
+STAGE2_FSDP2_MESH_SHAPE = (8,)
 """,
     ),
     _PatchUnit(
@@ -842,6 +847,7 @@ STAGE2_FSDP2_WORLD_SIZE = 8
         """    frozen_tensor_count = 0
     global_frozen_parameters = 0
     canonical_keys: list[str] = []
+    audited_mesh_shape: tuple[int, ...] | None = None
     runtime_to_raw: Mapping[str, str] = {}
     raw_to_key: dict[str, str] = {}
     if expected_schema is not None:
@@ -1260,18 +1266,38 @@ def restore_stage2_optimizer_state(
     ),
     _PatchUnit(
         "prepared_optimizer_return",
-        """    return raw_g, raw_f, ema, _validate_topology(topology)
+        """    _validate_rank_state_maps(
+        rank_ema_states=rank_ema_states,
+        rank_rng_states=rank_rng_states,
+        completed_g=completed_g,
+        expected_ema_parameter_names={
+            spec.raw_parameter_name for spec in generator_schema.values()
+        },
+        trainer_state=trainer_state,
+    )
+    return raw_g, raw_f, ema, _validate_topology(topology)
 
 
 def _optimizer_names_for_schema(
 """,
-        """    return (
+        """    audited_topology = _validate_topology(topology)
+    _validate_rank_state_maps(
+        rank_ema_states=rank_ema_states,
+        rank_rng_states=rank_rng_states,
+        completed_g=completed_g,
+        expected_ema_parameter_names={
+            spec.raw_parameter_name for spec in generator_schema.values()
+        },
+        trainer_state=trainer_state,
+        world_size=audited_topology["world_size"],
+    )
+    return (
         raw_g,
         raw_f,
         ema,
         canonical_generator_optimizer,
         canonical_fake_optimizer,
-        _validate_topology(topology),
+        audited_topology,
     )
 
 

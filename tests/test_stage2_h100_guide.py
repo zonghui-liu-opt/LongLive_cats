@@ -42,6 +42,7 @@ def _isolated_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         }
     )
     for name in (
+        "STAGE2_GPUS",
         "STAGE2_CONFIG",
         "ACTIVE_CONFIG",
         "STAGE2_SMOKE_DIR",
@@ -53,8 +54,11 @@ def _isolated_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "STAGE2_INFERENCE_CHECKPOINT_ROOT",
         "STAGE2_INFERENCE_NPROC",
         "STAGE2_INFERENCE_HEARTBEAT_SECONDS",
+        "LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS",
+        "LONG_LIVE_STAGE2_PREFLIGHT_MICRO2_ACCUMULATION_STEPS",
     ):
         env.pop(name, None)
+    env.pop("CUDA_VISIBLE_DEVICES", None)
     return env, work_root, train_root
 
 
@@ -72,7 +76,8 @@ def test_stage2_h100_guide_has_valid_shell_and_plain_operator_help():
     assert completed.returncode == 0, completed.stderr
     required = (
         "train_i2v_stage2_600cats_micro1_acc8.yaml",
-        "8卡×micro1×acc8=global64",
+        "默认8卡；4卡启动前设置：export STAGE2_GPUS=4",
+        "8卡×micro1×acc8 或 4卡×micro1×acc16，均为global64",
         "A360/B40",
         "G/F LR=1e-5/2e-6",
         "bash run_stage2_h100.sh prepare",
@@ -99,6 +104,8 @@ def test_stage2_h100_guide_has_valid_shell_and_plain_operator_help():
     assert all(item in completed.stdout for item in required)
     assert "3750" not in completed.stdout
     assert "200/200/200" not in completed.stdout
+    prepare = (PROJECT_ROOT / "prepare_stage2.sh").read_text(encoding="utf-8")
+    assert 'CUDA_VISIBLE_DEVICES=0 "$STAGE2_PYTHON"' not in prepare
 
 
 def test_stage2_h100_guide_dry_runs_exact_commands_without_writes(tmp_path):
@@ -156,6 +163,67 @@ def test_stage2_h100_guide_dry_runs_exact_commands_without_writes(tmp_path):
     assert "formal_b1_longrun/plots_live" in outputs["plot-live"]
     assert outputs["plot-live"].count("--formats png svg") == 1
     assert "infer_stage2_baseline.sh" in outputs["infer"]
+
+
+def test_stage2_h100_guide_world4_keeps_global64_and_uses_four_processes(tmp_path):
+    env, work_root, train_root = _isolated_env(tmp_path)
+    env["STAGE2_GPUS"] = "4"
+    env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
+    smoke = _run("--dry-run", "smoke", env=env)
+    train = _run("--dry-run", "train", env=env)
+    prepare = _run("--dry-run", "prepare", env=env)
+
+    for completed in (prepare, smoke, train):
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert smoke.stdout.count("--nproc-per-node=4") == 3
+    assert "--nproc-per-node=8" not in smoke.stdout
+    assert "--nproc-per-node=4" in train.stdout
+    assert "topology=4xH100 micro1 acc16 global64" in train.stdout
+    assert "prepare_stage2.sh" in prepare.stdout
+    assert not work_root.exists()
+    assert not train_root.exists()
+
+
+def test_stage2_h100_guide_allows_single_gpu_inference_for_world8_checkpoint(tmp_path):
+    env, work_root, train_root = _isolated_env(tmp_path)
+    env["STAGE2_INFERENCE_NPROC"] = "1"
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+
+    completed = _run("--dry-run", "infer", env=env)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "STAGE2_INFERENCE_NPROC=1" in completed.stdout
+    assert "topology=8xH100 micro1 acc8 global64" in completed.stdout
+    assert not work_root.exists()
+    assert not train_root.exists()
+
+
+def test_stage2_h100_guide_world4_default_roots_are_isolated(tmp_path):
+    env, _, _ = _isolated_env(tmp_path)
+    env.pop("STAGE2_WORK_ROOT")
+    env.pop("STAGE2_TRAIN_ROOT")
+    env["STAGE2_GPUS"] = "4"
+    env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
+    completed = _run("--dry-run", "train", env=env)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "LongLive-2.0_training_h100_micro1_acc8_longrun_4gpus" in completed.stdout
+
+
+def test_stage2_h100_guide_rejects_unsupported_or_mismatched_gpu_topology(tmp_path):
+    env, _, _ = _isolated_env(tmp_path)
+    env["STAGE2_GPUS"] = "5"
+    unsupported = _run("--dry-run", "train", env=env)
+    assert unsupported.returncode != 0
+    assert "STAGE2_GPUS must be 4 or 8" in unsupported.stderr
+
+    env["STAGE2_GPUS"] = "4"
+    env["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+    mismatch = _run("--dry-run", "train", env=env)
+    assert mismatch.returncode != 0
+    assert "CUDA_VISIBLE_DEVICES" in mismatch.stderr
 
 
 def test_stage2_h100_guide_preserves_explicit_config_override(tmp_path):
@@ -289,9 +357,9 @@ def test_stage2_h100_guide_keeps_release_safety_and_validation_order():
     assert "require_external_path" not in text
     assert "checkpoint_model_003075" in text
     assert "stage1_step3075_ema_merged.pt" in text
-    assert "STAGE2_FSDP2_ACCUMULATION_GATE=PASS mode=H100-world8" in text
+    assert "STAGE2_FSDP2_ACCUMULATION_GATE=PASS mode=H100-world${STAGE2_GPUS}" in text
     assert "--max-restarts=0" in text
-    assert "--nproc-per-node=8" in text
+    assert '--nproc-per-node="$STAGE2_GPUS"' in text
     assert "--require-complete" in text
     assert "expected_sample_count" in text
     assert "== 56" in text

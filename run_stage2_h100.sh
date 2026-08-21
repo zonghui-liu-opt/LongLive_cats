@@ -9,10 +9,27 @@ SCRIPT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_ROOT
 export STAGE2_PROJECT_ROOT="$SCRIPT_ROOT"
 
+STAGE2_GPUS="${STAGE2_GPUS:-8}"
+case "$STAGE2_GPUS" in
+  4)
+    STAGE2_TOPOLOGY_SUFFIX="_4gpus"
+    ;;
+  8)
+    STAGE2_TOPOLOGY_SUFFIX=""
+    ;;
+  *)
+    echo "ERROR: STAGE2_GPUS must be 4 or 8, got: $STAGE2_GPUS" >&2
+    exit 1
+    ;;
+esac
+export STAGE2_GPUS
+export LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS="$((64 / STAGE2_GPUS))"
+export LONG_LIVE_STAGE2_PREFLIGHT_MICRO2_ACCUMULATION_STEPS="$((32 / STAGE2_GPUS))"
+
 export STAGE2_PYTHON="${STAGE2_PYTHON:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python}"
 export STAGE2_TORCHRUN="${STAGE2_TORCHRUN:-$(dirname -- "$STAGE2_PYTHON")/torchrun}"
-export STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_h100_micro1_acc8_longrun}"
-export STAGE2_TRAIN_ROOT="${STAGE2_TRAIN_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training_h100_micro1_acc8_longrun}"
+export STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_h100_micro1_acc8_longrun${STAGE2_TOPOLOGY_SUFFIX}}"
+export STAGE2_TRAIN_ROOT="${STAGE2_TRAIN_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_training_h100_micro1_acc8_longrun${STAGE2_TOPOLOGY_SUFFIX}}"
 
 export ARCH_ROOT="${ARCH_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}"
 export TEACHER_CKPT="${TEACHER_CKPT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts}"
@@ -41,8 +58,15 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$STAGE2_WORK_ROOT/pycache}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-export STAGE2_INFERENCE_NPROC="${STAGE2_INFERENCE_NPROC:-8}"
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  if [[ "$STAGE2_GPUS" -eq 4 ]]; then
+    CUDA_VISIBLE_DEVICES="0,1,2,3"
+  else
+    CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+  fi
+fi
+export CUDA_VISIBLE_DEVICES
+export STAGE2_INFERENCE_NPROC="${STAGE2_INFERENCE_NPROC:-$STAGE2_GPUS}"
 export STAGE2_INFERENCE_HEARTBEAT_SECONDS="${STAGE2_INFERENCE_HEARTBEAT_SECONDS:-30}"
 
 # prepare_stage2.sh runs in a child shell, so every invocation of this wrapper
@@ -72,13 +96,14 @@ usage() {
 Stage-2 H100 简明指导脚本
 
 默认训练配置：configs/train_i2v_stage2_600cats_micro1_acc8.yaml
-长程合同：8卡×micro1×acc8=global64，A360/B40，G/F LR=1e-5/2e-6。
+默认8卡；4卡启动前设置：export STAGE2_GPUS=4
+长程合同：8卡×micro1×acc8 或 4卡×micro1×acc16，均为global64；A360/B40，G/F LR=1e-5/2e-6。
 如需使用其他已审计配置，请在启动前显式设置 STAGE2_CONFIG。
 
 按顺序运行下面 6 条命令；每条只有看到对应 PASS 才能继续：
 
   1. bash run_stage2_h100.sh prepare
-     作用：检查/准备 step3075、600条数据、198/202/200 动作、8×H100 FSDP2。
+     作用：检查/准备 step3075、600条数据、198/202/200 动作、4/8×H100 FSDP2。
      正确：STAGE2_GUIDE_PREPARE=PASS
 
   2. bash run_stage2_h100.sh smoke
@@ -146,11 +171,32 @@ STAGE2_PHASE_B_EPOCHS=0
 STAGE2_A_END_G=0
 STAGE2_FINAL_G=0
 STAGE2_FINAL_F=0
+STAGE2_RESOLVED_WORLD_SIZE=0
+STAGE2_RESOLVED_MICROBATCH=0
+STAGE2_RESOLVED_ACCUMULATION=0
+STAGE2_RESOLVED_GLOBAL_BATCH=0
 STAGE2_A_END_STEP=""
 STAGE2_FINAL_STEP=""
 
+require_gpu_topology() {
+  local expected_devices="${1:-$STAGE2_GPUS}"
+  [[ "$expected_devices" =~ ^[1-9][0-9]*$ ]] || \
+    fail "GPU进程数必须是正整数：$expected_devices"
+  [[ "$CUDA_VISIBLE_DEVICES" != *[[:space:]]* && \
+     "$CUDA_VISIBLE_DEVICES" != ,* && \
+     "$CUDA_VISIBLE_DEVICES" != *, && \
+     "$CUDA_VISIBLE_DEVICES" != *,,* ]] || \
+    fail "CUDA_VISIBLE_DEVICES格式非法：$CUDA_VISIBLE_DEVICES"
+  local visible_devices=()
+  IFS=',' read -r -a visible_devices <<<"$CUDA_VISIBLE_DEVICES"
+  [[ "${#visible_devices[@]}" -eq "$expected_devices" ]] || \
+    fail "CUDA_VISIBLE_DEVICES包含${#visible_devices[@]}张卡，但需要${expected_devices}张"
+}
+
 load_stage2_schedule() {
+  local visible_device_count="${1:-$STAGE2_GPUS}"
   [[ "$STAGE2_SCHEDULE_LOADED" -eq 0 ]] || return 0
+  require_gpu_topology "$visible_device_count"
   [[ -x "$STAGE2_PYTHON" ]] || fail "Python不可执行，无法解析训练合同：$STAGE2_PYTHON"
   [[ -f "$ACTIVE_CONFIG" ]] || fail "训练配置不存在：$ACTIVE_CONFIG"
   local payload
@@ -175,6 +221,10 @@ print(
             resolved.phase_a_generator_updates,
             resolved.total_generator_updates,
             resolved.total_fake_updates,
+            resolved.expected_world_size,
+            resolved.microbatch_size_per_device,
+            resolved.gradient_accumulation_steps,
+            resolved.effective_global_batch,
         )
     )
 )
@@ -185,17 +235,26 @@ PY
   IFS=$'\t' read -r \
     STAGE2_PROFILE_NAME STAGE2_CONTRACT_SHORT \
     STAGE2_PHASE_A_EPOCHS STAGE2_PHASE_B_EPOCHS \
-    STAGE2_A_END_G STAGE2_FINAL_G STAGE2_FINAL_F <<<"$payload"
+    STAGE2_A_END_G STAGE2_FINAL_G STAGE2_FINAL_F \
+    STAGE2_RESOLVED_WORLD_SIZE STAGE2_RESOLVED_MICROBATCH \
+    STAGE2_RESOLVED_ACCUMULATION STAGE2_RESOLVED_GLOBAL_BATCH <<<"$payload"
   [[ -n "$STAGE2_PROFILE_NAME" && "$STAGE2_CONTRACT_SHORT" =~ ^[0-9a-f]{12}$ ]] || \
     fail "Stage-2训练合同标识非法：$payload"
   local value
   for value in \
     "$STAGE2_PHASE_A_EPOCHS" "$STAGE2_PHASE_B_EPOCHS" \
-    "$STAGE2_A_END_G" "$STAGE2_FINAL_G" "$STAGE2_FINAL_F"; do
+    "$STAGE2_A_END_G" "$STAGE2_FINAL_G" "$STAGE2_FINAL_F" \
+    "$STAGE2_RESOLVED_WORLD_SIZE" "$STAGE2_RESOLVED_MICROBATCH" \
+    "$STAGE2_RESOLVED_ACCUMULATION" "$STAGE2_RESOLVED_GLOBAL_BATCH"; do
     [[ "$value" =~ ^[0-9]+$ ]] || fail "Stage-2训练合同计数非法：$payload"
   done
   [[ "$STAGE2_A_END_G" -gt 0 && "$STAGE2_FINAL_G" -ge "$STAGE2_A_END_G" ]] || \
     fail "Stage-2训练合同phase边界非法：$payload"
+  [[ "$STAGE2_RESOLVED_WORLD_SIZE" -eq "$STAGE2_GPUS" ]] || \
+    fail "配置要求${STAGE2_RESOLVED_WORLD_SIZE}卡，但STAGE2_GPUS=$STAGE2_GPUS"
+  [[ "$STAGE2_RESOLVED_GLOBAL_BATCH" -eq 64 && \
+     "$((STAGE2_RESOLVED_WORLD_SIZE * STAGE2_RESOLVED_MICROBATCH * STAGE2_RESOLVED_ACCUMULATION))" -eq 64 ]] || \
+    fail "Stage-2启动合同没有保持global64：$payload"
   printf -v STAGE2_A_END_STEP '%06d' "$STAGE2_A_END_G"
   printf -v STAGE2_FINAL_STEP '%06d' "$STAGE2_FINAL_G"
   if [[ -z "$STAGE2_INFERENCE_OUTPUT_EXPLICIT" ]]; then
@@ -203,6 +262,7 @@ PY
     export LONG_LIVE_STAGE2_INFERENCE_OUTPUT="$STAGE2_INFERENCE_OUTPUT"
   fi
   export LONG_LIVE_STAGE2_INFERENCE_CHECKPOINT="$STAGE2_FORMAL_DIR/checkpoint_stage2_g$STAGE2_FINAL_STEP"
+  echo "STAGE2_LAUNCH_CONTRACT=profile=$STAGE2_PROFILE_NAME topology=${STAGE2_RESOLVED_WORLD_SIZE}xH100 micro${STAGE2_RESOLVED_MICROBATCH} acc${STAGE2_RESOLVED_ACCUMULATION} global${STAGE2_RESOLVED_GLOBAL_BATCH}"
   STAGE2_SCHEDULE_LOADED=1
 }
 
@@ -344,7 +404,7 @@ torchrun_train_command() {
   local logdir="$2"
   shift 2
   print_command \
-    "$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 \
+    "$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" \
     --max-restarts=0 --no-python "$STAGE2_PYTHON" -I -B \
     "$SCRIPT_ROOT/train.py" --config_path "$config" --logdir "$logdir" \
     "$@" --no-visualize
@@ -356,7 +416,7 @@ run_torchrun_train() {
   local logdir="$3"
   shift 3
   run_logged "$log_path" \
-    "$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node=8 \
+    "$STAGE2_TORCHRUN" --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" \
     --max-restarts=0 --no-python "$STAGE2_PYTHON" -I -B \
     "$SCRIPT_ROOT/train.py" --config_path "$config" --logdir "$logdir" \
     "$@" --no-visualize
@@ -376,7 +436,7 @@ prepare_complete() {
     STAGE2_PRETRAIN_PASS; do
     grep -Fqx "$marker" "$log_path" || return 1
   done
-  grep -Fqx 'STAGE2_FSDP2_ACCUMULATION_GATE=PASS mode=H100-world8' "$log_path" || return 1
+  grep -Fqx "STAGE2_FSDP2_ACCUMULATION_GATE=PASS mode=H100-world${STAGE2_GPUS}" "$log_path" || return 1
   [[ -f "$LONG_LIVE_STAGE2_GENERATOR_BASE" ]] || return 1
   [[ -f "$LONG_LIVE_STAGE2_GENERATOR_MANIFEST" ]] || return 1
   [[ -f "$LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST" ]] || return 1
@@ -770,7 +830,7 @@ inference_log_for_step() {
 run_prepare() {
   CURRENT_STAGE="prepare"
   announce \
-    "准备并验证step3075、198/202/200动作数据、模型角色和8×H100累积梯度" \
+    "准备并验证step3075、198/202/200动作数据、模型角色和${STAGE2_GPUS}×H100累积梯度" \
     "STAGE2_GUIDE_PREPARE=PASS"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     print_command bash "$SCRIPT_ROOT/prepare_stage2.sh"
@@ -1096,7 +1156,10 @@ shift || true
 
 cd -- "$SCRIPT_ROOT"
 case "$COMMAND" in
-  prepare|1-prepare|smoke|2-smoke|train|3-train|control|b0|4-control|plot-live|live-plot|plot|5-plot|infer|6-infer|status)
+  infer|6-infer)
+    load_stage2_schedule "$STAGE2_INFERENCE_NPROC"
+    ;;
+  prepare|1-prepare|smoke|2-smoke|train|3-train|control|b0|4-control|plot-live|live-plot|plot|5-plot|status)
     load_stage2_schedule
     ;;
 esac

@@ -206,7 +206,7 @@ def _trainer(g, *, phase_b_mode="dmd_dfd"):
     )
 
 
-def _rank_states(g, *, ema_initialized=None):
+def _rank_states(g, *, ema_initialized=None, world_size=8):
     if ema_initialized is None:
         ema_initialized = g >= 40
     ema = {}
@@ -215,10 +215,10 @@ def _rank_states(g, *, ema_initialized=None):
         spec.raw_parameter_name: tuple(spec.global_shape)
         for spec in GENERATOR_SCHEMA.values()
     }
-    for rank in range(8):
+    for rank in range(world_size):
         local_shapes = {}
         for name, shape in parameter_shapes.items():
-            chunk = (shape[0] + 7) // 8
+            chunk = (shape[0] + world_size - 1) // world_size
             local_first = max(0, min(chunk, shape[0] - rank * chunk))
             local_shapes[name] = (local_first, *shape[1:])
         shard_metadata = {
@@ -229,8 +229,8 @@ def _rank_states(g, *, ema_initialized=None):
                 "dtype": "torch.float32",
                 "mesh_device_type": "cuda",
                 "mesh_dim_names": ("shard",),
-                "mesh_shape": (8,),
-                "rank_layout": tuple((mesh_rank,) for mesh_rank in range(8)),
+                "mesh_shape": (world_size,),
+                "rank_layout": tuple((mesh_rank,) for mesh_rank in range(world_size)),
                 "coordinate": (rank,),
                 "placements": ("S(0)",),
             }
@@ -243,9 +243,9 @@ def _rank_states(g, *, ema_initialized=None):
             "initialized": ema_initialized,
             "last_completed_step": g,
             "rank": rank,
-            "world_size": 8,
+            "world_size": world_size,
             "topology": {
-                "rank_layout": tuple(range(8)),
+                "rank_layout": tuple(range(world_size)),
                 "mesh_dim_names": ("shard",),
             },
             "local_shapes": local_shapes,
@@ -272,6 +272,7 @@ def _rank_states(g, *, ema_initialized=None):
         )
         rng[rank] = capture_stage2_rng_state(
             rank=rank,
+            world_size=world_size,
             dedicated_generators=dedicated,
             rank0_control_generators=controls,
             include_cuda=False,
@@ -279,18 +280,40 @@ def _rank_states(g, *, ema_initialized=None):
     return ema, rng
 
 
-def _topology():
+def _topology(world_size=8):
     return {
-        "world_size": 8,
+        "world_size": world_size,
         "nodes": 1,
         "fsdp_backend": "fsdp2",
         "sharding_strategy": "FULL_SHARD",
-        "mesh_shape": [8],
+        "mesh_shape": [world_size],
         "mesh_dim_names": ["shard"],
-        "rank_layout": list(range(8)),
-        "microbatch_size_per_device": 2,
-        "gradient_accumulation_steps": 4,
+        "rank_layout": list(range(world_size)),
+        "microbatch_size_per_device": 1 if world_size == 4 else 2,
+        "gradient_accumulation_steps": 16 if world_size == 4 else 4,
         "global_batch_size": 64,
+    }
+
+
+def _resolved_config(world_size=8, *, g=None):
+    topology = _topology(world_size)
+    config = {"contract": "fixture"}
+    if g is not None:
+        config["g"] = g
+    return {
+        "config": config,
+        "derived": {
+            "expected_nodes": topology["nodes"],
+            "expected_world_size": world_size,
+            "data_parallel_size": world_size,
+            "sequence_parallel_size": 1,
+            "fsdp_backend": topology["fsdp_backend"],
+            "sharding_strategy": "full",
+            "microbatch_size_per_device": topology["microbatch_size_per_device"],
+            "gradient_accumulation_steps": topology["gradient_accumulation_steps"],
+            "global_batch_size": topology["global_batch_size"],
+            "effective_global_batch": topology["global_batch_size"],
+        },
     }
 
 
@@ -306,8 +329,9 @@ def _save(
     resolved_config=None,
     generator_lr=None,
     fake_score_lr=None,
+    world_size=8,
 ):
-    ema_states, rng_states = _rank_states(g)
+    ema_states, rng_states = _rank_states(g, world_size=world_size)
     return save_stage2_checkpoint_from_payloads(
         root,
         trainer_state=_trainer(g, phase_b_mode=phase_b_mode),
@@ -332,12 +356,12 @@ def _save(
         rank_ema_states=ema_states,
         rank_rng_states=rng_states,
         resolved_config=(
-            {"contract": "fixture", "g": g}
+            _resolved_config(world_size, g=g)
             if resolved_config is None
             else resolved_config
         ),
         provenance=_provenance() if provenance is None else provenance,
-        topology=_topology(),
+        topology=_topology(world_size),
         io_include_cuda=False,
         failure_injector=(
             (
@@ -412,6 +436,83 @@ def test_atomic_checkpoint_roundtrip_and_exact_file_mapping(tmp_path):
     assert set(payload.rank_rng_states) == set(range(8))
 
 
+def test_world4_checkpoint_roundtrip_has_exact_rank_payloads(tmp_path):
+    directory = _save(tmp_path, 40, world_size=4)
+
+    manifest = validate_stage2_checkpoint(
+        directory,
+        expected_contract_hash="a" * 64,
+        expected_topology=_topology(4),
+        expected_generator_parameter_names=tuple(
+            spec.raw_parameter_name for spec in GENERATOR_SCHEMA.values()
+        ),
+        expected_fake_score_parameter_names=tuple(
+            spec.raw_parameter_name for spec in FAKE_SCHEMA.values()
+        ),
+    )
+
+    assert manifest["topology"]["world_size"] == 4
+    rank_payloads = {
+        entry["name"]
+        for entry in manifest["files"]
+        if entry["name"].startswith(("ema_state_rank", "rng_state_rank"))
+    }
+    assert rank_payloads == {
+        *(f"ema_state_rank{rank:05d}.pt" for rank in range(4)),
+        *(f"rng_state_rank{rank:05d}.pt" for rank in range(4)),
+    }
+    payload = load_stage2_checkpoint(
+        directory,
+        expected_contract_hash="a" * 64,
+        expected_world_size=4,
+        expected_topology=_topology(4),
+    )
+    assert set(payload.rank_rng_states) == set(range(4))
+    with pytest.raises(RuntimeError, match="topology|world_size"):
+        load_stage2_checkpoint(
+            directory,
+            expected_contract_hash="a" * 64,
+            expected_world_size=8,
+            expected_topology=_topology(),
+        )
+
+
+def test_checkpoint_rejects_resolved_config_topology_mismatch_before_tensor_load(
+    tmp_path, monkeypatch
+):
+    with pytest.raises(RuntimeError, match="config topology differs"):
+        _save(
+            tmp_path / "save",
+            40,
+            world_size=4,
+            resolved_config=_resolved_config(8, g=40),
+        )
+
+    directory = _save(tmp_path / "validate", 40, world_size=4)
+    resolved_path = directory / "resolved_config.json"
+    resolved_path.write_text(json.dumps(_resolved_config(8, g=40)))
+    manifest_path = directory / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    entry = next(
+        item for item in manifest["files"] if item["name"] == resolved_path.name
+    )
+    entry["size"] = resolved_path.stat().st_size
+    entry["sha256"] = sha256_file(resolved_path)
+    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    manifest["manifest_sha256"] = canonical_json_sha256(body)
+    manifest_path.write_text(json.dumps(manifest))
+
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("topology mismatch must fail before torch.load")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="config topology differs"):
+        validate_stage2_checkpoint(directory)
+
+
 def test_checkpoint_roundtrip_authenticates_longrun_optimizer_learning_rates(tmp_path):
     def spec(role, learning_rate):
         return {
@@ -425,13 +526,14 @@ def test_checkpoint_roundtrip_authenticates_longrun_optimizer_learning_rates(tmp
             "schedule": "constant",
         }
 
-    resolved_config = {
-        "config": {"profile": "h100_micro1_acc8_longrun"},
-        "derived": {
+    resolved_config = _resolved_config()
+    resolved_config["config"] = {"profile": "h100_micro1_acc8_longrun"}
+    resolved_config["derived"].update(
+        {
             "generator_optimizer": spec("generator", 1.0e-5),
             "fake_score_optimizer": spec("fake_score", 2.0e-6),
-        },
-    }
+        }
+    )
     directory = _save(
         tmp_path,
         40,
@@ -570,12 +672,12 @@ def test_generator_ema_inference_gate_never_deserializes_training_pickles(
         expected_contract_hash="a" * 64,
         expected_launch_hash="b" * 64,
         expected_topology=_topology(),
-        expected_resolved_config={"contract": "fixture", "g": 40},
+        expected_resolved_config=_resolved_config(g=40),
         expected_generator_schema=GENERATOR_SCHEMA,
     )
     assert payload.directory == directory
     assert payload.manifest["ema"]["initialized"] is True
-    assert payload.resolved_config == {"contract": "fixture", "g": 40}
+    assert payload.resolved_config == _resolved_config(g=40)
     assert payload.provenance["schema"] == "longlive_stage2_checkpoint_provenance"
     assert set(payload.provenance["code_version"]) == {"stage2_source_sha256"}
     assert torch.equal(
@@ -689,7 +791,7 @@ def test_generator_ema_inference_gate_rejects_any_resolved_launch_drift(
     kwargs = {
         "expected_contract_hash": "a" * 64,
         "expected_launch_hash": "b" * 64,
-        "expected_resolved_config": {"contract": "fixture", "g": 40},
+        "expected_resolved_config": _resolved_config(g=40),
         field: value,
     }
     with pytest.raises(RuntimeError, match=message):
@@ -897,7 +999,7 @@ def test_high_level_save_collects_two_roles_and_all_rank_local_state(
         tmp_path,
         trainer_state=_trainer(10),
         metrics_lineage_snapshot=_metrics_snapshot(10),
-        resolved_config={"fixture": True},
+        resolved_config=_resolved_config(),
         generator_module=generator_module,
         fake_score_module=fake_score_module,
         generator_optimizer=generator_optimizer,
@@ -952,7 +1054,7 @@ def test_high_level_save_rejects_nonquiescent_live_boundary(tmp_path, corruption
             tmp_path,
             trainer_state=_trainer(10),
             metrics_lineage_snapshot=_metrics_snapshot(10),
-            resolved_config={"fixture": True},
+            resolved_config=_resolved_config(),
             generator_module=generator_module,
             fake_score_module=fake_score_module,
             generator_optimizer=torch.optim.AdamW(
@@ -1132,7 +1234,7 @@ def test_rank_ema_state_cannot_claim_initialization_before_g40(tmp_path):
         fake_score_optimizer_state=_optimizer(FAKE_SCHEMA, 50),
         rank_ema_states=ema_states,
         rank_rng_states=rng_states,
-        resolved_config={"fixture": True},
+        resolved_config=_resolved_config(),
         provenance=_provenance(),
         topology=_topology(),
         io_include_cuda=False,
@@ -1165,7 +1267,7 @@ def test_publication_requires_full_sampler_and_ema_schema_before_marker(
             fake_score_optimizer_state=_optimizer(FAKE_SCHEMA, 200),
             rank_ema_states=ema_states,
             rank_rng_states=rng_states,
-            resolved_config={"fixture": True},
+            resolved_config=_resolved_config(),
             provenance=_provenance(),
             topology=_topology(),
             io_include_cuda=False,

@@ -5,13 +5,31 @@ trap 'echo "STAGE2_PRETRAIN_CHECK_FAILED (line ${LINENO})" >&2' ERR
 
 SOURCE_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SOURCE_REPO
+STAGE2_GPUS="${STAGE2_GPUS:-8}"
+case "$STAGE2_GPUS" in
+  4|8) ;;
+  *) echo "STAGE2_GPUS must be 4 or 8, got: $STAGE2_GPUS" >&2; exit 1 ;;
+esac
+export STAGE2_GPUS
+export LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS="$((64 / STAGE2_GPUS))"
+export LONG_LIVE_STAGE2_PREFLIGHT_MICRO2_ACCUMULATION_STEPS="$((32 / STAGE2_GPUS))"
 STAGE2_WORK_ROOT="${STAGE2_WORK_ROOT:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/stage2_runs/LongLive-2.0_stage2_new}"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONPYCACHEPREFIX="$STAGE2_WORK_ROOT/pycache"
 export OMP_NUM_THREADS=1
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  [[ "$STAGE2_GPUS" -eq 4 ]] && \
+    CUDA_VISIBLE_DEVICES="0,1,2,3" || \
+    CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+fi
+export CUDA_VISIBLE_DEVICES
+IFS=',' read -r -a STAGE2_VISIBLE_DEVICES <<<"$CUDA_VISIBLE_DEVICES"
+[[ "${#STAGE2_VISIBLE_DEVICES[@]}" -eq "$STAGE2_GPUS" ]] || {
+  echo "CUDA_VISIBLE_DEVICES has ${#STAGE2_VISIBLE_DEVICES[@]} devices, but STAGE2_GPUS=$STAGE2_GPUS" >&2
+  exit 1
+}
 
 STAGE2_PYTHON="${STAGE2_PYTHON:-/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/condaenv/longlive2/bin/python}"
 STAGE2_TORCHRUN="${STAGE2_TORCHRUN:-$(dirname "$STAGE2_PYTHON")/torchrun}"
@@ -148,7 +166,7 @@ echo "CHECK_1_TEACHER_PASS"
 
 # 2. Stage-1 step3075 EMA Generator
 if [[ ! -e "$G_MERGED" && ! -e "$G_MANIFEST" ]]; then
-  CUDA_VISIBLE_DEVICES=0 "$STAGE2_PYTHON" -I -B scripts/merge_lora_generator.py \
+  "$STAGE2_PYTHON" -I -B scripts/merge_lora_generator.py \
     --base-checkpoint "$STAGE1_BASE" \
     --training-checkpoint "$STAGE1_CKPT" \
     --output-path "$G_MERGED" \
@@ -289,7 +307,7 @@ echo "CHECK_3P5_PRUNE_PASS"
 # 4. F25 + 文本语义证明 + negative + 600 条正式审计
 if [[ ! -f "$F25_BASE" || ! -f "$F25_SUCCESS" ]]; then
   "$STAGE2_TORCHRUN" \
-    --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+    --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
     --no-python "$STAGE2_PYTHON" -I -B \
     scripts/prepare_stage2_i2v_f25_cache.py \
     --config-path "$STAGE2_CONFIG" \
@@ -335,7 +353,7 @@ load_source_cache_manifest(
 PY
 
 if [[ ! -e "$NEGATIVE_DIR" ]]; then
-  CUDA_VISIBLE_DEVICES=0 "$STAGE2_PYTHON" -I -B scripts/audit_stage2_i2v_cache.py \
+  "$STAGE2_PYTHON" -I -B scripts/audit_stage2_i2v_cache.py \
     prepare-negative \
     --source-cache-manifest "$F25_ATTESTED" \
     --t5-checkpoint "$T5_CKPT" \
@@ -419,10 +437,10 @@ PY
 echo "CHECK_4_DATA_PASS"
 
 
-# 5. 8xH100 角色初始化；只初始化，不训练
+# 5. 4/8xH100 角色初始化；只初始化，不训练
 if [[ ! -e "$ROLE_INIT_DIR" ]]; then
   "$STAGE2_TORCHRUN" \
-    --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+    --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
     --no-python "$STAGE2_PYTHON" -I -B \
     scripts/preflight_stage2_roles.py \
     --config "$STAGE2_CONFIG" \
@@ -472,10 +490,10 @@ assert record["side_effects"] == {
     "vae_created": False,
     "dataloader_created": False,
 }
-assert record["fsdp"]["world_size"] == 8
+assert record["fsdp"]["world_size"] == resolved.expected_world_size
 assert record["fsdp"]["sequence_parallel_size"] == 1
-assert record["fsdp"]["data_parallel_size"] == 8
-assert record["fsdp"]["mesh_shape"] == [8]
+assert record["fsdp"]["data_parallel_size"] == resolved.data_parallel_size
+assert record["fsdp"]["mesh_shape"] == [resolved.expected_world_size]
 assert record["fsdp"]["mesh_dim_names"] == ["shard"]
 assert record["fsdp"]["sharding_strategy"] == "FULL_SHARD"
 assert record["fsdp"]["all_roles_independently_wrapped"] is True
@@ -487,7 +505,7 @@ echo "CHECK_5_ROLE_INIT_PASS"
 
 # 6. real FSDP2 gradient-accumulation parity；只跑 tiny 参数门禁，不启动训练
 "$STAGE2_TORCHRUN" \
-  --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=0 \
+  --standalone --nnodes=1 --nproc-per-node="$STAGE2_GPUS" --max-restarts=0 \
   --no-python "$STAGE2_PYTHON" -I -B \
   tests/stage2_fsdp2_accumulation_gate.py --require-h100 \
   2>&1 | tee "$LOG_DIR/fsdp2_accumulation_gate.log"

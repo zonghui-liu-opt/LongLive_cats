@@ -582,6 +582,25 @@ def test_role_init_manifest_is_stable_self_hashed_and_not_a_training_checkpoint(
         write_stage2_role_init_artifacts(output, payload)
 
 
+def test_role_init_manifest_accepts_audited_world4_topology():
+    kwargs = _role_init_manifest_kwargs()
+    for audit in kwargs["role_audits"].values():
+        audit["post_fsdp"]["mesh_shape"] = (4,)
+    kwargs["fsdp_audits"].update(
+        {
+            "world_size": 4,
+            "data_parallel_size": 4,
+            "mesh_shape": (4,),
+        }
+    )
+
+    payload = build_stage2_role_init_manifest(**kwargs)
+
+    assert payload["fsdp"]["world_size"] == 4
+    assert payload["fsdp"]["data_parallel_size"] == 4
+    assert payload["fsdp"]["mesh_shape"] == (4,)
+
+
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [

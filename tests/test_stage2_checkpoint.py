@@ -635,7 +635,7 @@ def test_local_optimizer_audit_rejects_non_lora_and_role_state():
         audit_stage2_lora_optimizer(module, optimizer, role="generator")
 
 
-def _one_dimensional_shards():
+def _one_dimensional_shards(world_size=8):
     schema = {
         "block.lora_A.weight": LoraTensorSpec(
             "block.lora_A.default.weight", (10, 2), torch.float32
@@ -643,8 +643,8 @@ def _one_dimensional_shards():
     }
     full = torch.arange(20, dtype=torch.float32).reshape(10, 2)
     records = []
-    chunk = 2
-    ranks = tuple(range(8))
+    chunk = (full.shape[0] + world_size - 1) // world_size
+    ranks = tuple(range(world_size))
     for rank in ranks:
         start_row = min(rank * chunk, 10)
         end_row = min(start_row + chunk, 10)
@@ -654,11 +654,11 @@ def _one_dimensional_shards():
             global_shape=(10, 2),
             intra_param_start=start_row * 2,
             shard_rank=rank,
-            shard_world_size=8,
+            shard_world_size=world_size,
             shard_group_ranks=ranks,
             fsdp_unit_fingerprint="same",
             local_shape=tuple(local.shape),
-            mesh_shape=(8,),
+            mesh_shape=(world_size,),
             mesh_dim_names=("shard",),
             placements=("shard:0",),
             mesh_coordinate=(rank,),
@@ -674,20 +674,29 @@ def _one_dimensional_shards():
     return schema, full, records
 
 
-def test_world8_one_dimensional_selective_lora_consolidation():
-    schema, full, records = _one_dimensional_shards()
+@pytest.mark.parametrize("world_size", (4, 8))
+def test_one_dimensional_selective_lora_consolidation(world_size):
+    schema, full, records = _one_dimensional_shards(world_size)
     result = consolidate_stage2_lora_shards(records, expected_schema=schema)
     assert list(result) == ["block.lora_A.weight"]
     assert torch.equal(result["block.lora_A.weight"], full)
 
     corrupt = copy.deepcopy(records)
-    corrupt[7]["block.lora_A.weight"] = copy.copy(corrupt[7]["block.lora_A.weight"])
-    object.__setattr__(corrupt[7]["block.lora_A.weight"], "mesh_shape", (2, 4))
+    corrupt[-1]["block.lora_A.weight"] = copy.copy(corrupt[-1]["block.lora_A.weight"])
+    object.__setattr__(corrupt[-1]["block.lora_A.weight"], "mesh_shape", (2, 2))
     with pytest.raises(ValueError, match="one-dimensional"):
         consolidate_stage2_lora_shards(corrupt, expected_schema=schema)
 
 
-def test_stage2_collectives_reject_any_world_other_than_eight():
+def test_stage2_collectives_accept_four_or_eight_and_reject_other_world_sizes():
+    for world_size in (4, 8):
+        Stage2CollectiveOps(
+            get_rank=lambda: 0,
+            get_world_size=lambda world_size=world_size: world_size,
+            barrier=lambda: None,
+            consensus=lambda success: success,
+            broadcast_object=lambda value, src: value,
+        ).validate()
     ops = Stage2CollectiveOps(
         get_rank=lambda: 0,
         get_world_size=lambda: 7,
@@ -695,5 +704,5 @@ def test_stage2_collectives_reject_any_world_other_than_eight():
         consensus=lambda success: success,
         broadcast_object=lambda value, src: value,
     )
-    with pytest.raises(RuntimeError, match="WORLD_SIZE=8"):
+    with pytest.raises(RuntimeError, match="WORLD_SIZE"):
         ops.validate()

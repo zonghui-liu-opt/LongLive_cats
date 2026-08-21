@@ -52,6 +52,7 @@ STAGE2_TRAINER_STATE_SCHEMA_VERSION = 1
 STAGE2_RNG_STATE_SCHEMA = "longlive_stage2_rank_rng"
 STAGE2_RNG_STATE_SCHEMA_VERSION = 1
 STAGE2_PHASE_SCHEDULE_VERSION = "longlive_stage2_phase_schedule/v1"
+STAGE2_WORLD_SIZES = (4, 8)
 STAGE2_WORLD_SIZE = 8
 STAGE2_EMA_START_GENERATOR_UPDATE = 40
 STAGE2_GENERATOR_UPDATES_PER_EPOCH = 10
@@ -105,6 +106,15 @@ def _plain_int(value: Any, label: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{label} must be an integer >= {minimum}, got {value!r}")
     return value
+
+
+def _stage2_world_size(value: Any, label: str = "world_size") -> int:
+    world_size = _plain_int(value, label, minimum=1)
+    if world_size not in STAGE2_WORLD_SIZES:
+        raise RuntimeError(
+            f"Stage-2 {label} must be one of {STAGE2_WORLD_SIZES}, got {world_size}"
+        )
+    return world_size
 
 
 def _sha256(value: Any, label: str) -> str:
@@ -269,10 +279,7 @@ class Stage2CollectiveOps:
         rank = self.get_rank()
         if type(world_size) is not int or type(rank) is not int:
             raise TypeError("Stage-2 collective rank/world_size must be integers")
-        if world_size != STAGE2_WORLD_SIZE:
-            raise RuntimeError(
-                f"Stage-2 checkpoint requires WORLD_SIZE=8, got {world_size}"
-            )
+        _stage2_world_size(world_size, "checkpoint WORLD_SIZE")
         if rank < 0 or rank >= world_size:
             raise RuntimeError(f"invalid Stage-2 checkpoint rank {rank}/{world_size}")
         return self
@@ -689,15 +696,17 @@ def _generator_snapshot(generator: torch.Generator, label: str) -> dict[str, Any
 def capture_stage2_rng_state(
     *,
     rank: int,
+    world_size: int = STAGE2_WORLD_SIZE,
     dedicated_generators: Mapping[str, torch.Generator],
     rank0_control_generators: Mapping[str, torch.Generator] | None,
     include_cuda: bool = True,
 ) -> dict[str, Any]:
     """Capture default and every explicit Stage-2 RNG stream for one rank."""
 
+    world_size = _stage2_world_size(world_size)
     rank = _plain_int(rank, "rank")
-    if rank >= STAGE2_WORLD_SIZE:
-        raise ValueError(f"rank must be below {STAGE2_WORLD_SIZE}")
+    if rank >= world_size:
+        raise ValueError(f"rank must be below {world_size}")
     if not isinstance(dedicated_generators, Mapping) or not dedicated_generators:
         raise ValueError("dedicated_generators must be a non-empty mapping")
     names = sorted(dedicated_generators)
@@ -720,7 +729,7 @@ def capture_stage2_rng_state(
         "schema": STAGE2_RNG_STATE_SCHEMA,
         "schema_version": STAGE2_RNG_STATE_SCHEMA_VERSION,
         "rank": rank,
-        "world_size": STAGE2_WORLD_SIZE,
+        "world_size": world_size,
         "general": capture_rng_state(include_cuda=include_cuda),
         "dedicated": {
             name: _generator_snapshot(dedicated_generators[name], name)
@@ -858,6 +867,7 @@ def validate_stage2_rng_state(
     state: Mapping[str, Any],
     *,
     expected_rank: int,
+    expected_world_size: int = STAGE2_WORLD_SIZE,
     expected_dedicated_names: set[str] | None = None,
 ) -> Mapping[str, Any]:
     value = _exact_mapping(
@@ -873,6 +883,7 @@ def validate_stage2_rng_state(
             "rank0_control",
         },
     )
+    expected_world_size = _stage2_world_size(expected_world_size, "expected_world_size")
     if (
         value["schema"] != STAGE2_RNG_STATE_SCHEMA
         or type(value["schema_version"]) is not int
@@ -883,7 +894,7 @@ def validate_stage2_rng_state(
         type(value["rank"]) is not int
         or value["rank"] != expected_rank
         or type(value["world_size"]) is not int
-        or value["world_size"] != STAGE2_WORLD_SIZE
+        or value["world_size"] != expected_world_size
     ):
         raise RuntimeError("Stage-2 rank RNG topology mismatch")
     general = _validate_general_rng_state(value["general"])
@@ -921,13 +932,18 @@ def restore_stage2_rng_state(
     state: Mapping[str, Any],
     *,
     rank: int,
+    expected_world_size: int = STAGE2_WORLD_SIZE,
     dedicated_generators: Mapping[str, torch.Generator],
     rank0_control_generators: Mapping[str, torch.Generator] | None,
     require_cuda_topology: bool = True,
 ) -> None:
     """Validate all RNG bytes first, then restore them as the final resume step."""
 
-    validate_stage2_rng_state(state, expected_rank=rank)
+    validate_stage2_rng_state(
+        state,
+        expected_rank=rank,
+        expected_world_size=expected_world_size,
+    )
     dedicated = _validate_generator_snapshots(
         state["dedicated"],
         dedicated_generators,
@@ -1613,15 +1629,16 @@ def consolidate_stage2_lora_shards(
     *,
     expected_schema: Mapping[str, LoraTensorSpec],
 ) -> OrderedDict[str, torch.Tensor]:
-    """Reconstruct canonical LoRA tensors from the 1D world8 shard mesh."""
+    """Reconstruct canonical LoRA tensors from a reviewed 1D shard mesh."""
 
-    if len(shards_by_rank) != STAGE2_WORLD_SIZE:
-        raise ValueError("Stage-2 selective LoRA gather requires exactly 8 ranks")
+    world_size = _stage2_world_size(
+        len(shards_by_rank), "selective LoRA gather world_size"
+    )
     expected_keys = set(expected_schema)
     if not expected_keys:
         raise ValueError("Stage-2 selective LoRA schema is empty")
     result: OrderedDict[str, torch.Tensor] = OrderedDict()
-    ranks = tuple(range(STAGE2_WORLD_SIZE))
+    ranks = tuple(range(world_size))
     for index, mapping in enumerate(shards_by_rank):
         if set(mapping) != expected_keys:
             raise ValueError(f"Stage-2 rank {index} LoRA shard keys drifted")
@@ -1640,12 +1657,12 @@ def consolidate_stage2_lora_shards(
             exact_topology = (
                 record.is_dtensor
                 and record.global_shape == tuple(spec.global_shape)
-                and record.mesh_shape == (8,)
+                and record.mesh_shape == (world_size,)
                 and record.mesh_dim_names == ("shard",)
                 and record.placements == ("shard:0",)
                 and record.mesh_coordinate == (rank,)
                 and record.mesh_ranks == (ranks,)
-                and record.shard_world_size == 8
+                and record.shard_world_size == world_size
                 and record.shard_group_ranks == ranks
                 and record.replica_group_ranks == (rank,)
                 and record.authoritative_shard_group_ranks == ranks
@@ -1654,10 +1671,10 @@ def consolidate_stage2_lora_shards(
             )
             if not exact_topology:
                 raise ValueError(
-                    f"Stage-2 {key} is not one-dimensional world8 Shard(0)"
+                    f"Stage-2 {key} is not one-dimensional world{world_size} Shard(0)"
                 )
             rows, offset = _chunk_size_and_offset(
-                int(spec.global_shape[0]), STAGE2_WORLD_SIZE, rank
+                int(spec.global_shape[0]), world_size, rank
             )
             expected_shape = (rows, *tuple(spec.global_shape[1:]))
             local = record.tensor.detach().to(device="cpu").contiguous()
@@ -1703,6 +1720,7 @@ def gather_stage2_lora_state_dict(
 
     ops = _collectives(collectives)
     rank = int(ops.get_rank())
+    world_size = int(ops.get_world_size())
     local_fn = local_shards_fn or get_lora_sharded_state_dict
     gather_fn = gather_object_fn or dist.gather_object
     local = _consensus_call(
@@ -1713,13 +1731,13 @@ def gather_stage2_lora_state_dict(
             expected_schema=expected_schema,
             expected_adapter_tensors=len(expected_schema),
             expected_dtype=torch.float32,
-            expected_mesh_shape=(8,),
-            expected_mesh_ranks=(tuple(range(8)),),
+            expected_mesh_shape=(world_size,),
+            expected_mesh_ranks=(tuple(range(world_size)),),
             expected_mesh_dim_names=("shard",),
         ),
         ops,
     )
-    gathered: list[Any] | None = [None] * 8 if rank == 0 else None
+    gathered: list[Any] | None = [None] * world_size if rank == 0 else None
     _consensus_call(
         f"{role} directed selective LoRA gather",
         lambda: gather_fn(
@@ -1813,14 +1831,15 @@ def _validate_topology(value: Mapping[str, Any]) -> dict[str, Any]:
             "global_batch_size",
         },
     )
+    world_size = _stage2_world_size(topology["world_size"], "topology.world_size")
     expected_fixed = {
-        "world_size": 8,
+        "world_size": world_size,
         "nodes": 1,
         "fsdp_backend": "fsdp2",
         "sharding_strategy": "FULL_SHARD",
-        "mesh_shape": [8],
+        "mesh_shape": [world_size],
         "mesh_dim_names": ["shard"],
-        "rank_layout": list(range(8)),
+        "rank_layout": list(range(world_size)),
         "global_batch_size": 64,
     }
     for key, expected in expected_fixed.items():
@@ -1841,18 +1860,96 @@ def _validate_topology(value: Mapping[str, Any]) -> dict[str, Any]:
             minimum=1,
         ),
     )
-    if profile not in {(2, 4), (1, 8)}:
+    supported_profiles = {
+        (microbatch, 64 // (world_size * microbatch)) for microbatch in (2, 1)
+    }
+    if profile not in supported_profiles:
         raise RuntimeError(f"unsupported Stage-2 checkpoint batch profile {profile}")
     return topology
+
+
+def _topology_from_resolved_config(value: Any) -> dict[str, Any]:
+    serialized = value.to_dict() if callable(getattr(value, "to_dict", None)) else value
+    resolved = _exact_mapping(
+        serialized,
+        label="resolved Stage-2 config",
+        expected_keys={"config", "derived"},
+    )
+    if not isinstance(resolved["config"], Mapping):
+        raise TypeError("resolved Stage-2 config.config must be a mapping")
+    if not isinstance(resolved["derived"], Mapping):
+        raise TypeError("resolved Stage-2 config.derived must be a mapping")
+    derived = resolved["derived"]
+    world_size = _stage2_world_size(
+        derived.get("expected_world_size"),
+        "resolved_config.derived.expected_world_size",
+    )
+    nodes = _plain_int(
+        derived.get("expected_nodes"),
+        "resolved_config.derived.expected_nodes",
+        minimum=1,
+    )
+    data_parallel_size = _plain_int(
+        derived.get("data_parallel_size"),
+        "resolved_config.derived.data_parallel_size",
+        minimum=1,
+    )
+    sequence_parallel_size = _plain_int(
+        derived.get("sequence_parallel_size"),
+        "resolved_config.derived.sequence_parallel_size",
+        minimum=1,
+    )
+    if nodes != 1 or data_parallel_size != world_size or sequence_parallel_size != 1:
+        raise RuntimeError("resolved Stage-2 checkpoint topology is unsupported")
+    if derived.get("fsdp_backend") != "fsdp2":
+        raise RuntimeError("resolved Stage-2 checkpoint FSDP backend is unsupported")
+    if derived.get("sharding_strategy") != "full":
+        raise RuntimeError("resolved Stage-2 checkpoint sharding is unsupported")
+    global_batch_size = _plain_int(
+        derived.get("global_batch_size"),
+        "resolved_config.derived.global_batch_size",
+        minimum=1,
+    )
+    effective_global_batch = _plain_int(
+        derived.get("effective_global_batch"),
+        "resolved_config.derived.effective_global_batch",
+        minimum=1,
+    )
+    if global_batch_size != effective_global_batch:
+        raise RuntimeError("resolved Stage-2 checkpoint global batch is inconsistent")
+    return _validate_topology(
+        {
+            "world_size": world_size,
+            "nodes": nodes,
+            "fsdp_backend": "fsdp2",
+            "sharding_strategy": "FULL_SHARD",
+            "mesh_shape": [world_size],
+            "mesh_dim_names": ["shard"],
+            "rank_layout": list(range(world_size)),
+            "microbatch_size_per_device": _plain_int(
+                derived.get("microbatch_size_per_device"),
+                "resolved_config.derived.microbatch_size_per_device",
+                minimum=1,
+            ),
+            "gradient_accumulation_steps": _plain_int(
+                derived.get("gradient_accumulation_steps"),
+                "resolved_config.derived.gradient_accumulation_steps",
+                minimum=1,
+            ),
+            "global_batch_size": global_batch_size,
+        }
+    )
 
 
 def _validate_ema_state(
     state: Mapping[str, Any],
     *,
     rank: int,
+    world_size: int = STAGE2_WORLD_SIZE,
     completed_g: int,
     expected_parameter_names: set[str] | None = None,
 ) -> Mapping[str, Any]:
+    world_size = _stage2_world_size(world_size)
     expected_initialized = completed_g >= STAGE2_EMA_START_GENERATOR_UPDATE
     if (
         not isinstance(state, Mapping)
@@ -1867,13 +1964,13 @@ def _validate_ema_state(
     validate_trainable_sharded_ema_state_dict(
         state,
         expected_rank=rank,
-        expected_world_size=STAGE2_WORLD_SIZE,
+        expected_world_size=world_size,
         expected_decay=0.99,
         expected_start_step=STAGE2_EMA_START_GENERATOR_UPDATE,
         expected_completed_step=completed_g,
         expected_initialized=expected_initialized,
         expected_topology={
-            "rank_layout": tuple(range(STAGE2_WORLD_SIZE)),
+            "rank_layout": tuple(range(world_size)),
             "mesh_dim_names": ("shard",),
         },
         expected_parameter_names=expected_parameter_names,
@@ -1882,9 +1979,9 @@ def _validate_ema_state(
         if (
             metadata["kind"] != "dtensor"
             or metadata["mesh_device_type"] != "cuda"
-            or tuple(metadata["mesh_shape"]) != (STAGE2_WORLD_SIZE,)
+            or tuple(metadata["mesh_shape"]) != (world_size,)
             or tuple(tuple(row) for row in metadata["rank_layout"])
-            != tuple((mesh_rank,) for mesh_rank in range(STAGE2_WORLD_SIZE))
+            != tuple((mesh_rank,) for mesh_rank in range(world_size))
             or tuple(metadata["coordinate"]) != (rank,)
             or tuple(metadata["placements"]) != ("S(0)",)
         ):
@@ -1947,7 +2044,10 @@ def _load_authenticated_safetensors_snapshot(
     return OrderedDict(sorted(load(snapshot).items()))
 
 
-def _required_payload_names(ema_initialized: bool) -> set[str]:
+def _required_payload_names(
+    ema_initialized: bool, *, world_size: int = STAGE2_WORLD_SIZE
+) -> set[str]:
+    world_size = _stage2_world_size(world_size)
     result = {
         "generator_raw.safetensors",
         "fake_score_raw.safetensors",
@@ -1957,8 +2057,8 @@ def _required_payload_names(ema_initialized: bool) -> set[str]:
         "trainer_state.pt",
         "resolved_config.json",
         "provenance.json",
-        *(f"ema_state_rank{rank:05d}.pt" for rank in range(8)),
-        *(f"rng_state_rank{rank:05d}.pt" for rank in range(8)),
+        *(f"ema_state_rank{rank:05d}.pt" for rank in range(world_size)),
+        *(f"rng_state_rank{rank:05d}.pt" for rank in range(world_size)),
     }
     if ema_initialized:
         result.add("generator_ema.safetensors")
@@ -2121,27 +2221,33 @@ def _validate_rank_state_maps(
     completed_g: int,
     expected_ema_parameter_names: set[str],
     trainer_state: Mapping[str, Any],
+    world_size: int = STAGE2_WORLD_SIZE,
 ) -> None:
-    expected_ranks = set(range(STAGE2_WORLD_SIZE))
+    world_size = _stage2_world_size(world_size)
+    expected_ranks = set(range(world_size))
     if set(rank_ema_states) != expected_ranks or set(rank_rng_states) != expected_ranks:
-        raise RuntimeError("Stage-2 checkpoint requires EMA/RNG state for all 8 ranks")
-    for rank in range(STAGE2_WORLD_SIZE):
+        raise RuntimeError(
+            f"Stage-2 checkpoint requires EMA/RNG state for all {world_size} ranks"
+        )
+    for rank in range(world_size):
         _validate_ema_state(
             rank_ema_states[rank],
             rank=rank,
+            world_size=world_size,
             completed_g=completed_g,
             expected_parameter_names=expected_ema_parameter_names,
         )
         validate_stage2_rng_state(
             rank_rng_states[rank],
             expected_rank=rank,
+            expected_world_size=world_size,
             expected_dedicated_names=set(STAGE2_DEDICATED_RNG_NAMES),
         )
     reference_global_shapes = {
         name: tuple(shape)
         for name, shape in rank_ema_states[0]["global_shapes"].items()
     }
-    for rank in range(1, STAGE2_WORLD_SIZE):
+    for rank in range(1, world_size):
         candidate = {
             name: tuple(shape)
             for name, shape in rank_ema_states[rank]["global_shapes"].items()
@@ -2151,7 +2257,7 @@ def _validate_rank_state_maps(
     for name, global_shape in reference_global_shapes.items():
         local_numel = sum(
             math.prod(tuple(rank_ema_states[rank]["local_shapes"][name]))
-            for rank in range(STAGE2_WORLD_SIZE)
+            for rank in range(world_size)
         )
         if local_numel != math.prod(global_shape):
             raise RuntimeError(
@@ -2242,6 +2348,7 @@ def _validate_prepared_payloads(
         expected_completed_updates=completed_f,
         expected_optimizer_spec=fake_score_optimizer_spec,
     )
+    audited_topology = _validate_topology(topology)
     _validate_rank_state_maps(
         rank_ema_states=rank_ema_states,
         rank_rng_states=rank_rng_states,
@@ -2250,6 +2357,7 @@ def _validate_prepared_payloads(
             spec.raw_parameter_name for spec in generator_schema.values()
         },
         trainer_state=trainer_state,
+        world_size=audited_topology["world_size"],
     )
     return (
         raw_g,
@@ -2257,7 +2365,7 @@ def _validate_prepared_payloads(
         ema,
         canonical_generator_optimizer,
         canonical_fake_optimizer,
-        _validate_topology(topology),
+        audited_topology,
     )
 
 
@@ -2341,6 +2449,10 @@ def save_stage2_checkpoint_from_payloads(
             generator_optimizer_spec=generator_optimizer_spec,
             fake_score_optimizer_spec=fake_score_optimizer_spec,
         )
+        if audited_topology != _topology_from_resolved_config(resolved_config):
+            raise RuntimeError(
+                "resolved Stage-2 config topology differs from checkpoint topology"
+            )
         provenance = validate_stage2_provenance(
             provenance,
             add_code_version=True,
@@ -2421,7 +2533,8 @@ def save_stage2_checkpoint_from_payloads(
             temporary / "metrics_lineage.jsonl",
             metrics_lineage_snapshot,
         )
-        for rank in range(STAGE2_WORLD_SIZE):
+        world_size = int(audited_topology["world_size"])
+        for rank in range(world_size):
             atomic_torch_save(
                 temporary / f"ema_state_rank{rank:05d}.pt",
                 dict(rank_ema_states[rank]),
@@ -2440,7 +2553,10 @@ def save_stage2_checkpoint_from_payloads(
             failure_injector("after_files")
 
         ema_initialized = ema is not None
-        payload_names = _required_payload_names(ema_initialized)
+        payload_names = _required_payload_names(
+            ema_initialized,
+            world_size=world_size,
+        )
         manifest = _build_manifest(
             temporary,
             trainer_state=trainer_state,
@@ -2551,7 +2667,7 @@ def _validate_manifest_and_files(
         raise RuntimeError("checkpoint manifest F/G/cycle clocks disagree")
     if manifest["next_substep"] != "F1":
         raise RuntimeError("checkpoint manifest next_substep must be F1")
-    _validate_topology(manifest["topology"])
+    audited_topology = _validate_topology(manifest["topology"])
     config = _exact_mapping(
         manifest["config"],
         label="checkpoint config hashes",
@@ -2594,7 +2710,10 @@ def _validate_manifest_and_files(
     entries = manifest["files"]
     if isinstance(entries, (str, bytes)) or not isinstance(entries, Sequence):
         raise TypeError("checkpoint manifest files must be a sequence")
-    expected_names = _required_payload_names(expected_initialized)
+    expected_names = _required_payload_names(
+        expected_initialized,
+        world_size=audited_topology["world_size"],
+    )
     names: list[str] = []
     for entry in entries:
         item = _exact_mapping(
@@ -2635,6 +2754,12 @@ def _validate_manifest_and_files(
         path = directory / item["name"]
         if path.stat().st_size != item["size"] or sha256_file(path) != item["sha256"]:
             raise RuntimeError(f"checkpoint file hash/size mismatch: {path}")
+    with (directory / "resolved_config.json").open("r", encoding="utf-8") as handle:
+        resolved_config = json.load(handle)
+    if audited_topology != _topology_from_resolved_config(resolved_config):
+        raise RuntimeError(
+            "resolved Stage-2 config topology differs from checkpoint topology"
+        )
     if require_success_marker:
         marker = directory / "_SUCCESS"
         if marker.is_symlink() or not marker.is_file() or marker.stat().st_size != 0:
@@ -2667,6 +2792,7 @@ def validate_stage2_checkpoint(
     manifest = _validate_manifest_and_files(
         path, expected_completed_g=completed_g, require_success_marker=True
     )
+    world_size = int(_validate_topology(manifest["topology"])["world_size"])
     if expected_contract_hash is not None and manifest["config"][
         "contract_hash"
     ] != _sha256(expected_contract_hash, "expected_contract_hash"):
@@ -2734,11 +2860,11 @@ def validate_stage2_checkpoint(
     )
     rank_ema_states = {
         rank: _torch_load_cpu(path / f"ema_state_rank{rank:05d}.pt")
-        for rank in range(STAGE2_WORLD_SIZE)
+        for rank in range(world_size)
     }
     rank_rng_states = {
         rank: _torch_load_cpu(path / f"rng_state_rank{rank:05d}.pt")
-        for rank in range(STAGE2_WORLD_SIZE)
+        for rank in range(world_size)
     }
     _validate_rank_state_maps(
         rank_ema_states=rank_ema_states,
@@ -2746,6 +2872,7 @@ def validate_stage2_checkpoint(
         completed_g=completed_g,
         expected_ema_parameter_names=set(generator_names),
         trainer_state=trainer,
+        world_size=world_size,
     )
     validate_stage2_full_optimizer_state(
         generator_state,
@@ -2960,10 +3087,9 @@ def load_stage2_checkpoint(
 ) -> Stage2CheckpointPayload:
     """Load complete CPU state only after marker, manifest, and byte validation."""
 
-    if expected_world_size != STAGE2_WORLD_SIZE:
-        raise RuntimeError(
-            f"Stage-2 resume requires expected_world_size=8, got {expected_world_size}"
-        )
+    expected_world_size = _stage2_world_size(
+        expected_world_size, "resume expected_world_size"
+    )
     candidate = Path(directory).expanduser()
     manifest = validate_stage2_checkpoint(
         candidate,
@@ -2973,6 +3099,8 @@ def load_stage2_checkpoint(
         expected_generator_parameter_names=expected_generator_parameter_names,
         expected_fake_score_parameter_names=expected_fake_score_parameter_names,
     )
+    if manifest["topology"]["world_size"] != expected_world_size:
+        raise RuntimeError("Stage-2 checkpoint world_size differs from this launch")
     path = candidate.resolve()
     with (path / "resolved_config.json").open("r", encoding="utf-8") as handle:
         resolved_config = json.load(handle)
@@ -2993,11 +3121,11 @@ def load_stage2_checkpoint(
         fake_score_optimizer_state=_torch_load_cpu(path / "optimizer_fake_score.pt"),
         rank_ema_states={
             rank: _torch_load_cpu(path / f"ema_state_rank{rank:05d}.pt")
-            for rank in range(8)
+            for rank in range(expected_world_size)
         },
         rank_rng_states={
             rank: _torch_load_cpu(path / f"rng_state_rank{rank:05d}.pt")
-            for rank in range(8)
+            for rank in range(expected_world_size)
         },
         resolved_config=resolved_config,
         provenance=provenance,
@@ -3020,10 +3148,12 @@ def load_stage2_checkpoint_collective(
 
     ops = _collectives(collectives)
     rank = int(ops.get_rank())
-    if expected_world_size != STAGE2_WORLD_SIZE:
+    expected_world_size = _stage2_world_size(
+        expected_world_size, "collective resume expected_world_size"
+    )
+    if int(ops.get_world_size()) != expected_world_size:
         raise RuntimeError(
-            f"Stage-2 collective resume requires expected_world_size=8, "
-            f"got {expected_world_size}"
+            "Stage-2 collective resume WORLD_SIZE differs from expected_world_size"
         )
     io_rng = capture_rng_state(include_cuda=io_include_cuda)
     try:
@@ -3091,10 +3221,16 @@ def load_stage2_checkpoint_collective(
                 else _torch_load_cpu(path / f"rng_state_rank{rank:05d}.pt")
             )
             completed_g = int(small["trainer_state"]["completed_generator_updates"])
-            _validate_ema_state(local_ema, rank=rank, completed_g=completed_g)
+            _validate_ema_state(
+                local_ema,
+                rank=rank,
+                world_size=expected_world_size,
+                completed_g=completed_g,
+            )
             validate_stage2_rng_state(
                 local_rng,
                 expected_rank=rank,
+                expected_world_size=expected_world_size,
                 expected_dedicated_names=set(STAGE2_DEDICATED_RNG_NAMES),
             )
             raw_g = (
@@ -3307,7 +3443,7 @@ def save_stage2_checkpoint(
     Every rank calls this function in the same order.  Only selective LoRA
     shards and optimizer-only DCP state are gathered; immutable base weights
     are never materialized.  Rank 0 performs directory publication after all
-    eight rank-local EMA/RNG payloads have arrived, then every rank receives
+    all rank-local EMA/RNG payloads have arrived, then every rank receives
     the committed path or the same non-zero failure.
     """
 
@@ -3315,6 +3451,12 @@ def save_stage2_checkpoint(
 
     ops = _collectives(collectives)
     rank = int(ops.get_rank())
+    world_size = int(ops.get_world_size())
+    audited_topology = _validate_topology(topology)
+    if audited_topology["world_size"] != world_size:
+        raise RuntimeError(
+            "Stage-2 checkpoint topology world_size differs from the collective"
+        )
     io_rng = capture_rng_state(include_cuda=io_include_cuda)
     local_rng_state: Mapping[str, Any] | None = None
     try:
@@ -3325,6 +3467,7 @@ def save_stage2_checkpoint(
             "rank-local Stage-2 entry RNG capture",
             lambda: capture_stage2_rng_state(
                 rank=rank,
+                world_size=world_size,
                 dedicated_generators=dedicated_generators,
                 rank0_control_generators=rank0_control_generators,
                 include_cuda=io_include_cuda,
@@ -3334,12 +3477,12 @@ def save_stage2_checkpoint(
         validate_stage2_rng_state(
             local_rng_state,
             expected_rank=rank,
+            expected_world_size=world_size,
             expected_dedicated_names=set(STAGE2_DEDICATED_RNG_NAMES),
         )
         validate_stage2_trainer_state(trainer_state)
         completed_g = int(trainer_state["completed_generator_updates"])
         completed_f = int(trainer_state["completed_fake_updates"])
-        _validate_topology(topology)
         config_value = (
             resolved_config.to_dict()
             if callable(getattr(resolved_config, "to_dict", None))
@@ -3425,6 +3568,7 @@ def save_stage2_checkpoint(
             return _validate_ema_state(
                 state,
                 rank=rank,
+                world_size=world_size,
                 completed_g=completed_g,
                 expected_parameter_names={
                     spec.raw_parameter_name for spec in generator_schema.values()
@@ -3448,7 +3592,9 @@ def save_stage2_checkpoint(
             else None
         )
         gather_fn = gather_rank_object_fn or dist.gather_object
-        gathered_rank_payloads: list[Any] | None = [None] * 8 if rank == 0 else None
+        gathered_rank_payloads: list[Any] | None = (
+            [None] * world_size if rank == 0 else None
+        )
         _consensus_call(
             "rank-local EMA/RNG payload gather",
             lambda: gather_fn(
@@ -3483,7 +3629,7 @@ def save_stage2_checkpoint(
                 if payload_rank in by_rank:
                     raise RuntimeError("duplicate gathered Stage-2 checkpoint rank")
                 by_rank[payload_rank] = (ema_state, rng_state)
-            if set(by_rank) != set(range(8)):
+            if set(by_rank) != set(range(world_size)):
                 raise RuntimeError("gathered Stage-2 checkpoint ranks are incomplete")
             if raw_generator is None or raw_fake_score is None:
                 raise RuntimeError("rank0 is missing canonical raw adapters")
@@ -3533,6 +3679,7 @@ def save_stage2_checkpoint(
             restore_stage2_rng_state(
                 local_rng_state,
                 rank=rank,
+                expected_world_size=world_size,
                 dedicated_generators=dedicated_generators,
                 rank0_control_generators=rank0_control_generators,
                 require_cuda_topology=io_include_cuda,

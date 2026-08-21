@@ -11,7 +11,6 @@ from torch import nn
 
 from utils.stage2_fsdp2 import (
     STAGE2_FSDP2_MESH_DIM_NAMES,
-    STAGE2_FSDP2_MESH_SHAPE,
     audit_stage2_fsdp2_role,
     audit_stage2_runtime_descriptors,
     fsdp2_wrap_stage2_role,
@@ -20,33 +19,45 @@ from utils.stage2_fsdp2 import (
 from utils.stage2_role_init import stage2_init_only_side_effect_guard
 
 
-def _descriptors():
+def _descriptors(world_size=8):
     return [
         {
             "rank": rank,
             "local_rank": rank,
             "hostname": "one-host",
-            "visible_device_count": 8,
+            "visible_device_count": world_size,
             "device_name": "NVIDIA H100 80GB HBM3",
             "total_memory": 80 * 1024**3,
             "bf16_supported": True,
         }
-        for rank in range(8)
+        for rank in range(world_size)
     ]
 
 
-def test_stage2_topology_is_single_node_world8_one_dimensional_full_shard():
+@pytest.mark.parametrize("world_size", (4, 8))
+def test_stage2_topology_is_single_node_one_dimensional_full_shard(world_size):
     audit = validate_stage2_fsdp2_topology(
-        world_size=8,
+        world_size=world_size,
         sequence_parallel_size=1,
-        data_parallel_size=8,
-        mesh_shape=STAGE2_FSDP2_MESH_SHAPE,
+        data_parallel_size=world_size,
+        mesh_shape=(world_size,),
         mesh_dim_names=STAGE2_FSDP2_MESH_DIM_NAMES,
     )
     assert audit["sharding_strategy"] == "FULL_SHARD"
-    assert audit["mesh_shape"] == (8,)
+    assert audit["mesh_shape"] == (world_size,)
     assert audit["mesh_dim_names"] == ("shard",)
-    audit_stage2_runtime_descriptors(_descriptors())
+    audit_stage2_runtime_descriptors(_descriptors(world_size))
+
+
+def test_stage2_topology_rejects_unreviewed_world_size():
+    with pytest.raises(ValueError, match="world_size"):
+        validate_stage2_fsdp2_topology(
+            world_size=6,
+            sequence_parallel_size=1,
+            data_parallel_size=6,
+            mesh_shape=(6,),
+            mesh_dim_names=("shard",),
+        )
 
 
 @pytest.mark.parametrize(

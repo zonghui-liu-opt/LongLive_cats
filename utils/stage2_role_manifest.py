@@ -371,7 +371,7 @@ def build_stage2_teacher_manifest(
 
     This builder hashes provenance and records requirements.  It does not claim
     that a strict model load occurred; that evidence is emitted only by the
-    world8 role-init preflight.
+    reviewed 4/8-GPU role-init preflight.
     """
 
     checkpoint_format = _nonempty_string(checkpoint_format, "checkpoint_format")
@@ -954,6 +954,9 @@ def build_stage2_role_init_manifest(
         raise ValueError(
             "role isolation audit does not prove three independent role objects/storage"
         )
+    world_size = fsdp_audits.get("world_size")
+    if type(world_size) is not int or world_size not in {4, 8}:
+        raise ValueError("role-init FSDP world_size must be 4 or 8")
     expected_role_values = {
         "generator": (32, 180, 360, 57_016_320, "causal", False),
         "real_score": (None, 0, 0, 0, "bidirectional_ti2v", False),
@@ -1013,7 +1016,7 @@ def build_stage2_role_init_manifest(
             "all_parameters_are_dtensor": True,
             "fsdp_module_count": 31,
             "root_and_30_blocks_independently_wrapped": True,
-            "mesh_shape": (8,),
+            "mesh_shape": (world_size,),
             "mesh_dim_names": ("shard",),
             "placements": ("shard:0",),
         }
@@ -1058,10 +1061,10 @@ def build_stage2_role_init_manifest(
     if dict(side_effect_audit) != expected_side_effects:
         raise ValueError("init-only side-effect tripwire audit is not clean")
     expected_fsdp = {
-        "world_size": 8,
+        "world_size": world_size,
         "sequence_parallel_size": 1,
-        "data_parallel_size": 8,
-        "mesh_shape": (8,),
+        "data_parallel_size": world_size,
+        "mesh_shape": (world_size,),
         "mesh_dim_names": ("shard",),
         "sharding_strategy": "FULL_SHARD",
     }

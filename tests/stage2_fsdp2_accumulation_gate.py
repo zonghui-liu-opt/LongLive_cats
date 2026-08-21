@@ -5,7 +5,7 @@ Local/CI seam (closest real):
         tests/stage2_fsdp2_accumulation_gate.py
 
 Release H100 gate (exact Stage-2 topology and both locked profiles):
-    torchrun --standalone --nproc-per-node=8 \
+    torchrun --standalone --nproc-per-node=4|8 \
         tests/stage2_fsdp2_accumulation_gate.py --require-h100
 """
 
@@ -120,9 +120,9 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     if args.require_h100:
-        if world_size != 8 or not torch.cuda.is_available():
+        if world_size not in {4, 8} or not torch.cuda.is_available():
             raise RuntimeError(
-                "Stage-2 release accumulation gate requires 8 CUDA ranks"
+                "Stage-2 release accumulation gate requires 4 or 8 CUDA ranks"
             )
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
@@ -165,7 +165,7 @@ def main() -> None:
                 raise RuntimeError("global64 is not divisible by this gate topology")
             accumulation = 64 // (world_size * microbatch)
             if args.require_h100:
-                expected = 4 if microbatch == 2 else 8
+                expected = 64 // (world_size * microbatch)
                 if accumulation != expected:
                     raise RuntimeError("H100 gate did not resolve the locked profile")
             synchronized = _run_variant(
@@ -207,7 +207,11 @@ def main() -> None:
             for left, right in zip(synchronized, no_sync):
                 torch.testing.assert_close(left, right, rtol=2e-5, atol=2e-6)
         if rank == 0:
-            mode = "H100-world8" if args.require_h100 else f"CPU-world{world_size}"
+            mode = (
+                f"H100-world{world_size}"
+                if args.require_h100
+                else f"CPU-world{world_size}"
+            )
             print(f"STAGE2_FSDP2_ACCUMULATION_GATE=PASS mode={mode}", flush=True)
     finally:
         dist.destroy_process_group()

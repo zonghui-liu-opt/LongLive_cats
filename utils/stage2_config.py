@@ -824,8 +824,18 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
 
     infra = _required_section(raw, "infra", _INFRA_KEYS)
     expected_nodes = _locked_integer(infra, "expected_nodes", "infra", 1)
-    world_size = _locked_integer(infra, "expected_world_size", "infra", 8)
-    data_parallel_size = _locked_integer(infra, "data_parallel_size", "infra", 8)
+    world_size = _integer(
+        infra["expected_world_size"], "infra.expected_world_size", minimum=1
+    )
+    if world_size not in {4, 8}:
+        raise ValueError("infra.expected_world_size must be 4 or 8.")
+    data_parallel_size = _integer(
+        infra["data_parallel_size"], "infra.data_parallel_size", minimum=1
+    )
+    if data_parallel_size != world_size:
+        raise ValueError(
+            "infra.data_parallel_size must equal infra.expected_world_size."
+        )
     sequence_parallel_size = _locked_integer(
         infra, "sequence_parallel_size", "infra", 1
     )
@@ -1254,16 +1264,23 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         "training.gradient_accumulation_steps",
         minimum=1,
     )
-    if (microbatch_size, accumulation) not in profile_spec.training_batch_profiles:
+    training_batch_profiles = tuple(
+        (microbatch, profile_accumulation * 8 // world_size)
+        for microbatch, profile_accumulation in profile_spec.training_batch_profiles
+    )
+    if (microbatch_size, accumulation) not in training_batch_profiles:
         raise ValueError(
             f"training microbatch/accumulation for profile {profile!r} must be "
-            f"one of the candidate profiles {profile_spec.training_batch_profiles}, got "
+            f"one of the candidate profiles {training_batch_profiles}, got "
             f"{(microbatch_size, accumulation)}."
         )
-    if saved_tensor_cpu_offload and (microbatch_size, accumulation) != (1, 8):
+    if saved_tensor_cpu_offload and (microbatch_size, accumulation) != (
+        1,
+        64 // world_size,
+    ):
         raise ValueError(
             "infra.saved_tensor_cpu_offload is only a candidate after the "
-            "micro1 x accumulation8 profile is selected."
+            "micro1 global64 profile is selected."
         )
     effective_global_batch = world_size * microbatch_size * accumulation
     if effective_global_batch != global_batch_size:
@@ -1438,7 +1455,15 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
                 ),
             )
         )
-    _locked("preflight.candidate_profiles", tuple(profiles), _CANDIDATE_BATCH_PROFILES)
+    expected_candidate_profiles = tuple(
+        (microbatch, accumulation * 8 // world_size)
+        for microbatch, accumulation in _CANDIDATE_BATCH_PROFILES
+    )
+    _locked(
+        "preflight.candidate_profiles",
+        tuple(profiles),
+        expected_candidate_profiles,
+    )
     max_allocated_fraction = _locked_number(
         preflight, "max_allocated_fraction", "preflight", 0.85
     )

@@ -2,8 +2,8 @@ config_schema: longlive_stage2_train/v1
 profile: h100_micro1_acc8_longrun
 infra:
   expected_nodes: 1
-  expected_world_size: 8
-  data_parallel_size: 8
+  expected_world_size: ${oc.decode:${oc.env:STAGE2_GPUS,8}}
+  data_parallel_size: ${oc.decode:${oc.env:STAGE2_GPUS,8}}
   sequence_parallel_size: 1
   fsdp_backend: fsdp2
   sharding_strategy: full
@@ -163,7 +163,7 @@ training:
   seed: 1
   global_batch_size: 64
   microbatch_size_per_device: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: ${oc.decode:${oc.env:LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS,8}}
   fake_updates_per_generator_update: 5
   phase_a_epochs: 360
   phase_b_epochs: 40
@@ -243,9 +243,9 @@ logging:
 preflight:
   candidate_profiles:
   - microbatch_size_per_device: 2
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: ${oc.decode:${oc.env:LONG_LIVE_STAGE2_PREFLIGHT_MICRO2_ACCUMULATION_STEPS,4}}
   - microbatch_size_per_device: 1
-    gradient_accumulation_steps: 8
+    gradient_accumulation_steps: ${oc.decode:${oc.env:LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS,8}}
   max_allocated_fraction: 0.85
   max_reserved_fraction: 0.9
   min_free_gib: 8

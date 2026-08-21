@@ -2230,6 +2230,7 @@ class Trainer:
         restore_stage2_rng_state(
             resume_payload.local_rng_state,
             rank=self.rank,
+            expected_world_size=self.world_size,
             dedicated_generators=self._checkpoint_dedicated_generators(),
             rank0_control_generators=self._rank0_control_generators(),
             require_cuda_topology=True,

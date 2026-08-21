@@ -1,4 +1,4 @@
-"""Stage-2-only world8 one-dimensional FSDP2 FULL_SHARD helpers."""
+"""Stage-2-only one-dimensional FSDP2 FULL_SHARD helpers."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ from torch.distributed.tensor import DTensor, Shard
 from utils.lora_utils import LoraTensorSpec
 from utils.parameter_names import map_parameter_names_to_expected
 
+STAGE2_FSDP2_WORLD_SIZES = (4, 8)
+# Retained only so the cumulative pre-Phase-35 innernet hotfix can leave an
+# older world8 checkout runnable; production logic below is topology-derived.
 STAGE2_FSDP2_WORLD_SIZE = 8
 STAGE2_FSDP2_MESH_SHAPE = (8,)
 STAGE2_FSDP2_MESH_DIM_NAMES = ("shard",)
@@ -47,11 +50,16 @@ def validate_stage2_fsdp2_topology(
         "mesh_shape": tuple(int(value) for value in mesh_shape),
         "mesh_dim_names": tuple(str(value) for value in mesh_dim_names),
     }
+    if actual["world_size"] not in STAGE2_FSDP2_WORLD_SIZES:
+        raise ValueError(
+            "Stage-2 FSDP2 world_size must be one of "
+            f"{STAGE2_FSDP2_WORLD_SIZES}, got {actual['world_size']}"
+        )
     expected = {
-        "world_size": STAGE2_FSDP2_WORLD_SIZE,
+        "world_size": actual["world_size"],
         "sequence_parallel_size": 1,
-        "data_parallel_size": STAGE2_FSDP2_WORLD_SIZE,
-        "mesh_shape": STAGE2_FSDP2_MESH_SHAPE,
+        "data_parallel_size": actual["world_size"],
+        "mesh_shape": (actual["world_size"],),
         "mesh_dim_names": STAGE2_FSDP2_MESH_DIM_NAMES,
     }
     wrong = {
@@ -65,19 +73,22 @@ def validate_stage2_fsdp2_topology(
         **actual,
         "backend": "fsdp2",
         "sharding_strategy": "FULL_SHARD",
-        "rank_layout": tuple(range(STAGE2_FSDP2_WORLD_SIZE)),
+        "rank_layout": tuple(range(actual["world_size"])),
     }
 
 
 def audit_stage2_runtime_descriptors(
     descriptors: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    if len(descriptors) != STAGE2_FSDP2_WORLD_SIZE:
-        raise RuntimeError("Stage-2 runtime audit requires exactly 8 rank descriptors")
+    world_size = len(descriptors)
+    if world_size not in STAGE2_FSDP2_WORLD_SIZES:
+        raise RuntimeError(
+            "Stage-2 runtime audit requires exactly 4 or 8 rank descriptors"
+        )
     ordered = sorted(descriptors, key=lambda item: int(item["rank"]))
     ranks = tuple(int(item["rank"]) for item in ordered)
     local_ranks = tuple(sorted(int(item["local_rank"]) for item in ordered))
-    expected_ranks = tuple(range(STAGE2_FSDP2_WORLD_SIZE))
+    expected_ranks = tuple(range(world_size))
     if ranks != expected_ranks or local_ranks != expected_ranks:
         raise RuntimeError(
             f"Stage-2 rank/local-rank layout mismatch: ranks={ranks}, "
@@ -89,9 +100,10 @@ def audit_stage2_runtime_descriptors(
     failures: list[str] = []
     for item in ordered:
         rank = int(item["rank"])
-        if int(item["visible_device_count"]) != STAGE2_FSDP2_WORLD_SIZE:
+        if int(item["visible_device_count"]) != world_size:
             failures.append(
-                f"rank{rank}: visible GPUs={item['visible_device_count']} expected=8"
+                f"rank{rank}: visible GPUs={item['visible_device_count']} "
+                f"expected={world_size}"
             )
         if "H100" not in str(item["device_name"]).upper():
             failures.append(f"rank{rank}: device is not H100 ({item['device_name']!r})")
@@ -106,7 +118,7 @@ def audit_stage2_runtime_descriptors(
         raise RuntimeError("Stage-2 H100 runtime audit failed: " + "; ".join(failures))
     return {
         "single_host": next(iter(hosts)),
-        "world_size": STAGE2_FSDP2_WORLD_SIZE,
+        "world_size": world_size,
         "device_names": tuple(str(item["device_name"]) for item in ordered),
         "total_memory_bytes": tuple(int(item["total_memory"]) for item in ordered),
         "bf16_supported": True,
@@ -163,7 +175,7 @@ def validate_stage2_fsdp2_runtime() -> dict[str, Any]:
         }
     except Exception as exc:  # turn rank-local failures into one WORLD failure
         error = f"{type(exc).__name__}: {exc}"
-    statuses: list[dict[str, Any] | None] = [None] * STAGE2_FSDP2_WORLD_SIZE
+    statuses: list[dict[str, Any] | None] = [None] * dist.get_world_size()
     dist.all_gather_object(
         statuses,
         {"rank": rank, "descriptor": descriptor, "error": error},
@@ -182,13 +194,14 @@ def validate_stage2_fsdp2_runtime() -> dict[str, Any]:
 
 def build_stage2_fsdp2_device_mesh():
     runtime = validate_stage2_fsdp2_runtime()
+    world_size = int(runtime["world_size"])
     mesh = _fsdp2_api()["init_device_mesh"](
         "cuda",
-        STAGE2_FSDP2_MESH_SHAPE,
+        (world_size,),
         mesh_dim_names=STAGE2_FSDP2_MESH_DIM_NAMES,
     )
     ranks = tuple(int(value) for value in mesh.mesh.detach().cpu().tolist())
-    if ranks != tuple(range(STAGE2_FSDP2_WORLD_SIZE)):
+    if ranks != tuple(range(world_size)):
         raise RuntimeError(f"Stage-2 DeviceMesh rank layout mismatch: {ranks}")
     if tuple(mesh.mesh_dim_names or ()) != STAGE2_FSDP2_MESH_DIM_NAMES:
         raise RuntimeError("Stage-2 DeviceMesh dim names mismatch")
@@ -197,10 +210,11 @@ def build_stage2_fsdp2_device_mesh():
 
 def _mesh_contract(mesh: Any) -> None:
     tensor = mesh.mesh.detach().to(device="cpu")
-    if tensor.ndim != 1 or tuple(int(value) for value in tensor.tolist()) != tuple(
-        range(STAGE2_FSDP2_WORLD_SIZE)
-    ):
-        raise RuntimeError("Stage-2 FSDP2 requires the 1D ranks[0..7] DeviceMesh")
+    if tensor.ndim != 1:
+        raise RuntimeError("Stage-2 FSDP2 requires a 1D world4/world8 DeviceMesh")
+    ranks = tuple(int(value) for value in tensor.tolist())
+    if len(ranks) not in STAGE2_FSDP2_WORLD_SIZES or ranks != tuple(range(len(ranks))):
+        raise RuntimeError("Stage-2 FSDP2 requires a 1D world4/world8 DeviceMesh")
     if tuple(mesh.mesh_dim_names or ()) != STAGE2_FSDP2_MESH_DIM_NAMES:
         raise RuntimeError("Stage-2 FSDP2 DeviceMesh must be named ('shard',)")
 
@@ -392,6 +406,7 @@ def audit_stage2_fsdp2_role(
     frozen_tensor_count = 0
     global_frozen_parameters = 0
     canonical_keys: list[str] = []
+    audited_mesh_shape: tuple[int, ...] | None = None
     runtime_to_raw: Mapping[str, str] = {}
     raw_to_key: dict[str, str] = {}
     if expected_schema is not None:
@@ -411,8 +426,14 @@ def audit_stage2_fsdp2_role(
         if parameter.is_meta:
             raise RuntimeError(f"Stage-2 {role} parameter remained meta: {name}")
         mesh = parameter.device_mesh
-        if tuple(int(value) for value in mesh.shape) != STAGE2_FSDP2_MESH_SHAPE:
+        mesh_shape = tuple(int(value) for value in mesh.shape)
+        if (
+            len(mesh_shape) != 1
+            or mesh_shape[0] not in STAGE2_FSDP2_WORLD_SIZES
+            or (audited_mesh_shape is not None and mesh_shape != audited_mesh_shape)
+        ):
             raise RuntimeError(f"Stage-2 {role} parameter has wrong mesh shape: {name}")
+        audited_mesh_shape = mesh_shape
         if tuple(mesh.mesh_dim_names or ()) != STAGE2_FSDP2_MESH_DIM_NAMES:
             raise RuntimeError(f"Stage-2 {role} parameter has wrong mesh names: {name}")
         placements = tuple(parameter.placements)
@@ -456,7 +477,7 @@ def audit_stage2_fsdp2_role(
         "all_parameters_are_dtensor": True,
         "fsdp_module_count": len(fsdp_modules),
         "root_and_30_blocks_independently_wrapped": True,
-        "mesh_shape": STAGE2_FSDP2_MESH_SHAPE,
+        "mesh_shape": audited_mesh_shape,
         "mesh_dim_names": STAGE2_FSDP2_MESH_DIM_NAMES,
         "placements": ("shard:0",),
     }
