@@ -66,6 +66,7 @@ from utils.stage2_inference_batch import (
 )
 from utils.stage2_inference_config import ResolvedStage2InferenceConfig
 from utils.stage2_inference_loader import load_stage2_ema_generator_for_inference
+from utils.stage2_inference_sweep_config import ResolvedStage2InferenceSweepConfig
 
 _OUTPUT_ROOT_GUARD_SCHEMA = "longlive_stage2_output_root_guard/v2"
 _OUTPUT_ROOT_ANCHOR_SCHEMA = "longlive_stage2_output_root_anchor/v1"
@@ -977,6 +978,7 @@ def _validate_existing_pair(
     sample: Stage2InferenceSample,
     checkpoint: Mapping[str, Any],
     inference_config: Mapping[str, Any],
+    code_version: Mapping[str, Any],
     ops: Stage2InferenceRuntimeOps,
 ) -> dict[str, Any] | None:
     root = _assert_output_root_guard(guard)
@@ -1008,6 +1010,7 @@ def _validate_existing_pair(
             _strict_json_object(guard, trace_path),
             sample=sample,
             inference_config=inference_config,
+            code_version=code_version,
         )
     )
     _assert_output_root_guard(guard)
@@ -1019,6 +1022,10 @@ def _validate_existing_pair(
         raise RuntimeError(
             "existing Stage-2 sample uses another inference config: "
             f"{sample.sample_key}"
+        )
+    if trace.get("code_version") != dict(code_version):
+        raise RuntimeError(
+            f"existing Stage-2 sample uses another code version: {sample.sample_key}"
         )
     technical = dict(
         validate_stage2_video_artifact(
@@ -1050,6 +1057,7 @@ def _generate_one_sample(
     vae: Any,
     checkpoint: Mapping[str, Any],
     inference_config: Mapping[str, Any],
+    code_version: Mapping[str, Any],
     ops: Stage2InferenceRuntimeOps,
 ) -> dict[str, Any]:
     root = _assert_output_root_guard(guard)
@@ -1058,6 +1066,7 @@ def _generate_one_sample(
         sample=sample,
         checkpoint=checkpoint,
         inference_config=inference_config,
+        code_version=code_version,
         ops=ops,
     )
     if existing is not None:
@@ -1127,6 +1136,7 @@ def _generate_one_sample(
             video_path=video_path,
             checkpoint=checkpoint,
             inference_config=inference_config,
+            code_version=code_version,
             probe_fn=ops.probe_video,
         )
     )
@@ -1136,11 +1146,16 @@ def _generate_one_sample(
             trace,
             sample=sample,
             inference_config=inference_config,
+            code_version=code_version,
         )
     )
     if trace.get("inference_config") != dict(inference_config):
         raise RuntimeError(
             f"Stage-2 sample trace lost its inference config: {sample.sample_key}"
+        )
+    if trace.get("code_version") != dict(code_version):
+        raise RuntimeError(
+            f"Stage-2 sample trace lost its code version: {sample.sample_key}"
         )
     _assert_regular_parents(guard, trace_path, allow_missing=False)
     ops.write_sample_trace(root, sample=sample, trace=trace)
@@ -1198,6 +1213,7 @@ def _finalize_artifacts(
                 _strict_json_object(guard, trace_path),
                 sample=sample,
                 inference_config=inference_config,
+                code_version=code_version,
             )
         )
         _assert_regular_parents(guard, trace_path, allow_missing=False)
@@ -1335,14 +1351,17 @@ def _collective_phase_result(
 
 
 def run_stage2_inference(
-    config: ResolvedStage2InferenceConfig,
+    config: ResolvedStage2InferenceConfig | ResolvedStage2InferenceSweepConfig,
     *,
     context: Stage2InferenceDistributedContext | None = None,
     ops: Stage2InferenceRuntimeOps | None = None,
 ) -> dict[str, Any]:
     """Run every configured profile and publish a manifest only after full QA."""
 
-    if not isinstance(config, ResolvedStage2InferenceConfig):
+    if not isinstance(
+        config,
+        (ResolvedStage2InferenceConfig, ResolvedStage2InferenceSweepConfig),
+    ):
         raise TypeError("run_stage2_inference requires a resolved strict config")
     runtime_ops = ops or Stage2InferenceRuntimeOps()
     distributed = context or initialize_stage2_inference_distributed()
@@ -1399,11 +1418,18 @@ def run_stage2_inference(
         root = root_guard.root
         root_guard_identity = _output_root_guard_identity(root_guard)
         metadata_before_planning = _metadata_identity(config)
+        sample_options: dict[str, Any] = {}
+        if isinstance(config, ResolvedStage2InferenceSweepConfig):
+            sample_options = {
+                "single_row_ids": config.single_row_ids,
+                "two_action_row_ids": config.two_action_row_ids,
+            }
         samples = runtime_ops.build_samples(
             single_metadata=config.single_metadata,
             two_action_metadata=config.two_action_metadata,
             seeds=config.seeds,
             profiles=config.profiles,
+            **sample_options,
         )
         if not isinstance(samples, tuple) or any(
             not isinstance(sample, Stage2InferenceSample) for sample in samples
@@ -1596,6 +1622,7 @@ def run_stage2_inference(
                         sample=sample,
                         checkpoint=checkpoint,
                         inference_config=inference_config,
+                        code_version=code_version,
                         ops=runtime_ops,
                     )
                     is not None
@@ -1650,6 +1677,7 @@ def run_stage2_inference(
                     sample=sample,
                     checkpoint=checkpoint,
                     inference_config=inference_config,
+                    code_version=code_version,
                     ops=runtime_ops,
                 )
                 was_existing = sample.sample_key in existing_sample_keys
@@ -1688,6 +1716,7 @@ def run_stage2_inference(
                     vae=vae,
                     checkpoint=checkpoint,
                     inference_config=inference_config,
+                    code_version=code_version,
                     ops=runtime_ops,
                 )
                 generated += 1

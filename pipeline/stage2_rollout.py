@@ -9,6 +9,7 @@ entire microbatch; sampling that step twice inside the pipeline is forbidden.
 from __future__ import annotations
 
 import hashlib
+import struct
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -21,15 +22,16 @@ import torch.distributed as dist
 from pipeline.stage2_rollout_profile import (
     Stage2RolloutSpec,
     resolve_stage2_rollout_profile,
+    resolve_stage2_shift5_schedule,
 )
 from utils.stage2_cross_kv import Stage2CrossKVInitState
 
 STAGE2_K2_SHIFT5_TIMESTEPS = (999, 833)
 STAGE2_K4_SHIFT5_TIMESTEPS = (999, 937, 833, 624)
-_STAGE2_SHIFT5_TIMESTEPS = {
-    2: STAGE2_K2_SHIFT5_TIMESTEPS,
-    4: STAGE2_K4_SHIFT5_TIMESTEPS,
-}
+if resolve_stage2_shift5_schedule(2).timesteps != STAGE2_K2_SHIFT5_TIMESTEPS:
+    raise AssertionError("Stage-2 K2 shift=5 golden timetable drifted")
+if resolve_stage2_shift5_schedule(4).timesteps != STAGE2_K4_SHIFT5_TIMESTEPS:
+    raise AssertionError("Stage-2 K4 shift=5 golden timetable drifted")
 _EXIT_ROLES = ("generator", "fake_score")
 
 
@@ -420,8 +422,12 @@ class Stage2RolloutPipeline:
             )
         if self.num_train_timesteps != 1000:
             raise ValueError("Stage-2 rollout requires 1000 training timesteps")
-        if self.num_denoising_steps not in _STAGE2_SHIFT5_TIMESTEPS:
-            raise ValueError("Stage-2 rollout supports only native K2 or K4 UniPC")
+        try:
+            resolve_stage2_shift5_schedule(self.num_denoising_steps)
+        except ValueError as exc:
+            raise ValueError(
+                "Stage-2 rollout supports only native K1-K8 UniPC"
+            ) from exc
         if self.timestep_shift != 5.0:
             raise ValueError("Stage-2 rollout requires UniPC shift=5")
         derived = (
@@ -521,7 +527,8 @@ class Stage2RolloutPipeline:
         raw_timesteps = tuple(
             float(value) for value in scheduler.timesteps.detach().cpu().tolist()
         )
-        expected_timesteps = _STAGE2_SHIFT5_TIMESTEPS[self.num_denoising_steps]
+        reference = resolve_stage2_shift5_schedule(self.num_denoising_steps)
+        expected_timesteps = reference.timesteps
         if raw_timesteps != tuple(float(value) for value in expected_timesteps):
             raise RuntimeError(
                 "Stage-2 UniPC timetable drifted: "
@@ -536,6 +543,15 @@ class Stage2RolloutPipeline:
         sigma_values = tuple(
             float(value) for value in scheduler.sigmas.detach().float().cpu().tolist()
         )
+        sigma_fp32_bits = tuple(
+            struct.pack(">f", value).hex() for value in sigma_values
+        )
+        if sigma_fp32_bits != reference.sigma_fp32_bits:
+            raise RuntimeError(
+                "Stage-2 UniPC sigma schedule drifted: "
+                f"expected_fp32_bits={reference.sigma_fp32_bits}, "
+                f"actual_fp32_bits={sigma_fp32_bits}"
+            )
         if len(sigma_values) != self.num_denoising_steps + 1:
             raise RuntimeError(
                 "Stage-2 UniPC must expose one sigma per denoising step plus "

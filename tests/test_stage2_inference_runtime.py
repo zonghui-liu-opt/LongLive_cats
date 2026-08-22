@@ -12,9 +12,12 @@ from typing import Any
 
 import pytest
 import torch
-import utils.stage2_inference_runtime as stage2_inference_runtime
 
-from pipeline.stage2_rollout_profile import resolve_stage2_rollout_profile
+from pipeline.stage2_rollout_profile import (
+    build_stage2_deployment_rollout_spec,
+    resolve_stage2_rollout_profile,
+)
+from utils import stage2_inference_runtime
 from utils.stage1_io import (
     atomic_write_bytes,
     atomic_write_json,
@@ -40,6 +43,10 @@ from utils.stage2_inference_runtime import (
     _ensure_regular_parents,
     _prepare_output_root,
     run_stage2_inference,
+)
+from utils.stage2_inference_sweep_config import (
+    STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA,
+    ResolvedStage2InferenceSweepConfig,
 )
 
 _CHECKPOINT = {
@@ -296,6 +303,41 @@ def _config(
     )
 
 
+def _sweep_config(tmp_path: Path) -> ResolvedStage2InferenceSweepConfig:
+    base = _config(tmp_path, profile="baseline_c8w16k4s1")
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=6,
+        local_window_frames=12,
+        num_denoising_steps=3,
+    )
+    return ResolvedStage2InferenceSweepConfig(
+        schema=STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA,
+        base_config_path=str(tmp_path / "base.yaml"),
+        base_config_sha256="a" * 64,
+        stage2_checkpoint=base.stage2_checkpoint,
+        source_cache_manifest=base.source_cache_manifest,
+        architecture_root=base.architecture_root,
+        t5_checkpoint=base.t5_checkpoint,
+        tokenizer_dir=base.tokenizer_dir,
+        vae_checkpoint=base.vae_checkpoint,
+        single_metadata=base.single_metadata,
+        two_action_metadata=base.two_action_metadata,
+        output_root=base.output_root,
+        profiles=(spec.name,),
+        seeds=(7,),
+        dtype=base.dtype,
+        cfg_scale=base.cfg_scale,
+        fps=base.fps,
+        merge_ema_lora=base.merge_ema_lora,
+        batch_size_per_device=base.batch_size_per_device,
+        evaluation_mode="quick",
+        single_row_ids=(0,),
+        two_action_row_ids=(0,),
+        profile_set_sha256=canonical_json_sha256([spec.to_dict()]),
+        _rollout_specs=(spec,),
+    )
+
+
 def _runtime_asset_identity(
     config: ResolvedStage2InferenceConfig,
 ) -> dict[str, Any]:
@@ -424,6 +466,7 @@ def _fake_artifact_ops(calls: dict[str, Any]) -> dict[str, Any]:
         video_path: Path,
         checkpoint: dict[str, Any],
         inference_config: dict[str, Any],
+        code_version: dict[str, Any],
         probe_fn: Any,
     ) -> dict[str, Any]:
         probe = probe_fn(video_path)
@@ -431,6 +474,7 @@ def _fake_artifact_ops(calls: dict[str, Any]) -> dict[str, Any]:
             "sample_key": sample.sample_key,
             "checkpoint": dict(checkpoint),
             "inference_config": dict(inference_config),
+            "code_version": dict(code_version),
             "generation": dict(generation_trace),
             "output": {
                 "relative_path": sample.output_relative_path.as_posix(),
@@ -445,6 +489,7 @@ def _fake_artifact_ops(calls: dict[str, Any]) -> dict[str, Any]:
         *,
         sample: Stage2InferenceSample,
         inference_config: dict[str, Any] | None = None,
+        code_version: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if trace.get("sample_key") != sample.sample_key:
             raise RuntimeError("wrong fake trace sample")
@@ -453,6 +498,8 @@ def _fake_artifact_ops(calls: dict[str, Any]) -> dict[str, Any]:
             and trace.get("inference_config") != inference_config
         ):
             raise RuntimeError("wrong fake trace inference config")
+        if code_version is not None and trace.get("code_version") != code_version:
+            raise RuntimeError("wrong fake trace code version")
         return dict(trace)
 
     def write_trace(
@@ -702,6 +749,60 @@ def test_runtime_loads_once_preencodes_unique_prompts_and_uses_multisink_only_fo
     assert (Path(config.output_root) / STAGE2_REVIEW_INDEX_NAME).is_file()
 
 
+def test_runtime_executes_dynamic_sweep_and_forwards_exact_quick_selection(
+    tmp_path: Path,
+) -> None:
+    config = _sweep_config(tmp_path)
+    profile = config.profiles[0]
+    samples = (
+        _sample(
+            tmp_path,
+            dataset=STAGE2_SINGLE_DATASET,
+            row_id=0,
+            seed=7,
+            prompts=("single prompt",),
+            profile=profile,
+        ),
+        _sample(
+            tmp_path,
+            dataset=STAGE2_TWO_ACTION_DATASET,
+            row_id=0,
+            seed=7,
+            prompts=("action A", "action B"),
+            profile=profile,
+        ),
+    )
+    calls: dict[str, Any] = {}
+    seen_plan: dict[str, Any] = {}
+    ops = _runtime_ops(samples, calls)
+
+    def build_samples(**kwargs: Any) -> tuple[Stage2InferenceSample, ...]:
+        seen_plan.update(kwargs)
+        return samples
+
+    result = run_stage2_inference(
+        config,
+        context=_context(),
+        ops=replace(ops, build_samples=build_samples),
+    )
+
+    assert result["status"] == "complete"
+    assert seen_plan == {
+        "single_metadata": config.single_metadata,
+        "two_action_metadata": config.two_action_metadata,
+        "seeds": (7,),
+        "profiles": (profile,),
+        "single_row_ids": (0,),
+        "two_action_row_ids": (0,),
+    }
+    assert calls["text_encoder_builds"] == 1
+    assert calls["generator_loads"] == 1
+    assert calls["vae_builds"] == 1
+    assert calls["pipelines"] == [profile]
+    assert calls["single_calls"] == [profile]
+    assert calls["two_calls"] == [(profile, profile)]
+
+
 def test_runtime_completes_when_root_identity_drifts_after_video_save(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -834,6 +935,41 @@ def test_same_path_runtime_asset_content_drift_rejects_resume_before_any_write(
             ops=replace(
                 ops,
                 build_runtime_assets=lambda _config: changed_assets,
+            ),
+        )
+
+    assert calls["generator_loads"] == 1
+    assert calls["vae_builds"] == 0
+    assert calls["video_writes"] == 0
+    assert calls["trace_writes"] == 0
+
+
+def test_code_version_drift_rejects_resume_before_any_sample_write(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    sample = _sample(
+        tmp_path,
+        dataset=STAGE2_SINGLE_DATASET,
+        row_id=0,
+        seed=1,
+        prompts=("single prompt",),
+    )
+    run_stage2_inference(
+        config,
+        context=_context(),
+        ops=_runtime_ops((sample,), {}),
+    )
+
+    calls: dict[str, Any] = {}
+    ops = _runtime_ops((sample,), calls)
+    with pytest.raises(RuntimeError, match="code version"):
+        run_stage2_inference(
+            config,
+            context=_context(),
+            ops=replace(
+                ops,
+                capture_code_version=lambda: {"stage2_source_sha256": "f" * 64},
             ),
         )
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import pytest
-import torch
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+from utils import stage2_inference
 from utils.stage2_inference import (
     STAGE2_DECODE_INPUT_LATENTS,
     STAGE2_OUTPUT_PIXEL_FRAMES_PER_EPISODE,
@@ -176,6 +178,25 @@ def test_decode_uses_sink_plus_24_then_drops_only_pixel_frame_zero():
     assert torch.allclose(result.video[:, 0], torch.full((1, 3, 4, 5), 1.0 / 96.0))
     assert bool((result.video >= 0).all())
     assert bool((result.video <= 1).all())
+
+
+def test_decode_does_not_hash_full_decode_tensors(monkeypatch):
+    hashed_shapes = []
+
+    def _record_hash(value):
+        hashed_shapes.append(tuple(value.shape))
+        return "unused"
+
+    monkeypatch.setattr(stage2_inference, "tensor_identity_sha256", _record_hash)
+    result = decode_stage2_episode(
+        _FakeVAE(),
+        initial_latent=_initial(),
+        future_latents=torch.zeros(1, 24, 48, 2, 3, dtype=torch.bfloat16),
+    )
+
+    assert hashed_shapes == []
+    assert not hasattr(result, "decode_input_sha256")
+    assert not hasattr(result, "video_sha256")
 
 
 def test_decode_fails_closed_on_wrong_future_or_pixel_frame_count():

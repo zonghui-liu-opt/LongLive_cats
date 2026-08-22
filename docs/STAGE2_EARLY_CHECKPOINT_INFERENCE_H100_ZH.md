@@ -106,6 +106,71 @@ bash infer_stage2_tmp.sh 70
 GPU 0–3 跑 G60、GPU 4–7 跑 G70；两种方式的理想总耗时接近，但顺序使用 8 卡更简单，且共享
 存储的瞬时读取压力更小。不要让两个 8 卡任务同时占用同一组 GPU。
 
+### 2.2 C/W/K 推理消融：一次同步，内网直接切 quick/formal
+
+消融入口复用同一个 Generator、T5、VAE、metadata、断点续跑和产物验收链；不会为每组超参重复加载一套进程。
+默认矩阵在 `configs/infer_i2v_stage2_sweep.yaml`：包含冻结的
+`baseline_c8w16k4s1` 对照组和 7 个 deployment-only 动态点。动态点固定 `S=1`，因此不会误入训练。
+
+需要增删超参时，只在外网同步代码前编辑一次该 YAML 的 `profile_set.cases`：
+
+```yaml
+profile_set:
+  named: [baseline_c8w16k4s1]
+  grids: []
+  cases:
+    - {chunk_frames: 6, local_window_frames: 12, num_denoising_steps: 3}
+    - {chunk_frames: 8, local_window_frames: 24, num_denoising_steps: 6}
+```
+
+约束是：`C>=2` 且整除 24；`W>=C`、`W%C=0`、`W<=24`；`K=1..8`。
+也可以在 `grids` 中给三个字段各写一个列表，自动展开笛卡尔积；重复拓扑、非法组合和超过 32 个 profile
+都会在加载模型前直接拒绝。动态 profile id 包含完整拓扑、shift=5 timetable 和 sigma FP32 bits 的 SHA-256，
+不同实验不会覆盖到同一路径。
+
+代码同步到内网后，先做不启动 CUDA/torchrun 的完整计划预检。该步骤复用真实 metadata/sample
+planner，会读取并校验所选行与首帧，不再只按配置长度估算：
+
+```bash
+cd /srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0
+
+STAGE2_INFERENCE_CONFIG=configs/infer_i2v_stage2_sweep.yaml \
+STAGE2_INFERENCE_PLAN_ONLY=1 \
+STAGE2_INFERENCE_NPROC=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash infer_stage2_tmp.sh 70
+```
+
+确认输出中的 `expected_sample_count`、每组 C/W/K、DiT forward 数和 self-KV GiB 后，去掉
+`STAGE2_INFERENCE_PLAN_ONLY=1` 即可跑默认 quick 集合。默认 quick 是 4 个基础案例 × 1 seed × 8 profiles = 32 个视频；
+4 张卡能让同一案例跨 profile 落到同一 rank，最大化 prompt/首帧 latent 复用：
+
+```bash
+STAGE2_INFERENCE_CONFIG=configs/infer_i2v_stage2_sweep.yaml \
+STAGE2_INFERENCE_NPROC=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash infer_stage2_tmp.sh 70
+```
+
+quick 通过后，不改 YAML、不改代码，直接把同一 profile 集晋级为 56 个正式案例/seed 组合：
+
+```bash
+STAGE2_INFERENCE_CONFIG=configs/infer_i2v_stage2_sweep.yaml \
+STAGE2_SWEEP_EVALUATION=formal \
+STAGE2_INFERENCE_NPROC=7 \
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 \
+bash infer_stage2_tmp.sh 70
+```
+
+脚本会从 resolved plan 动态计算视频/trace 数，不再写死 56。sweep 默认输出目录包含 resolved contract
+hash，quick、formal、不同 profile 集和 baseline 不会混写；同一命令中断后原样重跑即可续跑，不要向既有
+输出目录追加、删除或重排 profile。每个样本 trace 还绑定当前推理源码闭包，旧代码生成的样本不能被新代码
+静默混入同一 manifest。
+
+同一输出目录同时只能有一个任务，脚本会创建相邻的 `*.stage2-run.lock` 并在正常结束、中断或报错时清理。
+若机器异常断电留下 stale lock，先确认对应任务和 PID 已不存在，再只删除报错中给出的那个 lock 目录；不要在
+任务仍运行时手工删除。
+
 ## 3. 为什么每个 checkpoint 生成 56 个视频
 
 默认 baseline 测试矩阵为：

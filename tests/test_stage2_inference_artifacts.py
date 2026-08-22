@@ -7,11 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.stage2_rollout import (
-    STAGE2_K2_SHIFT5_TIMESTEPS,
-    STAGE2_K4_SHIFT5_TIMESTEPS,
+from pipeline.stage2_rollout_profile import (
+    Stage2RolloutSpec,
+    build_stage2_deployment_rollout_spec,
+    resolve_stage2_rollout_profile,
+    resolve_stage2_shift5_schedule,
 )
-from pipeline.stage2_rollout_profile import resolve_stage2_rollout_profile
 from utils.stage1_io import canonical_json_sha256, sha256_file
 from utils.stage2_inference import (
     STAGE2_INFERENCE_TRACE_SCHEMA,
@@ -39,6 +40,10 @@ from utils.stage2_inference_batch import (
     build_stage2_inference_samples,
 )
 from utils.stage2_inference_config import ResolvedStage2InferenceConfig
+from utils.stage2_inference_sweep_config import (
+    STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA,
+    ResolvedStage2InferenceSweepConfig,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SINGLE_METADATA = PROJECT_ROOT / "testsets" / "metadata_6cases_480x832.csv"
@@ -54,10 +59,11 @@ CHECKPOINT = {
     "contract_hash": "2" * 64,
     "generator_ema_sha256": "3" * 64,
 }
+CODE_VERSION = {"stage2_source_sha256": "a" * 64}
 
 
 def _runtime_asset_identity(
-    config: ResolvedStage2InferenceConfig,
+    config: ResolvedStage2InferenceConfig | ResolvedStage2InferenceSweepConfig,
 ) -> dict[str, object]:
     paths = {
         "t5_checkpoint": config.t5_checkpoint,
@@ -137,6 +143,73 @@ def _inference_config(
     )
 
 
+def _resolved_sweep_config(
+    output_root: Path,
+    *,
+    specs: tuple[Stage2RolloutSpec, ...],
+    seeds: tuple[int, ...] = (9,),
+    evaluation_mode: str = "quick",
+    single_row_ids: tuple[int, ...] = (0,),
+    two_action_row_ids: tuple[int, ...] = (0,),
+) -> ResolvedStage2InferenceSweepConfig:
+    base = _resolved_inference_config(output_root)
+    return ResolvedStage2InferenceSweepConfig(
+        schema=STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA,
+        base_config_path="/configs/stage2_inference.yaml",
+        base_config_sha256="d" * 64,
+        stage2_checkpoint=base.stage2_checkpoint,
+        source_cache_manifest=base.source_cache_manifest,
+        architecture_root=base.architecture_root,
+        t5_checkpoint=base.t5_checkpoint,
+        tokenizer_dir=base.tokenizer_dir,
+        vae_checkpoint=base.vae_checkpoint,
+        single_metadata=base.single_metadata,
+        two_action_metadata=base.two_action_metadata,
+        output_root=base.output_root,
+        profiles=tuple(spec.name for spec in specs),
+        seeds=seeds,
+        dtype=base.dtype,
+        cfg_scale=base.cfg_scale,
+        fps=base.fps,
+        merge_ema_lora=base.merge_ema_lora,
+        batch_size_per_device=base.batch_size_per_device,
+        evaluation_mode=evaluation_mode,
+        single_row_ids=single_row_ids,
+        two_action_row_ids=two_action_row_ids,
+        profile_set_sha256=canonical_json_sha256([spec.to_dict() for spec in specs]),
+        _rollout_specs=specs,
+    )
+
+
+def _sweep_inference_config(
+    output_root: Path,
+    *,
+    specs: tuple[Stage2RolloutSpec, ...],
+    seeds: tuple[int, ...] = (9,),
+) -> dict[str, object]:
+    config = _resolved_sweep_config(output_root, specs=specs, seeds=seeds)
+    return build_stage2_inference_config_identity(
+        config,
+        runtime_assets=_runtime_asset_identity(config),
+    )
+
+
+def _rehash_config_identity(identity: dict[str, object]) -> None:
+    resolved = identity["resolved"]
+    assert isinstance(resolved, dict)
+    runtime_assets = identity["runtime_assets"]
+    contract_resolved = dict(resolved)
+    contract_resolved.pop("output_root")
+    identity["resolved_contract_hash"] = canonical_json_sha256(contract_resolved)
+    identity["resolved_launch_hash"] = canonical_json_sha256(resolved)
+    identity["runtime_contract_hash"] = canonical_json_sha256(
+        {"resolved": contract_resolved, "runtime_assets": runtime_assets}
+    )
+    identity["runtime_launch_hash"] = canonical_json_sha256(
+        {"resolved": resolved, "runtime_assets": runtime_assets}
+    )
+
+
 def _samples():
     return build_stage2_inference_samples(
         single_metadata=SINGLE_METADATA,
@@ -144,8 +217,10 @@ def _samples():
     )
 
 
-def _generation(sample, *, profile_name=None):
-    profile = resolve_stage2_rollout_profile(profile_name or sample.profile)
+def _generation(sample, *, profile_name=None, profile_spec=None):
+    profile = profile_spec or resolve_stage2_rollout_profile(
+        profile_name or sample.profile
+    )
     count = 1 if sample.dataset == STAGE2_SINGLE_DATASET else 2
     episodes = []
     frame_tokens = (sample.height // 32) * (sample.width // 32)
@@ -154,10 +229,9 @@ def _generation(sample, *, profile_name=None):
         if profile.global_sink_frames > 1 and episode_index == 0:
             actual_profile = resolve_stage2_rollout_profile("baseline_c8w16k4s1")
         steps = actual_profile.num_denoising_steps
-        timetable = list(
-            STAGE2_K2_SHIFT5_TIMESTEPS if steps == 2 else STAGE2_K4_SHIFT5_TIMESTEPS
-        )
-        sigmas = [1.0, 0.5, 0.0] if steps == 2 else [1.0, 0.75, 0.5, 0.25, 0.0]
+        schedule = resolve_stage2_shift5_schedule(steps)
+        timetable = list(schedule.timesteps)
+        sigmas = list(schedule.sigmas)
         chunks = actual_profile.num_chunks
         preload = int(episode_index == 0)
         noisy_calls = chunks * steps
@@ -343,6 +417,7 @@ def test_sample_trace_binds_video_prompt_checkpoint_profile_and_no_quality_metri
         video_path=video,
         checkpoint=CHECKPOINT,
         inference_config=inference_config,
+        code_version=CODE_VERSION,
         probe_fn=lambda _: _probe(sample),
     )
     assert trace["sample"]["sample_key"] == sample.sample_key
@@ -377,6 +452,7 @@ def test_config_identity_is_self_verifying_and_trace_rejects_resolved_drift(
         video_path=video,
         checkpoint=CHECKPOINT,
         inference_config=inference_config,
+        code_version=CODE_VERSION,
         probe_fn=lambda _: _probe(sample),
     )
 
@@ -395,6 +471,58 @@ def test_config_identity_is_self_verifying_and_trace_rejects_resolved_drift(
     tampered["resolved"]["vae_checkpoint"] = "/models/vae-v2.pth"
     with pytest.raises(RuntimeError, match="path differs|contract hash mismatch"):
         validate_stage2_inference_config_identity(tampered)
+
+
+def test_trace_rejects_code_version_and_bit_inexact_sigma_drift(
+    tmp_path: Path,
+) -> None:
+    sample = _samples()[0]
+    video = _write_video(tmp_path, sample)
+    trace = build_stage2_sample_trace(
+        sample=sample,
+        generation_trace=_generation(sample),
+        output_root=tmp_path,
+        video_path=video,
+        checkpoint=CHECKPOINT,
+        inference_config=_inference_config(tmp_path),
+        code_version=CODE_VERSION,
+        probe_fn=lambda _: _probe(sample),
+    )
+
+    with pytest.raises(RuntimeError, match="code version mismatch"):
+        validate_stage2_sample_trace(
+            trace,
+            sample=sample,
+            code_version={"stage2_source_sha256": "b" * 64},
+        )
+
+    drifted = deepcopy(trace)
+    sigmas = [0.9, 0.6, 0.3, 0.1, 0.0]
+    episode = drifted["generation"]["episodes"][0]
+    episode["scheduler_sigmas"] = sigmas
+    episode["chunk_sigmas"] = [sigmas[:-1]] * len(episode["chunk_sigmas"])
+    for chunk in episode["chunk_trace"]:
+        chunk["sigmas"] = sigmas[:-1]
+    body = dict(drifted)
+    body.pop("trace_sha256")
+    drifted["trace_sha256"] = canonical_json_sha256(body)
+    with pytest.raises(RuntimeError, match="sigma schedule drifted"):
+        validate_stage2_sample_trace(drifted, sample=sample)
+
+
+def test_formal_config_identity_cannot_smuggle_a_dynamic_sweep_profile(
+    tmp_path: Path,
+) -> None:
+    identity = _inference_config(tmp_path)
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=6,
+        local_window_frames=12,
+        num_denoising_steps=3,
+    )
+    forged = json.loads(json.dumps(identity))
+    forged["resolved"]["profiles"] = [spec.name]
+    with pytest.raises(ValueError, match="frozen named profile"):
+        validate_stage2_inference_config_identity(forged)
 
 
 def test_config_identity_separates_resolved_and_runtime_hash_semantics(
@@ -444,6 +572,243 @@ def test_config_identity_v2_rejects_ambiguous_legacy_hash_keys(
         validate_stage2_inference_config_identity(legacy)
 
 
+def test_formal_config_identity_v2_hash_golden_is_unchanged() -> None:
+    config = _resolved_inference_config(
+        Path("/artifacts/stage2-formal"),
+        single_metadata="/metadata/single.csv",
+        two_action_metadata="/metadata/two.csv",
+    )
+    identity = build_stage2_inference_config_identity(
+        config,
+        runtime_assets=_runtime_asset_identity(config),
+    )
+    assert identity["resolved"] == json.loads(json.dumps(config.to_dict()))
+    assert identity["resolved_contract_hash"] == (
+        "01471d5c3c147203f503cd15fc7890928a724bf7025cc31209339071e69507da"
+    )
+    assert identity["resolved_launch_hash"] == (
+        "873d99ed2518e8afc0ca62c33a4b4cdb5de61d841b4f3ad9e9f58bd25e96b7bc"
+    )
+    assert identity["runtime_contract_hash"] == (
+        "63e96f72bcdcfac1ee1281c320828dffd425b7f798fdac089796688022283d8f"
+    )
+    assert identity["runtime_launch_hash"] == (
+        "cb9b001cf35240946524002f86487d82bae8033dd09ada6845b6294151bc03f2"
+    )
+
+
+def test_sweep_config_identity_recomputes_profile_set_and_validates_evaluation(
+    tmp_path: Path,
+) -> None:
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=6,
+        local_window_frames=12,
+        num_denoising_steps=3,
+    )
+    identity = _sweep_inference_config(tmp_path, specs=(spec,))
+    assert validate_stage2_inference_config_identity(identity) == identity
+    assert identity["resolved"]["profile_set_sha256"] == canonical_json_sha256(
+        [spec.to_dict()]
+    )
+
+    bad_profile_sha = deepcopy(identity)
+    bad_profile_sha["resolved"]["profile_set_sha256"] = "f" * 64
+    _rehash_config_identity(bad_profile_sha)
+    with pytest.raises(RuntimeError, match="profile set SHA-256 mismatch"):
+        validate_stage2_inference_config_identity(bad_profile_sha)
+
+    bad_base_sha = deepcopy(identity)
+    bad_base_sha["resolved"]["base_config_sha256"] = "D" * 64
+    _rehash_config_identity(bad_base_sha)
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        validate_stage2_inference_config_identity(bad_base_sha)
+
+    duplicate_seed = deepcopy(identity)
+    duplicate_seed["resolved"]["seeds"] = [9, 9]
+    _rehash_config_identity(duplicate_seed)
+    with pytest.raises(ValueError, match="sorted and unique"):
+        validate_stage2_inference_config_identity(duplicate_seed)
+
+    invalid_formal_evaluation = deepcopy(identity)
+    invalid_formal_evaluation["resolved"]["evaluation_mode"] = "formal"
+    _rehash_config_identity(invalid_formal_evaluation)
+    with pytest.raises(ValueError, match="formal Stage-2 inference sweep"):
+        validate_stage2_inference_config_identity(invalid_formal_evaluation)
+
+    extra_key = deepcopy(identity)
+    extra_key["resolved"]["unexpected"] = None
+    _rehash_config_identity(extra_key)
+    with pytest.raises(ValueError, match="sweep config schema mismatch"):
+        validate_stage2_inference_config_identity(extra_key)
+
+
+def test_sweep_config_identity_rejects_noncanonical_or_forged_profiles(
+    tmp_path: Path,
+) -> None:
+    low = build_stage2_deployment_rollout_spec(
+        chunk_frames=4,
+        local_window_frames=8,
+        num_denoising_steps=3,
+    )
+    high = build_stage2_deployment_rollout_spec(
+        chunk_frames=8,
+        local_window_frames=16,
+        num_denoising_steps=5,
+    )
+    noncanonical = _resolved_sweep_config(tmp_path, specs=(high, low))
+    with pytest.raises(ValueError, match="profiles are not canonical"):
+        build_stage2_inference_config_identity(
+            noncanonical,
+            runtime_assets=_runtime_asset_identity(noncanonical),
+        )
+
+    baseline = resolve_stage2_rollout_profile("baseline_c8w16k4s1")
+    dynamic_baseline = build_stage2_deployment_rollout_spec(
+        chunk_frames=8,
+        local_window_frames=16,
+        num_denoising_steps=4,
+    )
+    duplicate = _resolved_sweep_config(
+        tmp_path,
+        specs=(baseline, dynamic_baseline),
+    )
+    with pytest.raises(ValueError, match="repeats a rollout topology"):
+        build_stage2_inference_config_identity(
+            duplicate,
+            runtime_assets=_runtime_asset_identity(duplicate),
+        )
+
+    identity = _sweep_inference_config(tmp_path, specs=(low,))
+    forged = deepcopy(identity)
+    profile_name = forged["resolved"]["profiles"][0]
+    replacement = "0" if profile_name[-1] != "0" else "1"
+    forged["resolved"]["profiles"][0] = profile_name[:-1] + replacement
+    _rehash_config_identity(forged)
+    with pytest.raises(ValueError, match="canonical name mismatch"):
+        validate_stage2_inference_config_identity(forged)
+
+
+def test_dynamic_sweep_profile_trace_and_manifest_roundtrip(tmp_path: Path) -> None:
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=6,
+        local_window_frames=12,
+        num_denoising_steps=3,
+    )
+    inference_config = _sweep_inference_config(tmp_path, specs=(spec,))
+    samples = build_stage2_inference_samples(
+        single_metadata=SINGLE_METADATA,
+        two_action_metadata=TWO_METADATA,
+        seeds=(9,),
+        profiles=(spec.name,),
+        single_row_ids=(0,),
+        two_action_row_ids=(0,),
+    )
+    sample = samples[0]
+    video = _write_video(tmp_path, sample)
+    trace = build_stage2_sample_trace(
+        sample=sample,
+        generation_trace=_generation(sample, profile_spec=spec),
+        output_root=tmp_path,
+        video_path=video,
+        checkpoint=CHECKPOINT,
+        inference_config=inference_config,
+        code_version=CODE_VERSION,
+        probe_fn=lambda _: _probe(sample),
+    )
+    assert trace["profile"] == {
+        **spec.to_dict(),
+        "profile_sha256": canonical_json_sha256(spec.to_dict()),
+    }
+    assert trace["generation"]["episodes"][0]["scheduler_timesteps"] == list(
+        resolve_stage2_shift5_schedule(3).timesteps
+    )
+    assert (
+        validate_stage2_sample_trace(
+            trace,
+            sample=sample,
+            inference_config=inference_config,
+        )
+        == trace
+    )
+    trace_path = write_stage2_sample_trace(tmp_path, sample=sample, trace=trace)
+    metadata = {
+        STAGE2_SINGLE_DATASET: {
+            "path": str(SINGLE_METADATA),
+            "sha256": sha256_file(SINGLE_METADATA),
+        },
+        STAGE2_TWO_ACTION_DATASET: {
+            "path": str(TWO_METADATA),
+            "sha256": sha256_file(TWO_METADATA),
+        },
+    }
+    with pytest.raises(RuntimeError, match="resolved sample matrix"):
+        build_stage2_inference_manifest(
+            output_root=tmp_path,
+            samples=(sample,),
+            traces={sample.sample_key: trace},
+            trace_paths={sample.sample_key: trace_path},
+            checkpoint=CHECKPOINT,
+            inference_config=inference_config,
+            metadata=metadata,
+            code_version=CODE_VERSION,
+        )
+
+    traces = {sample.sample_key: trace}
+    trace_paths = {sample.sample_key: trace_path}
+    second = samples[1]
+    second_video = _write_video(tmp_path, second)
+    second_trace = build_stage2_sample_trace(
+        sample=second,
+        generation_trace=_generation(second, profile_spec=spec),
+        output_root=tmp_path,
+        video_path=second_video,
+        checkpoint=CHECKPOINT,
+        inference_config=inference_config,
+        code_version=CODE_VERSION,
+        probe_fn=lambda _: _probe(second),
+    )
+    traces[second.sample_key] = second_trace
+    trace_paths[second.sample_key] = write_stage2_sample_trace(
+        tmp_path,
+        sample=second,
+        trace=second_trace,
+    )
+    manifest = build_stage2_inference_manifest(
+        output_root=tmp_path,
+        samples=samples,
+        traces=traces,
+        trace_paths=trace_paths,
+        checkpoint=CHECKPOINT,
+        inference_config=inference_config,
+        metadata=metadata,
+        code_version=CODE_VERSION,
+    )
+    assert manifest["seeds"] == [9]
+    assert manifest["profiles"] == [trace["profile"]]
+    assert manifest["samples"][0]["seed"] == 9
+    assert validate_stage2_inference_manifest(manifest) == manifest
+    write_stage2_inference_manifest(tmp_path, manifest=manifest)
+    write_stage2_review_index(tmp_path, manifest=manifest)
+    assert (
+        validate_stage2_inference_manifest_artifacts(
+            tmp_path,
+            manifest,
+            expected_checkpoint=CHECKPOINT,
+            expected_resolved_config=inference_config["resolved"],
+            expected_samples=samples,
+        )
+        == manifest
+    )
+
+    wrong_entry_seed = deepcopy(manifest)
+    wrong_entry_seed["samples"][0]["seed"] = 1
+    body = dict(wrong_entry_seed)
+    body.pop("manifest_sha256")
+    wrong_entry_seed["manifest_sha256"] = canonical_json_sha256(body)
+    with pytest.raises(ValueError, match=r"samples\[0\]\.seed is invalid"):
+        validate_stage2_inference_manifest(wrong_entry_seed)
+
+
 def test_technical_video_gate_rejects_wrong_frames_fps_or_resolution(tmp_path):
     sample = _samples()[0]
     video = _write_video(tmp_path, sample)
@@ -469,6 +834,7 @@ def test_trace_rejects_reused_a_b_noise_and_automatic_quality_metric(tmp_path):
             video_path=video,
             checkpoint=CHECKPOINT,
             inference_config=_inference_config(tmp_path),
+            code_version=CODE_VERSION,
             probe_fn=lambda _: _probe(sample),
         )
 
@@ -480,6 +846,7 @@ def test_trace_rejects_reused_a_b_noise_and_automatic_quality_metric(tmp_path):
         video_path=video,
         checkpoint=CHECKPOINT,
         inference_config=_inference_config(tmp_path),
+        code_version=CODE_VERSION,
         probe_fn=lambda _: _probe(sample),
     )
     trace["quality_metrics"] = {"psnr": 99.0}
@@ -503,6 +870,7 @@ def test_trace_records_one_contiguous_rng_stream_without_prompt_false_positive(
         video_path=video,
         checkpoint=CHECKPOINT,
         inference_config=_inference_config(tmp_path),
+        code_version=CODE_VERSION,
         probe_fn=lambda _: _probe(sample),
     )
     assert trace["generation"]["noise_stream"] == {
@@ -522,6 +890,7 @@ def test_trace_records_one_contiguous_rng_stream_without_prompt_false_positive(
             video_path=video,
             checkpoint=CHECKPOINT,
             inference_config=_inference_config(tmp_path),
+            code_version=CODE_VERSION,
             probe_fn=lambda _: _probe(sample),
         )
 
@@ -550,6 +919,7 @@ def test_compression_and_multi_sink_trace_uses_native_profile_contract(
             tmp_path,
             profiles=(profile_name,),
         ),
+        code_version=CODE_VERSION,
         probe_fn=lambda _: _probe(sample),
     )
     assert validate_stage2_sample_trace(trace, sample=sample) == trace
@@ -582,6 +952,7 @@ def test_complete_56_sample_manifest_and_static_review_index(tmp_path):
             video_path=video,
             checkpoint=CHECKPOINT,
             inference_config=inference_config,
+            code_version=CODE_VERSION,
             probe_fn=lambda _, item=sample: _probe(item),
         )
         trace_path = write_stage2_sample_trace(tmp_path, sample=sample, trace=trace)

@@ -17,8 +17,12 @@ from pipeline.stage2_rollout import (
     Stage2SinkPrefixSnapshot,
     draw_stage2_exit_schedule,
 )
-from utils.stage2_cross_kv import Stage2CrossKVInitState
+from pipeline.stage2_rollout_profile import (
+    build_stage2_deployment_rollout_spec,
+    resolve_stage2_shift5_schedule,
+)
 from utils.stage2_config import load_stage2_config
+from utils.stage2_cross_kv import Stage2CrossKVInitState
 from utils.stage2_inference import tensor_identity_sha256
 from wan_5b.modules.causal_model import (
     CausalWanModel,
@@ -69,16 +73,11 @@ class _FakeScheduler:
 
     def set_timesteps(self, count, *, device, shift):
         assert shift == 5.0
-        if count == 4:
-            timetable = STAGE2_K4_SHIFT5_TIMESTEPS
-            sigmas = [1.0, 0.937, 0.833, 0.624, 0.0]
-        elif count == 2:
-            timetable = STAGE2_K2_SHIFT5_TIMESTEPS
-            sigmas = [1.0, 0.833, 0.0]
-        else:
-            raise AssertionError(count)
-        self.timesteps = torch.tensor(timetable, dtype=torch.float32, device=device)
-        self.sigmas = torch.tensor(sigmas, dtype=torch.float32, device=device)
+        schedule = resolve_stage2_shift5_schedule(count)
+        self.timesteps = torch.tensor(
+            schedule.timesteps, dtype=torch.int64, device=device
+        )
+        self.sigmas = torch.tensor(schedule.sigmas, dtype=torch.float32, device=device)
 
     def step(self, flow, timestep, sample, *, return_dict):
         assert return_dict is False
@@ -249,6 +248,23 @@ def test_real_unipc_native_timetable_and_terminal_fp32_x0_identity(
     assert torch.equal(terminal_step, terminal_x0)
 
 
+@pytest.mark.parametrize("steps", range(1, 9))
+def test_real_unipc_matches_shared_shift5_reference_for_every_deployment_k(steps):
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=8,
+        local_window_frames=16,
+        num_denoising_steps=steps,
+    )
+    pipeline = Stage2RolloutPipeline(_FakeGenerator(), spec=spec)
+    scheduler, timetable = pipeline._new_scheduler(torch.device("cpu"))
+    reference = resolve_stage2_shift5_schedule(steps)
+
+    assert timetable == reference.timesteps
+    assert (
+        tuple(float(value) for value in scheduler.sigmas.tolist()) == reference.sigmas
+    )
+
+
 def test_rollout_contract_is_built_only_from_the_resolved_stage2_config():
     resolved = load_stage2_config("configs/train_i2v_stage2_600cats.yaml")
     schedulers = []
@@ -393,6 +409,29 @@ def test_deployment_only_profiles_cannot_enter_training_rollout(profile_name):
         )
 
 
+def test_dynamic_deployment_profile_is_rejected_before_any_training_forward():
+    generator = _FakeGenerator()
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=6,
+        local_window_frames=12,
+        num_denoising_steps=3,
+    )
+    pipeline, schedulers = _pipeline(generator, spec=spec)
+    initial, noise, conditioning = _inputs(batch=1)
+
+    with pytest.raises(RuntimeError, match="deployment-only"):
+        pipeline.rollout(
+            initial_latent=initial,
+            noise=noise,
+            conditional_dict=conditioning,
+            exit_step=0,
+            requires_grad=True,
+        )
+
+    assert generator.calls == []
+    assert schedulers == []
+
+
 def test_rollout_generates_24_new_latents_and_only_clean_forwards_commit_kv():
     generator = _FakeGenerator()
     pipeline, schedulers = _pipeline(generator)
@@ -425,7 +464,9 @@ def test_rollout_generates_24_new_latents_and_only_clean_forwards_commit_kv():
         [999, 937],
     ]
     assert generator.calls[1]["timestep"] == (999.0,) * 8
-    assert generator.calls[1]["flow_sigma"] == 1.0
+    assert (
+        generator.calls[1]["flow_sigma"] == resolve_stage2_shift5_schedule(4).sigmas[0]
+    )
     assert generator.calls[1]["flow_sigma"] != 999.0 / 1000.0
 
     # One sink preload, then three noisy/exit forwards and one clean commit per chunk.
@@ -636,6 +677,58 @@ def test_named_s1_profiles_share_one_full_deploy_path(
     assert generator.model.global_sink_size == 0
 
 
+def test_dynamic_c6_w12_k3_profile_runs_the_full_deployment_path():
+    generator = _FakeGenerator()
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=6,
+        local_window_frames=12,
+        num_denoising_steps=3,
+    )
+    pipeline, schedulers = _pipeline(generator, spec=spec)
+    initial, noise, conditioning = _inputs(batch=1)
+
+    result, state = pipeline.generate_full_episode(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning,
+    )
+
+    assert result.latents.shape == noise.shape
+    assert result.cache_audit["profile"] == spec.to_dict()
+    assert result.cache_audit["generator_forward_calls"] == 17
+    assert result.cache_audit["capacity_frames"] == 13
+    assert len(schedulers) == 4
+    assert all(
+        trace["timesteps"] == list(resolve_stage2_shift5_schedule(3).timesteps)
+        for trace in result.chunk_trace
+    )
+    assert state.self_kv[0]["k"].shape[1] == 13 * FRAME_TOKENS
+    assert state.episode_complete is True
+
+
+def test_dynamic_k1_profile_runs_one_noisy_forward_per_chunk():
+    generator = _FakeGenerator()
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=8,
+        local_window_frames=16,
+        num_denoising_steps=1,
+    )
+    pipeline, schedulers = _pipeline(generator, spec=spec)
+    initial, noise, conditioning = _inputs(batch=1)
+
+    result, _ = pipeline.generate_full_episode(
+        initial_latent=initial,
+        noise=noise,
+        conditional_dict=conditioning,
+    )
+
+    assert result.scheduler_timesteps == (999,)
+    assert result.cache_audit["solver_update_calls"] == 0
+    assert result.cache_audit["generator_forward_calls"] == 7
+    assert len(generator.calls) == 7
+    assert len(schedulers) == 3
+
+
 @pytest.mark.parametrize(
     ("target_profile", "sink_frames"),
     [("c8w16k4s4", 4), ("c8w16k4s8", 8)],
@@ -790,6 +883,22 @@ def test_attention_runtime_is_restored_when_scheduler_validation_fails():
         generator.model.sink_size,
         generator.model.global_sink_size,
     ) == original_runtime
+
+
+def test_scheduler_fp32_sigma_bits_must_match_the_shared_reference():
+    class _BadSigmaScheduler(_FakeScheduler):
+        def set_timesteps(self, count, *, device, shift):
+            super().set_timesteps(count, device=device, shift=shift)
+            self.sigmas[1] = torch.nextafter(
+                self.sigmas[1], torch.tensor(0.0, dtype=torch.float32)
+            )
+
+    pipeline = Stage2RolloutPipeline(
+        _FakeGenerator(),
+        scheduler_factory=_BadSigmaScheduler,
+    )
+    with pytest.raises(RuntimeError, match="sigma schedule drifted"):
+        pipeline._new_scheduler(torch.device("cpu"))
 
 
 def test_rollout_rejects_scheduler_instance_reuse_between_chunks():

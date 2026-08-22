@@ -8,9 +8,10 @@ shared by single- and two-action inference.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -162,8 +163,6 @@ def clear_stage2_vae_cache(vae: Any) -> bool:
 class Stage2DecodedEpisode:
     decode_input: torch.Tensor
     video: torch.Tensor
-    decode_input_sha256: tuple[str, ...]
-    video_sha256: tuple[str, ...]
     vae_cache_cleared: bool
 
 
@@ -224,8 +223,6 @@ def decode_stage2_episode(
     return Stage2DecodedEpisode(
         decode_input=decode_input,
         video=video,
-        decode_input_sha256=_per_sample_hashes(decode_input),
-        video_sha256=_per_sample_hashes(video),
         vae_cache_cleared=cache_cleared,
     )
 

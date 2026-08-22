@@ -9,13 +9,13 @@ an in-memory runtime object.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from utils.stage1_io import aggregate_file_hash, canonical_json_sha256
@@ -25,6 +25,7 @@ from utils.stage2_checkpoint import (
     validate_stage2_provenance,
 )
 from utils.stage2_inference_config import ResolvedStage2InferenceConfig
+from utils.stage2_inference_sweep_config import ResolvedStage2InferenceSweepConfig
 
 STAGE2_RUNTIME_ASSETS_SCHEMA = "longlive_stage2_inference_runtime_assets/v1"
 STAGE2_RUNTIME_ASSET_IDENTITY_SCHEMA = (
@@ -460,13 +461,16 @@ def _compact_asset(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def build_stage2_runtime_assets(
-    config: ResolvedStage2InferenceConfig,
+    config: ResolvedStage2InferenceConfig | ResolvedStage2InferenceSweepConfig,
     *,
     validate_generator_manifest_fn: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Cryptographically authenticate every live inference asset on rank 0."""
 
-    if not isinstance(config, ResolvedStage2InferenceConfig):
+    if not isinstance(
+        config,
+        (ResolvedStage2InferenceConfig, ResolvedStage2InferenceSweepConfig),
+    ):
         raise TypeError("Stage-2 runtime assets require a resolved inference config")
     manifest, provenance, checkpoint_directory = _checkpoint_provenance_snapshot(
         config.stage2_checkpoint

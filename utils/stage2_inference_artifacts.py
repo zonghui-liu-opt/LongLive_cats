@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import struct
 from collections.abc import Callable, Mapping, Sequence
 from html import escape
 from itertools import pairwise
@@ -13,13 +14,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
-from pipeline.stage2_rollout import (
-    STAGE2_K2_SHIFT5_TIMESTEPS,
-    STAGE2_K4_SHIFT5_TIMESTEPS,
-)
 from pipeline.stage2_rollout_profile import (
+    STAGE2_ROLLOUT_PROFILE_NAMES,
     Stage2RolloutSpec,
     resolve_stage2_rollout_profile,
+    resolve_stage2_shift5_schedule,
 )
 from utils.stage1_causal_validation import probe_video
 from utils.stage1_io import (
@@ -44,8 +43,13 @@ from utils.stage2_inference_config import (
     STAGE2_INFERENCE_CONFIG_SCHEMA,
     ResolvedStage2InferenceConfig,
 )
+from utils.stage2_inference_sweep_config import (
+    STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA,
+    STAGE2_INFERENCE_SWEEP_MAX_PROFILES,
+    ResolvedStage2InferenceSweepConfig,
+)
 
-STAGE2_SAMPLE_TRACE_SCHEMA = "longlive_stage2_sample_trace/v1"
+STAGE2_SAMPLE_TRACE_SCHEMA = "longlive_stage2_sample_trace/v2"
 STAGE2_INFERENCE_MANIFEST_SCHEMA = "longlive_stage2_inference_manifest/v2"
 STAGE2_INFERENCE_CONFIG_IDENTITY_SCHEMA = "longlive_stage2_inference_config_identity/v2"
 STAGE2_INFERENCE_MANIFEST_NAME = "manifest.json"
@@ -85,6 +89,15 @@ _RESOLVED_INFERENCE_CONFIG_KEYS = {
     "fps",
     "merge_ema_lora",
     "batch_size_per_device",
+}
+_RESOLVED_INFERENCE_SWEEP_CONFIG_KEYS = {
+    *_RESOLVED_INFERENCE_CONFIG_KEYS,
+    "base_config_path",
+    "base_config_sha256",
+    "evaluation_mode",
+    "single_row_ids",
+    "two_action_row_ids",
+    "profile_set_sha256",
 }
 _ROLLOUT_RESULT_KEYS = {
     "exit_step",
@@ -169,6 +182,117 @@ def _plain_int(value: Any, label: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _validate_code_version(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != {"stage2_source_sha256"}:
+        raise ValueError("Stage-2 inference code_version schema mismatch")
+    return {
+        "stage2_source_sha256": _sha256(
+            value["stage2_source_sha256"],
+            "code_version.stage2_source_sha256",
+        )
+    }
+
+
+def _rollout_topology_key(spec: Stage2RolloutSpec) -> tuple[Any, ...]:
+    return (
+        int(spec.generated_episode_frames),
+        int(spec.chunk_frames),
+        int(spec.local_window_frames),
+        int(spec.global_sink_frames),
+        int(spec.num_denoising_steps),
+        str(spec.solver),
+        float(spec.timestep_shift),
+    )
+
+
+def _canonical_rollout_key(spec: Stage2RolloutSpec) -> tuple[Any, ...]:
+    return (*_rollout_topology_key(spec), spec.name)
+
+
+def _canonical_int_list(
+    value: Any,
+    label: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> list[int]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label} must be a non-empty list")
+    if any(
+        isinstance(item, bool)
+        or not isinstance(item, int)
+        or not minimum <= item <= maximum
+        for item in value
+    ):
+        raise ValueError(
+            f"{label} must contain plain integers in [{minimum}, {maximum}]"
+        )
+    if value != sorted(value) or len(value) != len(set(value)):
+        raise ValueError(f"{label} must be sorted and unique")
+    return list(value)
+
+
+def _validate_sweep_resolved_config(resolved: Mapping[str, Any]) -> None:
+    _sha256(resolved.get("base_config_sha256"), "config.base_config_sha256")
+    profiles = resolved.get("profiles")
+    if (
+        not isinstance(profiles, list)
+        or not profiles
+        or len(profiles) > STAGE2_INFERENCE_SWEEP_MAX_PROFILES
+        or any(not isinstance(item, str) for item in profiles)
+        or len(profiles) != len(set(profiles))
+    ):
+        raise ValueError("Stage-2 resolved inference sweep profiles are invalid")
+    specs = tuple(resolve_stage2_rollout_profile(name) for name in profiles)
+    if any(spec.global_sink_frames != 1 for spec in specs):
+        raise ValueError("Stage-2 inference sweep profiles must all use S=1")
+    if specs != tuple(sorted(specs, key=_canonical_rollout_key)):
+        raise ValueError("Stage-2 inference sweep profiles are not canonical")
+    topology_keys = [_rollout_topology_key(spec) for spec in specs]
+    if len(topology_keys) != len(set(topology_keys)):
+        raise ValueError("Stage-2 inference sweep repeats a rollout topology")
+    profile_set_sha256 = _sha256(
+        resolved.get("profile_set_sha256"),
+        "config.profile_set_sha256",
+    )
+    expected_profile_set_sha256 = canonical_json_sha256(
+        [spec.to_dict() for spec in specs]
+    )
+    if profile_set_sha256 != expected_profile_set_sha256:
+        raise RuntimeError("Stage-2 inference sweep profile set SHA-256 mismatch")
+
+    seeds = _canonical_int_list(
+        resolved.get("seeds"),
+        "Stage-2 resolved inference sweep seeds",
+        minimum=0,
+        maximum=(1 << 63) - 1,
+    )
+    single_row_ids = _canonical_int_list(
+        resolved.get("single_row_ids"),
+        "Stage-2 resolved inference sweep single row ids",
+        minimum=0,
+        maximum=5,
+    )
+    two_action_row_ids = _canonical_int_list(
+        resolved.get("two_action_row_ids"),
+        "Stage-2 resolved inference sweep two-action row ids",
+        minimum=0,
+        maximum=7,
+    )
+    evaluation_mode = resolved.get("evaluation_mode")
+    if evaluation_mode not in {"formal", "quick"}:
+        raise ValueError("Stage-2 inference sweep evaluation mode is invalid")
+    if evaluation_mode == "formal" and (
+        seeds != [1, 2, 3, 4]
+        or single_row_ids != list(range(6))
+        or two_action_row_ids != list(range(8))
+    ):
+        raise ValueError(
+            "formal Stage-2 inference sweep requires seeds 1..4, "
+            "single rows 0..5, and two-action rows 0..7"
+        )
+
+
 def validate_stage2_inference_config_identity(
     identity: Any,
 ) -> dict[str, Any]:
@@ -187,15 +311,39 @@ def validate_stage2_inference_config_identity(
         raise ValueError("Stage-2 inference config identity schema mismatch")
     if identity.get("schema") != STAGE2_INFERENCE_CONFIG_IDENTITY_SCHEMA:
         raise ValueError("Stage-2 inference config identity version mismatch")
-    resolved = identity.get("resolved")
-    if not isinstance(resolved, Mapping) or set(resolved) != (
-        _RESOLVED_INFERENCE_CONFIG_KEYS
-    ):
-        raise ValueError("Stage-2 resolved inference config schema mismatch")
-    resolved = dict(resolved)
-    if resolved.get("schema") != STAGE2_INFERENCE_CONFIG_SCHEMA:
+    raw_resolved = identity.get("resolved")
+    if not isinstance(raw_resolved, Mapping):
+        raise TypeError("Stage-2 resolved inference config must be a mapping")
+    resolved = dict(raw_resolved)
+    resolved_schema = resolved.get("schema")
+    if resolved_schema == STAGE2_INFERENCE_CONFIG_SCHEMA:
+        if set(resolved) != _RESOLVED_INFERENCE_CONFIG_KEYS:
+            raise ValueError("Stage-2 resolved inference config schema mismatch")
+        profiles = resolved.get("profiles")
+        if (
+            not isinstance(profiles, list)
+            or not profiles
+            or any(not isinstance(item, str) for item in profiles)
+            or len(profiles) != len(set(profiles))
+        ):
+            raise ValueError("Stage-2 resolved inference profiles are invalid")
+        if any(profile not in STAGE2_ROLLOUT_PROFILE_NAMES for profile in profiles):
+            raise ValueError(
+                "formal Stage-2 resolved config requires a frozen named profile"
+            )
+        for profile in profiles:
+            resolve_stage2_rollout_profile(profile)
+        seeds = resolved.get("seeds")
+        if seeds != [1, 2, 3, 4] or any(type(seed) is not int for seed in seeds):
+            raise ValueError("Stage-2 resolved inference seeds are invalid")
+    elif resolved_schema == STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA:
+        if set(resolved) != _RESOLVED_INFERENCE_SWEEP_CONFIG_KEYS:
+            raise ValueError("Stage-2 resolved inference sweep config schema mismatch")
+        _validate_sweep_resolved_config(resolved)
+    else:
         raise ValueError("Stage-2 resolved inference config version mismatch")
-    for field in (
+
+    path_fields = [
         "stage2_checkpoint",
         "architecture_root",
         "t5_checkpoint",
@@ -205,7 +353,10 @@ def validate_stage2_inference_config_identity(
         "single_metadata",
         "two_action_metadata",
         "output_root",
-    ):
+    ]
+    if resolved_schema == STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA:
+        path_fields.append("base_config_path")
+    for field in path_fields:
         value = resolved.get(field)
         if (
             not isinstance(value, str)
@@ -216,19 +367,6 @@ def validate_stage2_inference_config_identity(
             raise ValueError(
                 f"Stage-2 resolved inference config {field} must be an absolute path"
             )
-    profiles = resolved.get("profiles")
-    if (
-        not isinstance(profiles, list)
-        or not profiles
-        or any(not isinstance(item, str) for item in profiles)
-        or len(profiles) != len(set(profiles))
-    ):
-        raise ValueError("Stage-2 resolved inference profiles are invalid")
-    for profile in profiles:
-        resolve_stage2_rollout_profile(profile)
-    seeds = resolved.get("seeds")
-    if seeds != [1, 2, 3, 4] or any(type(seed) is not int for seed in seeds):
-        raise ValueError("Stage-2 resolved inference seeds are invalid")
     if resolved.get("dtype") != "bfloat16":
         raise ValueError("Stage-2 resolved inference dtype is invalid")
     cfg_scale = resolved.get("cfg_scale")
@@ -321,13 +459,16 @@ def validate_stage2_inference_config_identity(
 
 
 def build_stage2_inference_config_identity(
-    config: ResolvedStage2InferenceConfig,
+    config: ResolvedStage2InferenceConfig | ResolvedStage2InferenceSweepConfig,
     *,
     runtime_assets: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Create a canonical, self-verifying identity for a resolved launch."""
 
-    if not isinstance(config, ResolvedStage2InferenceConfig):
+    if not isinstance(
+        config,
+        (ResolvedStage2InferenceConfig, ResolvedStage2InferenceSweepConfig),
+    ):
         raise TypeError(
             "Stage-2 inference config identity requires a resolved strict config"
         )
@@ -395,11 +536,7 @@ def _validate_checkpoint_identity(checkpoint: Any) -> dict[str, Any]:
 
 
 def _expected_timetable(steps: int) -> tuple[int, ...]:
-    if steps == 2:
-        return STAGE2_K2_SHIFT5_TIMESTEPS
-    if steps == 4:
-        return STAGE2_K4_SHIFT5_TIMESTEPS
-    raise ValueError(f"unsupported Stage-2 deployment denoising steps: {steps}")
+    return resolve_stage2_shift5_schedule(steps).timesteps
 
 
 def _frame_tokens(sample: Stage2InferenceSample) -> int:
@@ -436,6 +573,47 @@ def _expected_frames(sample: Stage2InferenceSample) -> int:
     if sample.dataset == STAGE2_TWO_ACTION_DATASET:
         return 2 * STAGE2_OUTPUT_PIXEL_FRAMES_PER_EPISODE
     raise ValueError(f"unknown Stage-2 inference dataset {sample.dataset!r}")
+
+
+def _validate_sample_config_scope(
+    sample: Stage2InferenceSample,
+    resolved_config: Mapping[str, Any],
+) -> None:
+    if sample.profile not in resolved_config["profiles"]:
+        raise RuntimeError("Stage-2 sample trace profile is absent from its config")
+    if resolved_config["schema"] != STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA:
+        return
+    if sample.seed not in resolved_config["seeds"] or isinstance(sample.seed, bool):
+        raise RuntimeError("Stage-2 sweep sample seed is absent from its config")
+    row_field = (
+        "single_row_ids"
+        if sample.dataset == STAGE2_SINGLE_DATASET
+        else "two_action_row_ids"
+    )
+    if sample.row_id not in resolved_config[row_field] or isinstance(
+        sample.row_id, bool
+    ):
+        raise RuntimeError("Stage-2 sweep sample row is absent from its config")
+
+
+def _expected_sample_coordinates(
+    resolved_config: Mapping[str, Any],
+) -> list[tuple[str, str, int, int]]:
+    if resolved_config["schema"] == STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA:
+        single_rows = resolved_config["single_row_ids"]
+        two_action_rows = resolved_config["two_action_row_ids"]
+    else:
+        single_rows = list(range(6))
+        two_action_rows = list(range(8))
+    coordinates: list[tuple[str, str, int, int]] = []
+    for profile in resolved_config["profiles"]:
+        for row_id in single_rows:
+            for seed in resolved_config["seeds"]:
+                coordinates.append((profile, STAGE2_SINGLE_DATASET, row_id, seed))
+        for row_id in two_action_rows:
+            for seed in resolved_config["seeds"]:
+                coordinates.append((profile, STAGE2_TWO_ACTION_DATASET, row_id, seed))
+    return coordinates
 
 
 def validate_stage2_video_artifact(
@@ -558,20 +736,26 @@ def _validate_generation_trace(
     for episode_index, episode in enumerate(episodes):
         if not isinstance(episode, Mapping) or set(episode) != _ROLLOUT_RESULT_KEYS:
             raise ValueError("Stage-2 rollout result trace schema mismatch")
+        actual_profile = profile
+        if profile.global_sink_frames > 1 and episode_index == 0:
+            actual_profile = resolve_stage2_rollout_profile("baseline_c8w16k4s1")
         if episode.get("requires_grad") is not False:
             raise RuntimeError("Stage-2 deployment episodes must run without gradients")
         if episode.get("rollout_mode") != "full_denoising":
             raise RuntimeError("Stage-2 deployment episode must use full_denoising")
-        if episode.get("exit_step") != profile.num_denoising_steps - 1:
+        if episode.get("exit_step") != actual_profile.num_denoising_steps - 1:
             raise RuntimeError("Stage-2 deployment episode did not execute full K")
         timetable = episode.get("scheduler_timesteps")
-        expected_timetable = list(_expected_timetable(profile.num_denoising_steps))
+        reference_schedule = resolve_stage2_shift5_schedule(
+            actual_profile.num_denoising_steps
+        )
+        expected_timetable = list(reference_schedule.timesteps)
         if timetable != expected_timetable:
             raise RuntimeError("Stage-2 deployment UniPC timetable mismatch")
         sigmas = episode.get("scheduler_sigmas")
         if (
             not isinstance(sigmas, list)
-            or len(sigmas) != profile.num_denoising_steps + 1
+            or len(sigmas) != actual_profile.num_denoising_steps + 1
             or any(
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
@@ -583,9 +767,11 @@ def _validate_generation_trace(
             or abs(float(sigmas[-1])) > 1.0e-12
         ):
             raise RuntimeError("Stage-2 deployment UniPC sigma schedule is invalid")
-        actual_profile = profile
-        if profile.global_sink_frames > 1 and episode_index == 0:
-            actual_profile = resolve_stage2_rollout_profile("baseline_c8w16k4s1")
+        sigma_fp32_bits = tuple(
+            struct.pack(">f", float(value)).hex() for value in sigmas
+        )
+        if sigma_fp32_bits != reference_schedule.sigma_fp32_bits:
+            raise RuntimeError("Stage-2 deployment UniPC sigma schedule drifted")
         chunks = actual_profile.num_chunks
         if episode.get("chunk_timesteps") != [expected_timetable] * chunks:
             raise RuntimeError("Stage-2 chunk timesteps differ from the fresh schedule")
@@ -784,6 +970,7 @@ def build_stage2_sample_trace(
     video_path: str | os.PathLike[str],
     checkpoint: Mapping[str, Any],
     inference_config: Mapping[str, Any],
+    code_version: Mapping[str, Any],
     probe_fn: Callable[[str | os.PathLike[str]], Mapping[str, Any]] = probe_video,
 ) -> dict[str, Any]:
     """Bind one technically validated video to all deterministic inputs."""
@@ -792,11 +979,11 @@ def build_stage2_sample_trace(
     _validate_generation_trace(sample, generation_trace, profile)
     checkpoint_identity = _validate_checkpoint_identity(checkpoint)
     config_identity = validate_stage2_inference_config_identity(inference_config)
+    source_identity = _validate_code_version(code_version)
     root = Path(output_root)
     if root.expanduser().resolve() != Path(config_identity["resolved"]["output_root"]):
         raise RuntimeError("Stage-2 sample trace output root differs from its config")
-    if sample.profile not in config_identity["resolved"]["profiles"]:
-        raise RuntimeError("Stage-2 sample trace profile is absent from its config")
+    _validate_sample_config_scope(sample, config_identity["resolved"])
     path = Path(video_path)
     relative_video = _relative_artifact(
         root,
@@ -813,6 +1000,7 @@ def build_stage2_sample_trace(
         "raw_prompt_sha256": [_raw_prompt_sha256(item) for item in sample.prompts],
         "checkpoint": checkpoint_identity,
         "inference_config": config_identity,
+        "code_version": source_identity,
         "profile": profile_value,
         "generation": dict(generation_trace),
         "output": {
@@ -830,6 +1018,7 @@ def validate_stage2_sample_trace(
     *,
     sample: Stage2InferenceSample,
     inference_config: Mapping[str, Any] | None = None,
+    code_version: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected_keys = {
         "schema",
@@ -838,6 +1027,7 @@ def validate_stage2_sample_trace(
         "raw_prompt_sha256",
         "checkpoint",
         "inference_config",
+        "code_version",
         "profile",
         "generation",
         "output",
@@ -885,6 +1075,12 @@ def validate_stage2_sample_trace(
         validate_stage2_inference_config_identity(inference_config)
     ):
         raise RuntimeError("Stage-2 sample trace inference config mismatch")
+    source_identity = _validate_code_version(trace.get("code_version"))
+    if code_version is not None and source_identity != _validate_code_version(
+        code_version
+    ):
+        raise RuntimeError("Stage-2 sample trace code version mismatch")
+    _validate_sample_config_scope(sample, config_identity["resolved"])
     _validate_generation_trace(sample, trace["generation"], profile)
     output = trace.get("output")
     if not isinstance(output, Mapping) or set(output) != {
@@ -1088,12 +1284,7 @@ def validate_stage2_inference_manifest(
         raise RuntimeError(
             f"Stage-2 manifest contains a forbidden quality metric key: {forbidden}"
         )
-    code_version = manifest.get("code_version")
-    if not isinstance(code_version, Mapping) or set(code_version) != {
-        "stage2_source_sha256"
-    }:
-        raise ValueError("Stage-2 inference code_version schema mismatch")
-    _sha256(code_version["stage2_source_sha256"], "code_version.stage2_source_sha256")
+    _validate_code_version(manifest.get("code_version"))
     _validate_checkpoint_identity(manifest.get("checkpoint"))
     config_identity = validate_stage2_inference_config_identity(
         manifest.get("inference_config")
@@ -1115,9 +1306,10 @@ def validate_stage2_inference_manifest(
             raise ValueError(f"Stage-2 {dataset} metadata path is invalid")
         _sha256(identity["sha256"], f"metadata.{dataset}.sha256")
     seeds = manifest.get("seeds")
+    expected_seeds = config_identity["resolved"]["seeds"]
     if (
         not isinstance(seeds, list)
-        or seeds != [1, 2, 3, 4]
+        or seeds != expected_seeds
         or any(type(seed) is not int for seed in seeds)
     ):
         raise ValueError("Stage-2 inference manifest seed set mismatch")
@@ -1136,15 +1328,23 @@ def validate_stage2_inference_manifest(
         profile_names.append(spec.name)
     if len(profile_names) != len(set(profile_names)):
         raise RuntimeError("Stage-2 inference manifest repeats a profile")
+    if profile_names != config_identity["resolved"]["profiles"]:
+        raise RuntimeError("Stage-2 inference manifest profiles differ from its config")
+    expected_coordinates = _expected_sample_coordinates(config_identity["resolved"])
     count = _plain_int(
         manifest.get("expected_sample_count"),
         "expected_sample_count",
         minimum=1,
     )
+    if count != len(expected_coordinates):
+        raise RuntimeError(
+            "Stage-2 inference manifest count differs from its resolved sample matrix"
+        )
     entries = manifest.get("samples")
     if not isinstance(entries, list) or len(entries) != count:
         raise RuntimeError("Stage-2 inference manifest sample count mismatch")
     keys: list[str] = []
+    coordinates: list[tuple[str, str, int, int]] = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, Mapping) or set(entry) != {
             "sample_key",
@@ -1162,11 +1362,38 @@ def validate_stage2_inference_manifest(
         keys.append(sample_key)
         if entry["dataset"] not in {STAGE2_SINGLE_DATASET, STAGE2_TWO_ACTION_DATASET}:
             raise ValueError(f"Stage-2 manifest samples[{index}].dataset is invalid")
-        _plain_int(entry["row_id"], f"samples[{index}].row_id")
-        if entry["seed"] not in {1, 2, 3, 4} or isinstance(entry["seed"], bool):
+        row_id = _plain_int(entry["row_id"], f"samples[{index}].row_id")
+        if entry["seed"] not in expected_seeds or isinstance(entry["seed"], bool):
             raise ValueError(f"Stage-2 manifest samples[{index}].seed is invalid")
+        if config_identity["resolved"]["schema"] == (
+            STAGE2_INFERENCE_SWEEP_CONFIG_SCHEMA
+        ):
+            row_field = (
+                "single_row_ids"
+                if entry["dataset"] == STAGE2_SINGLE_DATASET
+                else "two_action_row_ids"
+            )
+            if row_id not in config_identity["resolved"][row_field]:
+                raise ValueError(
+                    f"Stage-2 manifest samples[{index}].row_id is outside its config"
+                )
         if entry["profile"] not in profile_names:
             raise RuntimeError(f"Stage-2 manifest samples[{index}] profile is unknown")
+        coordinate = (
+            entry["profile"],
+            entry["dataset"],
+            row_id,
+            entry["seed"],
+        )
+        coordinates.append(coordinate)
+        expected_sample_key = (
+            f"{entry['dataset']}/row{row_id:03d}/"
+            f"seed{entry['seed']:04d}/{entry['profile']}"
+        )
+        if sample_key != expected_sample_key:
+            raise RuntimeError(
+                f"Stage-2 manifest samples[{index}].sample_key is non-canonical"
+            )
         video = entry["video"]
         if not isinstance(video, Mapping) or set(video) != {
             "relative_path",
@@ -1219,6 +1446,10 @@ def validate_stage2_inference_manifest(
         )
     if len(keys) != len(set(keys)):
         raise RuntimeError("Stage-2 inference manifest repeats a sample key")
+    if coordinates != expected_coordinates:
+        raise RuntimeError(
+            "Stage-2 inference manifest samples differ from its resolved Cartesian plan"
+        )
     without_hash = dict(manifest)
     claimed = without_hash.pop("manifest_sha256")
     _sha256(claimed, "manifest_sha256")
@@ -1316,6 +1547,7 @@ def validate_stage2_inference_manifest_artifacts(
             trace,
             sample=sample,
             inference_config=config_identity,
+            code_version=validated["code_version"],
         )
         if checked_trace["checkpoint"] != checkpoint_identity:
             raise RuntimeError("Stage-2 trace checkpoint differs from final manifest")
@@ -1389,15 +1621,14 @@ def build_stage2_inference_manifest(
     if root != Path(config_identity["resolved"]["output_root"]):
         raise RuntimeError("Stage-2 manifest output root differs from its config")
     metadata_identity = _validate_metadata_identity(metadata)
-    if set(code_version) != {"stage2_source_sha256"}:
-        raise ValueError("Stage-2 inference code_version schema mismatch")
-    _sha256(code_version["stage2_source_sha256"], "code_version.stage2_source_sha256")
+    source_identity = _validate_code_version(code_version)
     entries = []
     for sample in samples:
         trace = validate_stage2_sample_trace(
             traces[sample.sample_key],
             sample=sample,
             inference_config=config_identity,
+            code_version=source_identity,
         )
         if trace["checkpoint"] != checkpoint_identity:
             raise RuntimeError(
@@ -1421,13 +1652,13 @@ def build_stage2_inference_manifest(
     payload = {
         "schema": STAGE2_INFERENCE_MANIFEST_SCHEMA,
         "status": "complete",
-        "code_version": dict(code_version),
+        "code_version": source_identity,
         "checkpoint": checkpoint_identity,
         "inference_config": config_identity,
         "metadata": {
             key: dict(value) for key, value in sorted(metadata_identity.items())
         },
-        "seeds": [1, 2, 3, 4],
+        "seeds": list(config_identity["resolved"]["seeds"]),
         "profiles": profiles,
         "expected_sample_count": len(samples),
         "samples": entries,

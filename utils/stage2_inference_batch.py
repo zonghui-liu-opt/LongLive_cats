@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import re
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 from utils.stage1_causal_validation import load_causal_testset_records
 from utils.stage1_continuation_validation import load_continuation_metadata
@@ -101,6 +101,40 @@ def _formal_seeds(values: Sequence[int]) -> tuple[int, ...]:
     return seeds
 
 
+def _sweep_seeds(values: Sequence[int]) -> tuple[int, ...]:
+    seeds = tuple(values)
+    if not seeds:
+        raise ValueError("Stage-2 sweep requires at least one seed")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value >= 2**63
+        for value in seeds
+    ):
+        raise TypeError("Stage-2 sweep seeds must be plain integers in [0, 2**63)")
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("Stage-2 sweep seeds must be unique")
+    return seeds
+
+
+def _selected_records(records, row_ids: Sequence[int], *, label: str):
+    selected_ids = tuple(row_ids)
+    if not selected_ids:
+        raise ValueError(f"Stage-2 sweep {label} row ids must be non-empty")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) for value in selected_ids
+    ):
+        raise TypeError(f"Stage-2 sweep {label} row ids must be plain integers")
+    if len(selected_ids) != len(set(selected_ids)):
+        raise ValueError(f"Stage-2 sweep {label} row ids must be unique")
+    by_id = {record.row_id: record for record in records}
+    unknown = sorted(set(selected_ids) - set(by_id))
+    if unknown:
+        raise ValueError(f"Stage-2 sweep {label} row ids are unknown: {unknown}")
+    return tuple(by_id[row_id] for row_id in selected_ids)
+
+
 def _profile_names(values: Sequence[str]) -> tuple[str, ...]:
     names = tuple(values)
     if not names:
@@ -131,10 +165,17 @@ def build_stage2_inference_samples(
     two_action_metadata: str | os.PathLike[str],
     seeds: Sequence[int] = STAGE2_INFERENCE_SEEDS,
     profiles: Sequence[str] = (STAGE2_BASELINE_PROFILE,),
+    single_row_ids: Sequence[int] | None = None,
+    two_action_row_ids: Sequence[int] | None = None,
 ) -> tuple[Stage2InferenceSample, ...]:
     """Build the exact dataset x row x seed x profile Cartesian product."""
 
-    seed_values = _formal_seeds(seeds)
+    if (single_row_ids is None) is not (two_action_row_ids is None):
+        raise ValueError(
+            "Stage-2 sweep row selections must provide both single and two-action ids"
+        )
+    is_sweep = single_row_ids is not None
+    seed_values = _sweep_seeds(seeds) if is_sweep else _formal_seeds(seeds)
     profile_values = _profile_names(profiles)
     singles = load_causal_testset_records(single_metadata)
     doubles = load_continuation_metadata(two_action_metadata)
@@ -145,6 +186,13 @@ def build_stage2_inference_samples(
     if len(doubles) != 8:
         raise RuntimeError(
             "Stage-2 two-action metadata must contain 8 rows, " f"got {len(doubles)}"
+        )
+    if is_sweep:
+        singles = _selected_records(singles, single_row_ids, label="single-action")
+        doubles = _selected_records(
+            doubles,
+            two_action_row_ids,
+            label="two-action",
         )
 
     samples: list[Stage2InferenceSample] = []
@@ -197,7 +245,7 @@ def build_stage2_inference_samples(
         set(trace_paths)
     ):
         raise RuntimeError("Stage-2 batch planner produced colliding artifact paths")
-    expected = len(profile_values) * STAGE2_BASELINE_TOTAL_SAMPLES
+    expected = len(profile_values) * len(seed_values) * (len(singles) + len(doubles))
     if len(samples) != expected:
         raise AssertionError(
             f"Stage-2 batch planner expected {expected} samples, got {len(samples)}"

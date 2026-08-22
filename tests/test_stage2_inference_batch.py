@@ -76,6 +76,54 @@ def test_profile_is_part_of_every_sample_and_artifact_key():
     assert len({sample.output_relative_path for sample in samples}) == 112
 
 
+def test_sweep_plan_selects_rows_and_seeds_without_weakening_formal_defaults():
+    samples = build_stage2_inference_samples(
+        single_metadata=SINGLE_METADATA,
+        two_action_metadata=TWO_METADATA,
+        profiles=(STAGE2_BASELINE_PROFILE,),
+        seeds=(7, 11),
+        single_row_ids=(1, 4),
+        two_action_row_ids=(0, 6),
+    )
+    assert len(samples) == 8
+    assert {sample.seed for sample in samples} == {7, 11}
+    assert {
+        sample.row_id for sample in samples if sample.dataset == STAGE2_SINGLE_DATASET
+    } == {1, 4}
+    assert {
+        sample.row_id
+        for sample in samples
+        if sample.dataset == STAGE2_TWO_ACTION_DATASET
+    } == {0, 6}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"single_row_ids": (0,)}, "provide both"),
+        (
+            {"single_row_ids": (0,), "two_action_row_ids": (99,)},
+            "unknown",
+        ),
+        (
+            {
+                "seeds": (1, 1),
+                "single_row_ids": (0,),
+                "two_action_row_ids": (0,),
+            },
+            "unique",
+        ),
+    ],
+)
+def test_sweep_plan_rejects_ambiguous_selection(kwargs, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        build_stage2_inference_samples(
+            single_metadata=SINGLE_METADATA,
+            two_action_metadata=TWO_METADATA,
+            **kwargs,
+        )
+
+
 def test_rank_stride_sharding_has_no_padding_drop_or_collision():
     samples = _samples()
     shards = [

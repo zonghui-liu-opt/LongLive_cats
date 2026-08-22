@@ -7,7 +7,9 @@ import pytest
 from pipeline.stage2_rollout_profile import (
     STAGE2_ROLLOUT_PROFILE_NAMES,
     Stage2RolloutSpec,
+    build_stage2_deployment_rollout_spec,
     resolve_stage2_rollout_profile,
+    resolve_stage2_shift5_schedule,
 )
 
 
@@ -76,6 +78,122 @@ def test_rollout_profile_catalog_is_exact_and_immutable():
     spec = resolve_stage2_rollout_profile("baseline_c8w16k4s1")
     with pytest.raises(FrozenInstanceError):
         spec.chunk_frames = 4
+
+
+def test_named_profile_serialization_contract_remains_frozen():
+    assert resolve_stage2_rollout_profile("baseline_c8w16k4s1").to_dict() == {
+        "name": "baseline_c8w16k4s1",
+        "generated_episode_frames": 24,
+        "chunk_frames": 8,
+        "num_chunks": 3,
+        "local_window_frames": 16,
+        "history_frames": 8,
+        "global_sink_frames": 1,
+        "physical_kv_capacity_frames": 17,
+        "num_denoising_steps": 4,
+        "solver": "unipc",
+        "timestep_shift": 5.0,
+        "fresh_deploy_dit_calls": 16,
+        "training_allowed": True,
+        "fresh_episode_allowed": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("steps", "timesteps"),
+    [
+        (1, (999,)),
+        (2, (999, 833)),
+        (3, (999, 908, 713)),
+        (4, (999, 937, 833, 624)),
+        (5, (999, 952, 882, 768, 555)),
+        (6, (999, 961, 908, 833, 713, 499)),
+        (7, (999, 967, 925, 869, 789, 666, 454)),
+        (8, (999, 972, 937, 892, 833, 749, 624, 416)),
+    ],
+)
+def test_shift5_reference_schedule_is_golden_and_fp32_identified(steps, timesteps):
+    schedule = resolve_stage2_shift5_schedule(steps)
+    assert schedule.timesteps == timesteps
+    assert len(schedule.sigma_fp32_bits) == steps + 1
+    assert schedule.sigma_fp32_bits[-1] == "00000000"
+    assert len(schedule.sigmas) == steps + 1
+    assert all(
+        left > right for left, right in zip(schedule.sigmas, schedule.sigmas[1:])
+    )
+
+
+def test_dynamic_deployment_profile_is_canonical_immutable_and_never_trainable():
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=6,
+        local_window_frames=12,
+        num_denoising_steps=3,
+    )
+    assert spec.name == (
+        "deploy_c6w12k3s1_"
+        "3c3fb97b2ac89ccbff99525949a96f37c4fe79a40d569a9a168798bfe698de74"
+    )
+    assert spec.chunk_frames == 6
+    assert spec.local_window_frames == 12
+    assert spec.global_sink_frames == 1
+    assert spec.num_denoising_steps == 3
+    assert spec.num_chunks == 4
+    assert spec.history_frames == 6
+    assert spec.physical_kv_capacity_frames == 13
+    assert spec.fresh_deploy_dit_calls == 17
+    assert spec.training_allowed is False
+    assert spec.fresh_episode_allowed is True
+    assert (
+        build_stage2_deployment_rollout_spec(
+            chunk_frames=6,
+            local_window_frames=12,
+            num_denoising_steps=3,
+        )
+        == spec
+    )
+    assert resolve_stage2_rollout_profile(spec.name) == spec
+    with pytest.raises(FrozenInstanceError):
+        spec.num_denoising_steps = 4
+
+
+@pytest.mark.parametrize(
+    ("chunk", "window", "steps", "message"),
+    [
+        (True, 8, 4, "positive integer"),
+        (1, 8, 4, "divide 24"),
+        (5, 10, 4, "divide 24"),
+        (8, 4, 4, "local_window_frames"),
+        (6, 8, 4, "local_window_frames"),
+        (8, 32, 4, "local_window_frames"),
+        (8, 16, 0, "positive integer"),
+        (8, 16, 9, r"\[1, 8\]"),
+    ],
+)
+def test_dynamic_deployment_profile_rejects_out_of_contract_dimensions(
+    chunk, window, steps, message
+):
+    with pytest.raises(ValueError, match=message):
+        build_stage2_deployment_rollout_spec(
+            chunk_frames=chunk,
+            local_window_frames=window,
+            num_denoising_steps=steps,
+        )
+
+
+def test_dynamic_deployment_profile_rejects_a_forged_canonical_digest():
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=8,
+        local_window_frames=16,
+        num_denoising_steps=4,
+    )
+    with pytest.raises(ValueError, match="canonical name mismatch"):
+        Stage2RolloutSpec(
+            name=f"{spec.name[:-1]}0",
+            chunk_frames=spec.chunk_frames,
+            local_window_frames=spec.local_window_frames,
+            global_sink_frames=spec.global_sink_frames,
+            num_denoising_steps=spec.num_denoising_steps,
+        )
 
 
 def test_rollout_profiles_reject_unknown_names_and_unnamed_combinations():
