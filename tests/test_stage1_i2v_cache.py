@@ -4,7 +4,10 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from scripts.precompute_stage1_i2v_cache import _validate_precompute_runtime
+from scripts.precompute_stage1_i2v_cache import (
+    _build_stage1_cache_vae,
+    _validate_precompute_runtime,
+)
 from utils.stage1_i2v_data import (
     Stage1I2VCacheDataset,
     load_cache_manifest,
@@ -106,3 +109,29 @@ def test_cache_precompute_runtime_keeps_generic_config_compatible():
         )
         == 10
     )
+
+
+def test_stage1_cache_builder_configures_complete_vae_as_bfloat16(monkeypatch):
+    from utils import wan_5b_wrapper
+
+    class TinyVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv3d(3, 3, kernel_size=1)
+            self.register_buffer("scale", torch.ones(1, dtype=torch.float32))
+
+    checkpoint = object()
+    captured = {}
+
+    def fake_wrapper(*, vae_checkpoint):
+        captured["checkpoint"] = vae_checkpoint
+        return TinyVAE()
+
+    monkeypatch.setattr(wan_5b_wrapper, "WanVAEWrapper", fake_wrapper)
+    vae = _build_stage1_cache_vae(checkpoint, device=torch.device("cpu"))
+
+    assert captured["checkpoint"] is checkpoint
+    assert {parameter.dtype for parameter in vae.parameters()} == {torch.bfloat16}
+    assert vae.scale.dtype == torch.bfloat16
+    assert not vae.training
+    assert all(not parameter.requires_grad for parameter in vae.parameters())

@@ -90,6 +90,19 @@ def _validate_precompute_runtime(config, *, world_size: int, device: torch.devic
     return log_every_records
 
 
+def _build_stage1_cache_vae(vae_checkpoint, *, device: torch.device):
+    from utils.wan_5b_wrapper import (
+        WanVAEWrapper,
+        configure_wan_vae_runtime,
+    )
+
+    return configure_wan_vae_runtime(
+        WanVAEWrapper(vae_checkpoint=vae_checkpoint),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+
 def _existing_artifact_valid(path: Path, *, row_sha256: str, source_sha256: str) -> bool:
     if not path.is_file():
         return False
@@ -229,17 +242,17 @@ def precompute(config_path: str, *, cache_dir_override: str | None = None) -> Pa
     text_encoder = None
     vae = None
     if pending_records:
-        from utils.wan_5b_wrapper import WanTextEncoder, WanVAEWrapper
+        from utils.wan_5b_wrapper import WanTextEncoder
 
         text_encoder = WanTextEncoder(
             t5_checkpoint=model_paths.t5_checkpoint,
             tokenizer_dir=model_paths.tokenizer_dir,
             device=device,
         ).eval().requires_grad_(False)
-        vae = WanVAEWrapper(
-            vae_checkpoint=model_paths.vae_checkpoint
-        ).eval().requires_grad_(False)
-        vae = vae.to(device=device)
+        vae = _build_stage1_cache_vae(
+            model_paths.vae_checkpoint,
+            device=device,
+        )
 
     verified_shapes: set[tuple[int, int]] = set()
     started_at = time.perf_counter()

@@ -870,19 +870,52 @@ def prepare_stage2_f25_cache(
         actual_vae_hash = vae_hash
 
     vae = None
+    vae_initialization_error: Exception | None = None
     if needs_vae:
-        if vae_factory is None:
-            from utils.wan_5b_wrapper import WanVAEWrapper
-
-            def vae_factory(path: str | os.PathLike[str], target: torch.device) -> Any:
-                return (
-                    WanVAEWrapper(vae_checkpoint=path)
-                    .eval()
-                    .requires_grad_(False)
-                    .to(device=target)
+        try:
+            if vae_factory is None:
+                from utils.wan_5b_wrapper import (
+                    WanVAEWrapper,
+                    configure_wan_vae_runtime,
                 )
 
-        vae = vae_factory(vae_checkpoint_path, device)
+                def vae_factory(
+                    path: str | os.PathLike[str], target: torch.device
+                ) -> Any:
+                    return configure_wan_vae_runtime(
+                        WanVAEWrapper(vae_checkpoint=path),
+                        device=target,
+                        dtype=torch.bfloat16,
+                    )
+
+            vae = vae_factory(vae_checkpoint_path, device)
+            if isinstance(vae, torch.nn.Module):
+                from utils.wan_5b_wrapper import audit_wan_vae_runtime
+
+                audit_wan_vae_runtime(
+                    vae,
+                    expected_device=device,
+                    expected_dtype=torch.bfloat16,
+                    operation="Stage-2 F25 initialization",
+                    require_eval=True,
+                    require_frozen=True,
+                )
+        except Exception as exc:
+            vae_initialization_error = exc
+
+    if global_needs_vae and _global_any(
+        vae_initialization_error is not None, device=device
+    ):
+        if vae_initialization_error is not None:
+            raise RuntimeError(
+                f"Stage-2 F25 VAE initialization failed on rank {rank} before "
+                f"row encoding: {type(vae_initialization_error).__name__}: "
+                f"{vae_initialization_error}"
+            ) from vae_initialization_error
+        raise RuntimeError(
+            "Stage-2 F25 VAE initialization failed on another rank before row "
+            "encoding; no rank started materialization."
+        )
 
     counts: Counter[str] = Counter()
     completed_pending = 0

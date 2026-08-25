@@ -421,6 +421,75 @@ def test_reverification_or_f24_prefix_mismatch_publishes_nothing(tmp_path):
     assert not (tmp_path / "bad" / "sample_000000.complete.json").exists()
 
 
+def test_vae_initialization_failure_is_synchronized_before_row_encoding(tmp_path):
+    fixture = _fixture(tmp_path, [24], proven_f25=True)
+
+    def broken_factory(*_args):
+        raise RuntimeError("synthetic VAE initialization failure")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"initialization failed on rank 0 before row encoding.*synthetic",
+    ):
+        prepare_stage2_f25_cache(
+            metadata_path=fixture["metadata"],
+            source_cache_manifest_path=fixture["source_manifest"],
+            output_dir=tmp_path / "init-failure",
+            config_path=fixture["config"],
+            config_contract_sha256="1" * 64,
+            config_launch_sha256="2" * 64,
+            expected_num_samples=1,
+            rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+            vae_checkpoint_path=fixture["vae"],
+            vae_factory=broken_factory,
+            decode_video=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("decode must not start after VAE initialization failure")
+            ),
+        )
+    assert not (tmp_path / "init-failure" / "sample_000000.safetensors").exists()
+    assert not (tmp_path / "init-failure" / "sample_000000.complete.json").exists()
+
+
+def test_rank_without_rows_observes_peer_vae_initialization_failure(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, [24], proven_f25=True)
+    collective_inputs = []
+    collective_outputs = iter((True, True))
+
+    def simulated_global_any(value, *, device):
+        assert device == torch.device("cpu")
+        collective_inputs.append(value)
+        return next(collective_outputs)
+
+    monkeypatch.setattr("utils.stage2_f25_cache._global_any", simulated_global_any)
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        prepare_stage2_f25_cache(
+            metadata_path=fixture["metadata"],
+            source_cache_manifest_path=fixture["source_manifest"],
+            output_dir=tmp_path / "peer-init-failure",
+            config_path=fixture["config"],
+            config_contract_sha256="1" * 64,
+            config_launch_sha256="2" * 64,
+            expected_num_samples=1,
+            rank=1,
+            world_size=2,
+            device=torch.device("cpu"),
+            vae_checkpoint_path=fixture["vae"],
+            vae_factory=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("rank without rows must not construct a VAE")
+            ),
+            decode_video=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("rank without rows must not decode")
+            ),
+        )
+
+    assert collective_inputs == [False, False]
+    assert not (tmp_path / "peer-init-failure" / "sample_000000.safetensors").exists()
+
+
 def test_f24_prefix_mismatch_does_not_publish(tmp_path):
     fixture = _fixture(tmp_path, [24], proven_f25=True)
 

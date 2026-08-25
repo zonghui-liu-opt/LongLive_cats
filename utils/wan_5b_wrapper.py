@@ -34,6 +34,104 @@ WAN_TEXT_PADDING_SIDE = "right"
 WAN_TEXT_EMBEDDING_PADDING_VALUE = 0.0
 
 
+def _resolved_runtime_device(device) -> torch.device:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
+def audit_wan_vae_runtime(
+    vae: torch.nn.Module,
+    *,
+    expected_device,
+    expected_dtype: torch.dtype,
+    operation: str,
+    require_eval: bool = False,
+    require_frozen: bool = False,
+) -> torch.nn.Module:
+    """Fail before a VAE kernel when model state cannot consume its input.
+
+    Wan's VAE checkpoint loader preserves the checkpoint dtype.  Callers must
+    therefore make the model/input contract explicit instead of relying on
+    autocast or on the dtype of a single representative parameter.
+    """
+
+    if not isinstance(vae, torch.nn.Module):
+        raise TypeError("Wan VAE runtime audit requires a torch.nn.Module")
+    if not isinstance(expected_dtype, torch.dtype):
+        raise TypeError("Wan VAE expected_dtype must be a torch.dtype")
+    if not torch.empty((), dtype=expected_dtype).is_floating_point():
+        raise ValueError("Wan VAE runtime requires a floating-point input dtype")
+
+    device = _resolved_runtime_device(expected_device)
+    issues: list[str] = []
+
+    if require_eval:
+        training_modules = [
+            name or "<root>" for name, module in vae.named_modules() if module.training
+        ]
+        if training_modules:
+            issues.append(
+                "modules still in training mode: " + ", ".join(training_modules[:4])
+            )
+
+    for name, parameter in vae.named_parameters():
+        label = f"parameter {name!r}"
+        if parameter.is_meta:
+            issues.append(f"{label} is still on the meta device")
+            continue
+        if parameter.device != device:
+            issues.append(f"{label} is on {parameter.device}, expected {device}")
+        if parameter.is_floating_point() and parameter.dtype != expected_dtype:
+            issues.append(
+                f"{label} has dtype {parameter.dtype}, expected {expected_dtype}"
+            )
+        if require_frozen and parameter.requires_grad:
+            issues.append(f"{label} still has requires_grad=True")
+
+    for name, buffer in vae.named_buffers():
+        label = f"buffer {name!r}"
+        if buffer.is_meta:
+            issues.append(f"{label} is still on the meta device")
+            continue
+        if buffer.device != device:
+            issues.append(f"{label} is on {buffer.device}, expected {device}")
+        if buffer.is_floating_point() and buffer.dtype != expected_dtype:
+            issues.append(
+                f"{label} has dtype {buffer.dtype}, expected {expected_dtype}"
+            )
+
+    if issues:
+        visible = "; ".join(issues[:8])
+        omitted = len(issues) - 8
+        suffix = f"; plus {omitted} more issue(s)" if omitted else ""
+        raise RuntimeError(
+            f"Wan VAE runtime contract failed before {operation}: {visible}{suffix}"
+        )
+    return vae
+
+
+def configure_wan_vae_runtime(
+    vae: torch.nn.Module,
+    *,
+    device,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.nn.Module:
+    """Move, freeze, and audit a Wan VAE for deterministic execution."""
+
+    resolved_device = _resolved_runtime_device(device)
+    vae.eval().requires_grad_(False).to(device=resolved_device, dtype=dtype)
+    return audit_wan_vae_runtime(
+        vae,
+        expected_device=resolved_device,
+        expected_dtype=dtype,
+        operation="initialization",
+        require_eval=True,
+        require_frozen=True,
+    )
+
+
 def audit_wan_text_encoding_tokenizer_contract(tokenizer_dir):
     """Validate the tokenizer half of Wan's locked cache-encoding contract.
 
@@ -407,6 +505,12 @@ class WanVAEWrapper(torch.nn.Module):
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
         device, dtype = pixel.device, pixel.dtype
+        audit_wan_vae_runtime(
+            self,
+            expected_device=device,
+            expected_dtype=dtype,
+            operation="encode_to_latent",
+        )
 
         scale = [
             self.mean.to(device=device, dtype=dtype),
@@ -425,6 +529,12 @@ class WanVAEWrapper(torch.nn.Module):
     def decode_to_pixel(
         self, latent: torch.Tensor, use_cache: bool = False
     ) -> torch.Tensor:
+        audit_wan_vae_runtime(
+            self,
+            expected_device=latent.device,
+            expected_dtype=latent.dtype,
+            operation="decode_to_pixel",
+        )
         # from [batch_size, num_frames, num_channels, height, width]
         # to [batch_size, num_channels, num_frames, height, width]
         zs = latent.permute(0, 2, 1, 3, 4)
@@ -467,6 +577,12 @@ class WanVAEWrapper(torch.nn.Module):
         Returns:
             Decoded video tensor with shape [batch_size, num_frames, num_channels, height, width]
         """
+        audit_wan_vae_runtime(
+            self,
+            expected_device=latent.device,
+            expected_dtype=latent.dtype,
+            operation="decode_to_pixel_chunk",
+        )
         # latent shape: [batch_size, num_frames, num_channels, height, width]
         # zs shape after permute: [batch_size, num_channels, num_frames, height, width]
         zs = latent.permute(0, 2, 1, 3, 4)
