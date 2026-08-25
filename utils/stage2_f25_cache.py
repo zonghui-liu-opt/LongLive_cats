@@ -1,11 +1,12 @@
 """Deterministic Stage-1 cache -> native Stage-2 F25 materialization.
 
 This module never changes a Stage-1 artifact in place.  A provenance-complete
-F25 input is copied byte-for-byte.  If its old manifest lacks the 97-frame
-policy, a fresh full-F25 encode is used only as a bitwise verification oracle;
-the original bytes are still the published bytes.  Only F24 publishes a newly
-encoded video latent from presentation frames 0..96.  The resulting base
-manifest must subsequently pass the text-encoding attestation before audit.
+F25 input is copied byte-for-byte.  F24 inputs and F25 inputs whose old manifest
+does not prove the 97-frame policy publish a fresh native F25 video latent from
+presentation frames 0..96.  Comparisons with their legacy video latent are
+recorded as diagnostics, not treated as cross-runtime bitwise invariants.  The
+resulting base manifest must subsequently pass the text-encoding attestation
+before audit.
 """
 
 from __future__ import annotations
@@ -501,26 +502,42 @@ def _validate_completion(
         )
         if completion["tensors"] != _tensor_descriptions(tensors):
             return None
-        expected_verification = {
-            "reused_f25": {
-                "output_reuses_input_bytes": True,
-                "f24_prefix_exact": None,
-                "f25_reverification_exact": None,
-            },
-            "reverified_f25": {
-                "output_reuses_input_bytes": True,
-                "f24_prefix_exact": None,
-                "f25_reverification_exact": True,
-            },
-            "reencoded_f24": {
-                "output_reuses_input_bytes": False,
-                "f24_prefix_exact": True,
-                "f25_reverification_exact": None,
-            },
-        }[decision]
-        if completion.get("verification") != expected_verification:
+        verification = completion.get("verification")
+        if not isinstance(verification, Mapping) or set(verification) != {
+            "output_reuses_input_bytes",
+            "f24_prefix_exact",
+            "f25_reverification_exact",
+        }:
             return None
-        if decision in {"reused_f25", "reverified_f25"}:
+        output_reuses_input = verification["output_reuses_input_bytes"]
+        if decision == "reused_f25":
+            if verification != {
+                "output_reuses_input_bytes": True,
+                "f24_prefix_exact": None,
+                "f25_reverification_exact": None,
+            }:
+                return None
+        elif decision == "reencoded_f24":
+            if (
+                output_reuses_input is not False
+                or type(verification["f24_prefix_exact"]) is not bool
+                or verification["f25_reverification_exact"] is not None
+            ):
+                return None
+        elif decision == "reverified_f25":
+            if (
+                verification["f24_prefix_exact"] is not None
+                or type(verification["f25_reverification_exact"]) is not bool
+                or type(output_reuses_input) is not bool
+                or (
+                    output_reuses_input and not verification["f25_reverification_exact"]
+                )
+            ):
+                return None
+        else:
+            return None
+
+        if output_reuses_input:
             if (
                 completion["size"] != input_entry["size"]
                 or completion["sha256"] != input_entry["sha256"]
@@ -528,9 +545,17 @@ def _validate_completion(
             ):
                 return None
         else:
-            if not torch.equal(
-                tensors["video_latent"][:24], input_tensors["video_latent"]
-            ):
+            actual_exact = (
+                torch.equal(tensors["video_latent"][:24], input_tensors["video_latent"])
+                if decision == "reencoded_f24"
+                else torch.equal(tensors["video_latent"], input_tensors["video_latent"])
+            )
+            recorded_exact = (
+                verification["f24_prefix_exact"]
+                if decision == "reencoded_f24"
+                else verification["f25_reverification_exact"]
+            )
+            if actual_exact is not recorded_exact:
                 return None
             for name in ("initial_latent", "prompt_embeds", "prompt_mask"):
                 if _tensor_description(tensors[name]) != _tensor_description(
@@ -951,56 +976,40 @@ def prepare_stage2_f25_cache(
                 expected_video_sha256=fingerprint_record["video_sha256"],
                 decode_video=decode_video,
             )
-            if decision == "reverified_f25":
-                if not torch.equal(new_video, input_tensors["video_latent"]):
-                    raise RuntimeError(
-                        f"row {record.row_id}: unproven input F25 differs bitwise from "
-                        "a fresh 0..96 encode; refusing to reuse or replace it."
+            output_tensors = {
+                "video_latent": new_video,
+                "initial_latent": input_tensors["initial_latent"],
+                "prompt_embeds": input_tensors["prompt_embeds"],
+                "prompt_mask": input_tensors["prompt_mask"],
+            }
+            for name in ("initial_latent", "prompt_embeds", "prompt_mask"):
+                if tensor_sha256(output_tensors[name]) != tensor_sha256(
+                    input_tensors[name]
+                ):
+                    raise AssertionError(
+                        f"row {record.row_id}: {name} was not copied exactly"
                     )
-                atomic_write_bytes(output_path, payload)
-                if sha256_file(output_path) != entry["sha256"]:
-                    raise RuntimeError(
-                        f"row {record.row_id}: reverified F25 byte reuse failed."
-                    )
-                output_tensors = input_tensors
-                verification = {
-                    "output_reuses_input_bytes": True,
-                    "f24_prefix_exact": None,
-                    "f25_reverification_exact": True,
-                }
-            else:
-                if not torch.equal(new_video[:24], input_tensors["video_latent"]):
-                    raise RuntimeError(
-                        f"row {record.row_id}: new F25[:24] differs bitwise from the old "
-                        "F24 cache. Refusing publication because VAE/preprocessing "
-                        "provenance is inconsistent."
-                    )
-                output_tensors = {
-                    "video_latent": new_video,
-                    "initial_latent": input_tensors["initial_latent"],
-                    "prompt_embeds": input_tensors["prompt_embeds"],
-                    "prompt_mask": input_tensors["prompt_mask"],
-                }
-                for name in ("initial_latent", "prompt_embeds", "prompt_mask"):
-                    if tensor_sha256(output_tensors[name]) != tensor_sha256(
-                        input_tensors[name]
-                    ):
-                        raise AssertionError(
-                            f"row {record.row_id}: {name} was not copied exactly"
-                        )
-                _save_reencoded_artifact(
-                    output_path,
-                    output_tensors,
-                    record=record,
-                    decision=decision,
-                    source_sha256=entry["sha256"],
-                    preparation_contract_sha256=contract_sha256,
-                )
-                verification = {
-                    "output_reuses_input_bytes": False,
-                    "f24_prefix_exact": True,
-                    "f25_reverification_exact": None,
-                }
+            _save_reencoded_artifact(
+                output_path,
+                output_tensors,
+                record=record,
+                decision=decision,
+                source_sha256=entry["sha256"],
+                preparation_contract_sha256=contract_sha256,
+            )
+            verification = {
+                "output_reuses_input_bytes": False,
+                "f24_prefix_exact": (
+                    torch.equal(new_video[:24], input_tensors["video_latent"])
+                    if decision == "reencoded_f24"
+                    else None
+                ),
+                "f25_reverification_exact": (
+                    torch.equal(new_video, input_tensors["video_latent"])
+                    if decision == "reverified_f25"
+                    else None
+                ),
+            }
         completion = _completion_payload(
             record=record,
             decision=decision,

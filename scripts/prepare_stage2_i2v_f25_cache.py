@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the native Stage-2 F25 cache: reuse proven F25, re-encode F24."""
+"""Build native Stage-2 F25: reuse proven F25, freshly encode all other rows."""
 
 import sys
 
@@ -118,7 +118,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vae-checkpoint",
         help=(
-            "Required only when any row is F24 or needs full F25 reverification; "
+            "Required when any row needs fresh native-F25 materialization; "
             "must hash-match the Stage-1 manifest."
         ),
     )

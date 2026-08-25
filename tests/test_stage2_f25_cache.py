@@ -342,7 +342,7 @@ def test_mixed_f25_reuse_and_f24_reencode_once_with_prefix_parity(tmp_path, caps
     assert "final_verify=2/2 row_id=1" in progress
 
 
-def test_unproven_f25_is_fully_reverified_then_original_bytes_reused(tmp_path):
+def test_unproven_f25_is_freshly_reencoded_instead_of_reusing_old_bytes(tmp_path):
     fixture = _fixture(tmp_path, [25], proven_f25=False)
     calls = []
     manifest_path = _prepare(fixture, tmp_path, calls)
@@ -350,9 +350,14 @@ def test_unproven_f25_is_fully_reverified_then_original_bytes_reused(tmp_path):
     entry = manifest["records"][0]
     assert entry["decision"] == "reverified_f25"
     assert calls == [(1, 3, 97, 1, 1)]
-    assert (manifest_path.parent / entry["path"]).read_bytes() == (
+    assert (manifest_path.parent / entry["path"]).read_bytes() != (
         fixture["source"] / fixture["entries"][0]["path"]
     ).read_bytes()
+    assert entry["verification"] == {
+        "output_reuses_input_bytes": False,
+        "f24_prefix_exact": None,
+        "f25_reverification_exact": True,
+    }
 
 
 def test_f25_with_missing_old_preprocessing_policy_is_reverified(tmp_path):
@@ -389,36 +394,42 @@ def test_f25_with_missing_old_preprocessing_policy_is_reverified(tmp_path):
     output = json.loads(output_manifest.read_text())
     assert output["records"][0]["decision"] == "reverified_f25"
     assert calls == [(1, 3, 97, 1, 1)]
-    assert (output_manifest.parent / output["records"][0]["path"]).read_bytes() == (
+    assert (output_manifest.parent / output["records"][0]["path"]).read_bytes() != (
         source_artifact.read_bytes()
     )
 
 
-def test_reverification_or_f24_prefix_mismatch_publishes_nothing(tmp_path):
+def test_unproven_f25_mismatch_publishes_fresh_native_f25(tmp_path):
     fixture = _fixture(tmp_path, [25], proven_f25=False)
 
     class WrongVAE:
         def encode_to_latent(self, _pixels):
             return torch.full((1, 25, 48, 30, 52), -7, dtype=torch.bfloat16)
 
-    with pytest.raises(RuntimeError, match="differs bitwise"):
-        prepare_stage2_f25_cache(
-            metadata_path=fixture["metadata"],
-            source_cache_manifest_path=fixture["source_manifest"],
-            output_dir=tmp_path / "bad",
-            config_path=fixture["config"],
-            config_contract_sha256="1" * 64,
-            config_launch_sha256="2" * 64,
-            expected_num_samples=1,
-            rank=0,
-            world_size=1,
-            device=torch.device("cpu"),
-            vae_checkpoint_path=fixture["vae"],
-            vae_factory=lambda *_args: WrongVAE(),
-            decode_video=_decoder,
-        )
-    assert not (tmp_path / "bad" / "sample_000000.safetensors").exists()
-    assert not (tmp_path / "bad" / "sample_000000.complete.json").exists()
+    manifest_path = prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=tmp_path / "fresh-f25",
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_checkpoint_path=fixture["vae"],
+        vae_factory=lambda *_args: WrongVAE(),
+        decode_video=_decoder,
+    )
+    manifest = json.loads(manifest_path.read_text())
+    entry = manifest["records"][0]
+    output = load_file(str(manifest_path.parent / entry["path"]))
+    assert torch.all(output["video_latent"] == -7)
+    assert entry["verification"] == {
+        "output_reuses_input_bytes": False,
+        "f24_prefix_exact": None,
+        "f25_reverification_exact": False,
+    }
 
 
 def test_vae_initialization_failure_is_synchronized_before_row_encoding(tmp_path):
@@ -490,18 +501,261 @@ def test_rank_without_rows_observes_peer_vae_initialization_failure(
     assert not (tmp_path / "peer-init-failure" / "sample_000000.safetensors").exists()
 
 
-def test_f24_prefix_mismatch_does_not_publish(tmp_path):
+def test_f24_prefix_mismatch_is_diagnostic_and_fresh_f25_is_published(
+    tmp_path, monkeypatch
+):
     fixture = _fixture(tmp_path, [24], proven_f25=True)
 
     class WrongPrefixVAE:
         def encode_to_latent(self, _pixels):
             return torch.full((1, 25, 48, 30, 52), -3, dtype=torch.bfloat16)
 
-    with pytest.raises(RuntimeError, match=r"F25\[:24\] differs bitwise"):
+    manifest_path = prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=tmp_path / "different-prefix",
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_checkpoint_path=fixture["vae"],
+        vae_factory=lambda *_args: WrongPrefixVAE(),
+        decode_video=_decoder,
+    )
+    manifest = json.loads(manifest_path.read_text())
+    entry = manifest["records"][0]
+    output = load_file(str(manifest_path.parent / entry["path"]))
+    assert torch.all(output["video_latent"] == -3)
+    assert entry["verification"] == {
+        "output_reuses_input_bytes": False,
+        "f24_prefix_exact": False,
+        "f25_reverification_exact": None,
+    }
+    loaded = load_source_cache_manifest(manifest_path, expected_num_samples=1)
+    assert loaded["records"][0]["verification"]["f24_prefix_exact"] is False
+    monkeypatch.setattr(
+        "utils.wan_5b_wrapper.audit_wan_text_encoding_tokenizer_contract",
+        lambda _path: {
+            "cleaning": "whitespace",
+            "add_special_tokens": True,
+            "sequence_length": 512,
+            "padding_side": "right",
+            "embedding_padding_value": 0.0,
+            "validated_special_token_growth": True,
+            "validated_right_padding_mask": True,
+        },
+    )
+    attested = tmp_path / "attested-false.json"
+    upgrade_legacy_source_cache_manifest_text_encoding(
+        manifest_path,
+        attested,
+        expected_source_manifest_sha256=loaded["manifest_sha256"],
+        t5_checkpoint_path=fixture["t5"],
+        tokenizer_dir=fixture["tokenizer"],
+        operator_id="test-false-diagnostic",
+        operator_attestation=STAGE2_TEXT_ENCODING_OPERATOR_ATTESTATION,
+        expected_num_samples=1,
+    )
+    upgraded = load_source_cache_manifest(
+        attested,
+        expected_num_samples=1,
+        require_text_encoding_upgrade=True,
+    )
+    assert upgraded["records"][0]["verification"]["f24_prefix_exact"] is False
+
+
+def test_false_prefix_diagnostic_resumes_without_vae_or_decode(tmp_path):
+    fixture = _fixture(tmp_path, [24], proven_f25=True)
+
+    class DifferentPrefixVAE:
+        def encode_to_latent(self, _pixels):
+            return torch.full((1, 25, 48, 30, 52), -3, dtype=torch.bfloat16)
+
+    first = prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=tmp_path / "resume-false",
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_checkpoint_path=fixture["vae"],
+        vae_factory=lambda *_args: DifferentPrefixVAE(),
+        decode_video=_decoder,
+    )
+    first_bytes = (first.parent / "sample_000000.safetensors").read_bytes()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("valid False diagnostic must resume without VAE/decode")
+
+    second = prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=tmp_path / "resume-false",
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_checkpoint_path=fixture["vae"],
+        vae_factory=forbidden,
+        decode_video=forbidden,
+    )
+    assert (second.parent / "sample_000000.safetensors").read_bytes() == first_bytes
+
+
+def test_legacy_true_prefix_completion_still_resumes_without_reencoding(tmp_path):
+    fixture = _fixture(tmp_path, [24], proven_f25=True)
+    first = _prepare(fixture, tmp_path, [])
+    first_manifest = json.loads(first.read_text())
+    assert first_manifest["records"][0]["verification"]["f24_prefix_exact"] is True
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("valid legacy True completion must remain resumable")
+
+    second = prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=tmp_path / "f25",
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_checkpoint_path=fixture["vae"],
+        vae_factory=forbidden,
+        decode_video=forbidden,
+    )
+    assert (
+        json.loads(second.read_text())["records"][0]["verification"]["f24_prefix_exact"]
+        is True
+    )
+
+
+def test_legacy_reverified_f25_byte_reuse_completion_still_resumes(tmp_path):
+    fixture = _fixture(tmp_path, [25], proven_f25=False)
+    first = _prepare(fixture, tmp_path, [])
+    output_root = first.parent
+    artifact_path = output_root / "sample_000000.safetensors"
+    completion_path = output_root / "sample_000000.complete.json"
+    source_path = fixture["source"] / fixture["entries"][0]["path"]
+
+    artifact_path.write_bytes(source_path.read_bytes())
+    completion = json.loads(completion_path.read_text())
+    completion.pop("manifest_sha256")
+    completion["size"] = completion["input_artifact"]["size"]
+    completion["sha256"] = completion["input_artifact"]["sha256"]
+    completion["tensors"] = completion["input_artifact"]["tensors"]
+    completion["verification"] = {
+        "output_reuses_input_bytes": True,
+        "f24_prefix_exact": None,
+        "f25_reverification_exact": True,
+    }
+    completion["manifest_sha256"] = canonical_json_sha256(completion)
+    atomic_write_json(completion_path, completion)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy reverified F25 must resume without VAE/decode")
+
+    resumed = prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=output_root,
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_factory=forbidden,
+        decode_video=forbidden,
+    )
+    resumed_manifest = load_source_cache_manifest(resumed, expected_num_samples=1)
+    entry = resumed_manifest["records"][0]
+    assert entry["decision"] == "reverified_f25"
+    assert entry["verification"] == completion["verification"]
+    assert (resumed.parent / entry["path"]).read_bytes() == source_path.read_bytes()
+
+
+def test_resigned_wrong_prefix_diagnostic_is_detected_and_rebuilt(tmp_path):
+    fixture = _fixture(tmp_path, [24], proven_f25=True)
+
+    class DifferentPrefixVAE:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def encode_to_latent(self, _pixels):
+            self.calls.append(True)
+            return torch.full((1, 25, 48, 30, 52), -3, dtype=torch.bfloat16)
+
+    first_calls = []
+    manifest_path = prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=tmp_path / "tampered-diagnostic",
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_checkpoint_path=fixture["vae"],
+        vae_factory=lambda *_args: DifferentPrefixVAE(first_calls),
+        decode_video=_decoder,
+    )
+    completion_path = manifest_path.parent / "sample_000000.complete.json"
+    completion = json.loads(completion_path.read_text())
+    completion.pop("manifest_sha256")
+    completion["verification"]["f24_prefix_exact"] = True
+    completion["manifest_sha256"] = canonical_json_sha256(completion)
+    atomic_write_json(completion_path, completion)
+
+    second_calls = []
+    prepare_stage2_f25_cache(
+        metadata_path=fixture["metadata"],
+        source_cache_manifest_path=fixture["source_manifest"],
+        output_dir=tmp_path / "tampered-diagnostic",
+        config_path=fixture["config"],
+        config_contract_sha256="1" * 64,
+        config_launch_sha256="2" * 64,
+        expected_num_samples=1,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        vae_checkpoint_path=fixture["vae"],
+        vae_factory=lambda *_args: DifferentPrefixVAE(second_calls),
+        decode_video=_decoder,
+    )
+    assert first_calls == [True]
+    assert second_calls == [True]
+    repaired = json.loads(completion_path.read_text())
+    assert repaired["verification"]["f24_prefix_exact"] is False
+
+
+def test_nonfinite_fresh_f25_is_rejected_without_publication(tmp_path):
+    fixture = _fixture(tmp_path, [24], proven_f25=True)
+
+    class NonfiniteVAE:
+        def encode_to_latent(self, _pixels):
+            return torch.full((1, 25, 48, 30, 52), float("nan"), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="non-finite"):
         prepare_stage2_f25_cache(
             metadata_path=fixture["metadata"],
             source_cache_manifest_path=fixture["source_manifest"],
-            output_dir=tmp_path / "bad-prefix",
+            output_dir=tmp_path / "nonfinite",
             config_path=fixture["config"],
             config_contract_sha256="1" * 64,
             config_launch_sha256="2" * 64,
@@ -510,10 +764,11 @@ def test_f24_prefix_mismatch_does_not_publish(tmp_path):
             world_size=1,
             device=torch.device("cpu"),
             vae_checkpoint_path=fixture["vae"],
-            vae_factory=lambda *_args: WrongPrefixVAE(),
+            vae_factory=lambda *_args: NonfiniteVAE(),
             decode_video=_decoder,
         )
-    assert not (tmp_path / "bad-prefix" / "sample_000000.safetensors").exists()
+    assert not (tmp_path / "nonfinite" / "sample_000000.safetensors").exists()
+    assert not (tmp_path / "nonfinite" / "sample_000000.complete.json").exists()
 
 
 @pytest.mark.parametrize("latent_frames", [24, 26])

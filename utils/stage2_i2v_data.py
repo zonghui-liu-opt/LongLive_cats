@@ -800,7 +800,8 @@ def _stage1_manifest_declares_reusable_f25_policy(
     preprocessing = fingerprint.get("preprocessing")
     # Missing or legacy/malformed policy declarations are not proof that an
     # actual F25 artifact came from frames 0..96.  They therefore select the
-    # full-bitwise reverification path; the separate source/model provenance
+    # fresh native-F25 publication path; comparison with the legacy F25 is
+    # retained as a diagnostic, while the separate source/model provenance
     # gates still reject a fingerprint that cannot be trusted at all.
     if not isinstance(preprocessing, Mapping):
         return False
@@ -1151,28 +1152,34 @@ def _validate_f25_source_preparation(
             label=f"Stage-2 F25 row {row_id}.verification",
             expected=_F25_RECORD_VERIFICATION_KEYS,
         )
-        expected_verification = {
-            "reused_f25": {
+        output_reuses_input = verification["output_reuses_input_bytes"]
+        if decision == "reused_f25":
+            valid_verification = verification == {
                 "output_reuses_input_bytes": True,
                 "f24_prefix_exact": None,
                 "f25_reverification_exact": None,
-            },
-            "reverified_f25": {
-                "output_reuses_input_bytes": True,
-                "f24_prefix_exact": None,
-                "f25_reverification_exact": True,
-            },
-            "reencoded_f24": {
-                "output_reuses_input_bytes": False,
-                "f24_prefix_exact": True,
-                "f25_reverification_exact": None,
-            },
-        }[decision]
-        if verification != expected_verification:
+            }
+        elif decision == "reencoded_f24":
+            valid_verification = (
+                output_reuses_input is False
+                and type(verification["f24_prefix_exact"]) is bool
+                and verification["f25_reverification_exact"] is None
+            )
+        else:
+            valid_verification = (
+                verification["f24_prefix_exact"] is None
+                and type(verification["f25_reverification_exact"]) is bool
+                and type(output_reuses_input) is bool
+                and (
+                    not output_reuses_input
+                    or verification["f25_reverification_exact"] is True
+                )
+            )
+        if not valid_verification:
             raise RuntimeError(
                 f"Stage-2 F25 row {row_id} verification evidence mismatch."
             )
-        if decision in {"reused_f25", "reverified_f25"}:
+        if output_reuses_input:
             if (
                 entry["size"] != input_entry["size"]
                 or entry["sha256"] != input_entry["sha256"]
@@ -1507,7 +1514,8 @@ def _validate_f25_success_and_materialized_artifacts(
             label=f"F25 original input artifact row {row_id}",
         )
         decision = entry["decision"]
-        if decision in {"reused_f25", "reverified_f25"}:
+        verification = entry["verification"]
+        if verification["output_reuses_input_bytes"]:
             if (
                 entry["size"] != input_entry["size"]
                 or entry["sha256"] != input_entry["sha256"]
@@ -1517,11 +1525,26 @@ def _validate_f25_success_and_materialized_artifacts(
                 )
             ):
                 raise RuntimeError(f"F25 row {row_id} was not reused byte-for-byte.")
-        elif decision == "reencoded_f24":
-            if not torch.equal(
-                output_tensors["video_latent"][:24], input_tensors["video_latent"]
-            ):
-                raise RuntimeError(f"F25 row {row_id} failed F24 prefix parity.")
+        elif decision in {"reencoded_f24", "reverified_f25"}:
+            actual_exact = (
+                torch.equal(
+                    output_tensors["video_latent"][:24],
+                    input_tensors["video_latent"],
+                )
+                if decision == "reencoded_f24"
+                else torch.equal(
+                    output_tensors["video_latent"], input_tensors["video_latent"]
+                )
+            )
+            recorded_exact = (
+                verification["f24_prefix_exact"]
+                if decision == "reencoded_f24"
+                else verification["f25_reverification_exact"]
+            )
+            if actual_exact is not recorded_exact:
+                raise RuntimeError(
+                    f"F25 row {row_id} legacy comparison diagnostic mismatch."
+                )
             for name in ("initial_latent", "prompt_embeds", "prompt_mask"):
                 if not torch.equal(output_tensors[name], input_tensors[name]):
                     raise RuntimeError(f"F25 row {row_id} changed copied {name}.")
