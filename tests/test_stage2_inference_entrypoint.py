@@ -132,12 +132,12 @@ def test_repo_sweep_plan_promotes_same_profiles_from_quick_to_formal(
 
     assert quick["evaluation_mode"] == "quick"
     assert quick["base_samples_per_profile"] == 4
-    assert quick["profile_count"] == 8
-    assert quick["expected_sample_count"] == 32
+    assert quick["profile_count"] == 9
+    assert quick["expected_sample_count"] == 36
     assert len(quick["sample_plan_sha256"]) == 64
     assert formal["evaluation_mode"] == "formal"
     assert formal["base_samples_per_profile"] == 56
-    assert formal["expected_sample_count"] == 448
+    assert formal["expected_sample_count"] == 504
     assert [item["name"] for item in quick["profiles"]] == [
         item["name"] for item in formal["profiles"]
     ]

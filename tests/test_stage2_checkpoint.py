@@ -424,7 +424,12 @@ def test_fake_score_optimizer_uses_its_distinct_locked_learning_rate():
 
 @pytest.mark.parametrize(
     ("role", "learning_rate"),
-    (("generator", 1.0e-5), ("fake_score", 2.0e-6)),
+    (
+        ("generator", 1.0e-5),
+        ("fake_score", 2.0e-6),
+        ("generator", 5.0e-6),
+        ("fake_score", 1.0e-6),
+    ),
 )
 def test_optimizer_state_accepts_explicit_longrun_resolved_spec(role, learning_rate):
     state = _tiny_optimizer_state()

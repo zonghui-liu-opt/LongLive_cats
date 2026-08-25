@@ -1,0 +1,235 @@
+# C4/W16/S1 matched Stage-2 long-run contract.
+# W includes the current C4 chunk, so the causal Generator sees 4 current +
+# 12 local-history latents while preserving the initial image latent as one
+# independent global sink. Every 10-G Generator epoch is a permanent full
+# checkpoint; keep_last=400 and empty milestones intentionally disable pruning.
+config_schema: longlive_stage2_train/v1
+profile: h100_c4w16s1_micro1_acc8_longrun
+infra:
+  expected_nodes: 1
+  expected_world_size: ${oc.decode:${oc.env:STAGE2_GPUS,8}}
+  data_parallel_size: ${oc.decode:${oc.env:STAGE2_GPUS,8}}
+  sequence_parallel_size: 1
+  fsdp_backend: fsdp2
+  sharding_strategy: full
+  mixed_precision: true
+  forward_dtype: bfloat16
+  master_dtype: float32
+  generator_activation_checkpointing: false
+  real_score_activation_checkpointing: false
+  fake_score_activation_checkpointing: true
+  cpu_model_offload: false
+  saved_tensor_cpu_offload: false
+  saved_tensor_cpu_offload_scope: generator_grad_exit_only
+  model_quant: false
+  torch_compile: false
+  torch_compile_mode: max-autotune-no-cudagraphs
+  load_text_encoder: false
+  load_vae: false
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  architecture_root: ${oc.env:LONG_LIVE_STAGE2_ARCHITECTURE_ROOT,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/shared_checkpoints/Wan2.2-TI2V-5B}
+  init_weights: false
+model_contract:
+  latent_patch_size:
+  - 1
+  - 2
+  - 2
+  temporal_compression_ratio: 4
+checkpoints:
+  init_from_stage1:
+    generator_stage1_step: 3075
+    generator_checkpoint: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_BASE,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2_new/assets/stage1_step3075_ema_merged.pt}
+    generator_manifest: ${oc.env:LONG_LIVE_STAGE2_GENERATOR_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2_new/assets/stage1_step3075_ema_merged.manifest.json}
+    real_score_checkpoint: ${oc.env:LONG_LIVE_STAGE2_REAL_SCORE_BASE,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/DiffSynth-Studio_cats_LoRA/results/merged_bi-direct_Wan2.2-5B-cats/ckpts}
+    real_score_manifest: ${oc.env:LONG_LIVE_STAGE2_REAL_SCORE_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2_new/assets/real_score_teacher.manifest.json}
+  resume_stage2: null
+roles:
+  generator:
+    backbone: causal
+    base_source: stage1_step3075_ema_merged
+    trainable: adapter_only
+    conditioning_mode: conditional_only
+    forward_mode: single_conditional
+    cfg_formula: conditional_only
+    self_kv_cache_branches: 1
+    cross_kv_cache_branches: 1
+  real_score:
+    backbone: bidirectional_ti2v
+    base_source: real_score_checkpoint
+    trainable: frozen
+    conditioning_mode: standard_cfg
+    forward_mode: sequential_cond_uncond
+    cfg_formula: uncond_plus_scale_times_cond_minus_uncond
+    self_kv_cache_branches: 0
+    cross_kv_cache_branches: 0
+  fake_score:
+    backbone: bidirectional_ti2v
+    base_source: real_score_checkpoint
+    trainable: adapter_only
+    conditioning_mode: conditional_only
+    forward_mode: single_conditional
+    cfg_formula: conditional_only
+    self_kv_cache_branches: 0
+    cross_kv_cache_branches: 0
+algorithm:
+  trainer: stage2_distillation
+  objective: dmd_dfd
+  i2v: true
+  num_train_timesteps: 1000
+  score_timestep_mode: video_global
+  score_timestep_sampling: shifted_uniform_integer
+  score_sigma_mode: continuous
+  score_math_dtype: float32
+  loss_reduction_dtype: float32
+  score_timestep_shift: 5.0
+  score_timestep_min: 20.0
+  score_timestep_max: 980.0
+  score_real_cfg_scale: 5.0
+  score_fake_cfg_scale: 1.0
+  rollout_cfg_scale: 1.0
+  ts_schedule: false
+  ts_schedule_max: false
+  denominator_clamp: 1.0e-06
+  sink_excluded_from_loss: true
+rollout:
+  generated_episode_frames: 24
+  chunk_frames: 4
+  local_window_frames: 16
+  global_sink_frames: 1
+  num_denoising_steps: 4
+  solver: unipc
+  timestep_shift: 5.0
+  exit_sampling: stratified_uniform
+adapter:
+  generator:
+    type: lora
+    rank: 32
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    modules_to_save: []
+    target_patterns:
+    - ^blocks\.[0-9]+\.self_attn\.(q|k|v|o)$
+    - ^blocks\.[0-9]+\.ffn\.(0|2)$
+    expected_target_modules: 180
+    expected_trainable_parameters: 57016320
+    expected_adapter_tensors: 360
+  fake_score:
+    type: lora
+    rank: 64
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    modules_to_save: []
+    target_patterns:
+    - ^blocks\.[0-9]+\.self_attn\.(q|k|v|o)$
+    - ^blocks\.[0-9]+\.ffn\.(0|2)$
+    expected_target_modules: 180
+    expected_trainable_parameters: 114032640
+    expected_adapter_tensors: 360
+data:
+  backend: stage2_i2v_cache
+  metadata_path: ${oc.env:LONG_LIVE_STAGE2_METADATA_PATH,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/datasets_project/cats/metadata_600clips_480x832_buckets.csv}
+  source_cache_manifest: ${oc.env:LONG_LIVE_STAGE2_SOURCE_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2_new/stage2_600cats_f25_v1/cache_manifest.attested.json}
+  action_label_source_policy: manifest_first_sidecar_fallback
+  action_labels_path: ${oc.env:LONG_LIVE_STAGE2_ACTION_LABELS_PATH,null}
+  cache_dir: ${oc.env:LONG_LIVE_STAGE2_CACHE_DIR,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2_new/stage2_600cats_f25_v1}
+  expected_num_samples: 600
+  expected_num_actions: 3
+  expected_action_counts:
+    head_tilt_and_wink: 198
+    jump: 202
+    play_with_a_cat_wand: 200
+  video_latent_frames: 25
+  initial_latent_frames: 1
+  future_latent_frames: 24
+  latent_channels: 48
+  cache_dtype: bfloat16
+  allowed_latent_spatial_shapes:
+  - - 30
+    - 52
+  - - 52
+    - 30
+  prompt_padding_value: 0.0
+  negative_conditioning:
+    artifact_manifest: ${oc.env:LONG_LIVE_STAGE2_NEGATIVE_MANIFEST,/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/checkpoints/stage2_new/negative_v1/negative_conditioning_manifest.json}
+  num_workers: 2
+  deterministic: true
+sampler:
+  per_action_batch_counts:
+  - 22
+  - 21
+  - 21
+  rotate_extra_slot: true
+  independent_role_streams: true
+  deterministic: true
+training:
+  seed: 1
+  global_batch_size: 64
+  microbatch_size_per_device: 1
+  gradient_accumulation_steps: ${oc.decode:${oc.env:LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS,8}}
+  fake_updates_per_generator_update: 5
+  phase_a_epochs: 360
+  phase_b_epochs: 40
+  phase_b_mode: dmd_dfd
+  phase_b_dfd_probability_max: 0.25
+  reset_optimizers_between_phases: false
+  nonfinite_max_attempts_per_update: 2
+  optimizers:
+    generator:
+      type: adamw
+      lr: 5.0e-06
+      betas:
+      - 0.0
+      - 0.999
+      eps: 1.0e-08
+      weight_decay: 0.0
+      max_grad_norm: 10.0
+      schedule: constant
+    fake_score:
+      type: adamw
+      lr: 1.0e-06
+      betas:
+      - 0.0
+      - 0.999
+      eps: 1.0e-08
+      weight_decay: 0.0
+      max_grad_norm: 10.0
+      schedule: constant
+  ema:
+    enabled: true
+    role: generator
+    target: generator_adapter
+    decay: 0.99
+    initialize_after_completed_generator_updates: 40
+    dtype: float32
+    device: cpu
+    trainable_only: true
+checkpointing:
+  every_generator_epochs: 1
+  keep_last_resumable: 400
+  phase_a_milestone_epochs: []
+  phase_b_milestone_epochs: []
+  atomic_success_marker: true
+evaluation:
+  interval: 0
+logging:
+  backend: jsonl
+  metrics_schema: longlive_stage2_metrics/v1
+  jsonl_path: metrics/stage2_train_metrics.jsonl
+  jsonl_every_steps: 1
+  fsync_every_steps: 1
+  disable_wandb: true
+preflight:
+  candidate_profiles:
+  - microbatch_size_per_device: 2
+    gradient_accumulation_steps: ${oc.decode:${oc.env:LONG_LIVE_STAGE2_PREFLIGHT_MICRO2_ACCUMULATION_STEPS,4}}
+  - microbatch_size_per_device: 1
+    gradient_accumulation_steps: ${oc.decode:${oc.env:LONG_LIVE_STAGE2_GRADIENT_ACCUMULATION_STEPS,8}}
+  max_allocated_fraction: 0.85
+  max_reserved_fraction: 0.9
+  min_free_gib: 8
+  min_free_fraction: 0.1
+  max_live_allocated_growth_gib: 1
+  max_straggler_ratio: 1.15

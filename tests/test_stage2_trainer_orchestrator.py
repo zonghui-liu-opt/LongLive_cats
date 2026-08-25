@@ -27,12 +27,29 @@ from trainer.stage2_distillation import (
     Trainer,
     _STAGE2_DMD_RUNTIME_METHODS,
     _audit_stage2_dmd_runtime_api,
+    _should_apply_stage2_checkpoint_retention,
 )
 from utils.stage2_config import load_stage2_config
 from utils.stage2_sampler import build_stage2_role_samplers
 from utils.stage2_train_state import Stage2TrainingSchedule, Stage2TrainingState
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "train_i2v_stage2_600cats.yaml"
+C4W16_CONFIG_PATH = (
+    Path(__file__).parents[1]
+    / "configs"
+    / "train_i2v_stage2_600cats_c4w16s1_micro1_acc8.yaml"
+)
+
+
+def test_c4w16_keep_all_profile_skips_quadratic_checkpoint_retention_scan():
+    baseline = load_stage2_config(CONFIG_PATH)
+    c4w16 = load_stage2_config(C4W16_CONFIG_PATH)
+
+    assert _should_apply_stage2_checkpoint_retention(baseline) is True
+    assert c4w16.checkpoint_interval_generator_updates == 10
+    assert c4w16.keep_last_resumable == 400
+    assert c4w16.milestone_generator_updates == ()
+    assert _should_apply_stage2_checkpoint_retention(c4w16) is False
 
 
 def test_stage2_dmd_runtime_api_rejects_stale_loss_signatures(monkeypatch):
@@ -1061,6 +1078,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
         shard_group,
         keep_last,
         milestone_updates,
+        apply_retention,
     ):
         saver_calls.append(
             {
@@ -1082,6 +1100,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
                 "shard_group": shard_group,
                 "keep_last": keep_last,
                 "milestone_updates": milestone_updates,
+                "apply_retention": apply_retention,
             }
         )
         old_directory.rmdir()
@@ -1198,6 +1217,7 @@ def test_checkpoint_bridge_calls_current_builder_and_saver_contract(
     assert saver["shard_group"] is shard_group
     assert saver["keep_last"] == resolved.keep_last_resumable
     assert saver["milestone_updates"] == resolved.milestone_generator_updates
+    assert saver["apply_retention"] is True
 
     assert event["path"] == str(destination)
     assert event["manifest_sha256"] == "f" * 64

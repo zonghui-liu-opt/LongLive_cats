@@ -91,6 +91,22 @@ _STAGE2_DMD_RUNTIME_METHODS = {
 }
 
 
+def _should_apply_stage2_checkpoint_retention(resolved: Any) -> bool:
+    """Skip quadratic rescans when one profile intentionally keeps every save."""
+
+    interval = int(resolved.checkpoint_interval_generator_updates)
+    total = int(resolved.total_generator_updates)
+    if interval <= 0 or total <= 0:
+        raise ValueError(
+            "Stage-2 checkpoint interval and total updates must be positive"
+        )
+    scheduled = set(range(interval, total + 1, interval))
+    scheduled.update(int(value) for value in resolved.milestone_generator_updates)
+    if total not in scheduled:
+        raise ValueError("Stage-2 checkpoint schedule must include the terminal update")
+    return int(resolved.keep_last_resumable) < len(scheduled)
+
+
 def _audit_stage2_dmd_runtime_api(model_type: type) -> dict[str, Any]:
     """Fail before training when trainer and Stage2DMD source are out of sync."""
 
@@ -2565,6 +2581,7 @@ class Trainer:
             shard_group=self.mesh.get_group("shard"),
             keep_last=self.resolved.keep_last_resumable,
             milestone_updates=self.resolved.milestone_generator_updates,
+            apply_retention=_should_apply_stage2_checkpoint_retention(self.resolved),
         )
         return self._runtime_rank0_checked(
             "read committed Stage-2 checkpoint event",

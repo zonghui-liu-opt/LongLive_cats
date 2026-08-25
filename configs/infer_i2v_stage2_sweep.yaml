@@ -8,6 +8,7 @@ output_root: ${oc.env:LONG_LIVE_STAGE2_INFERENCE_OUTPUT,/path/to/stage2_sweep_in
 profile_set:
   named:
     - baseline_c8w16k4s1
+    - c4w16k4s1
   grids: []
   cases:
     - {chunk_frames: 4, local_window_frames: 8, num_denoising_steps: 2}
@@ -18,7 +19,7 @@ profile_set:
     - {chunk_frames: 8, local_window_frames: 16, num_denoising_steps: 2}
     - {chunk_frames: 8, local_window_frames: 16, num_denoising_steps: 6}
 
-# Default smoke matrix: 4 source cases x 1 seed x 8 profiles = 32 videos.
+# Default smoke matrix: 4 source cases x 1 seed x 9 profiles = 36 videos.
 # CLI `--evaluation formal` promotes the same immutable profile set to
 # 56 source/seed cases per profile without editing this file.
 evaluation:

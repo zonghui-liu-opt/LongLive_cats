@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 
 from pipeline.stage2_rollout_profile import (
+    STAGE2_ROLLOUT_PROFILE_NAMES,
     Stage2RolloutSpec,
     resolve_stage2_rollout_profile,
     resolve_stage2_shift5_schedule,
@@ -372,7 +373,6 @@ class Stage2RolloutPipeline:
         *,
         scheduler_factory: Callable[[], Any] | None = None,
     ) -> Stage2RolloutPipeline:
-        spec = resolve_stage2_rollout_profile("baseline_c8w16k4s1")
         actual = (
             int(resolved.generated_episode_frames),
             int(resolved.chunk_frames),
@@ -381,19 +381,26 @@ class Stage2RolloutPipeline:
             int(resolved.num_denoising_steps),
             float(resolved.rollout_timestep_shift),
         )
-        expected = (
-            spec.generated_episode_frames,
-            spec.chunk_frames,
-            spec.local_window_frames,
-            spec.global_sink_frames,
-            spec.num_denoising_steps,
-            spec.timestep_shift,
-        )
-        if actual != expected:
-            raise ValueError(
-                "resolved Stage-2 training config is not the named baseline rollout: "
-                f"expected={expected}, actual={actual}"
+        candidates = []
+        for name in STAGE2_ROLLOUT_PROFILE_NAMES:
+            candidate = resolve_stage2_rollout_profile(name)
+            expected = (
+                candidate.generated_episode_frames,
+                candidate.chunk_frames,
+                candidate.local_window_frames,
+                candidate.global_sink_frames,
+                candidate.num_denoising_steps,
+                candidate.timestep_shift,
             )
+            if candidate.training_allowed and actual == expected:
+                candidates.append(candidate)
+        if len(candidates) != 1:
+            raise ValueError(
+                "resolved Stage-2 training config must uniquely match one approved "
+                f"named training rollout: actual={actual}, matches="
+                f"{tuple(item.name for item in candidates)}"
+            )
+        spec = candidates[0]
         return cls(
             generator,
             spec=spec,

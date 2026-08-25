@@ -20,6 +20,7 @@ _PROFILE_FIELDS: dict[str, tuple[int, int, int, int]] = {
     "baseline_c8w16k4s1": (8, 16, 1, 4),
     "stress_c8w24k4s1": (8, 24, 1, 4),
     "lower_c8w8k4s1": (8, 8, 1, 4),
+    "c4w16k4s1": (4, 16, 1, 4),
     "c4w12k4s1": (4, 12, 1, 4),
     "c4w8k4s1": (4, 8, 1, 4),
     "c4w8k2s1": (4, 8, 1, 2),

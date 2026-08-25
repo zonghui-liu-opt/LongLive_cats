@@ -14,6 +14,7 @@ import pytest
 from utils.config import DEFAULT_NEGATIVE_PROMPT, normalize_config
 from utils.stage2_config import (
     STAGE2_CONFIG_SCHEMA,
+    STAGE2_H100_C4W16S1_LONGRUN_PROFILE,
     STAGE2_H100_LONGRUN_PROFILE,
     STAGE2_METRICS_SCHEMA,
     STAGE2_NEGATIVE_PROMPT_SHA256,
@@ -27,6 +28,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats.yaml"
 LONG_CONFIG_PATH = (
     PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats_micro1_acc8.yaml"
+)
+C4W16_CONFIG_PATH = (
+    PROJECT_ROOT / "configs" / "train_i2v_stage2_600cats_c4w16s1_micro1_acc8.yaml"
 )
 
 
@@ -42,6 +46,61 @@ def _long_config() -> dict:
     plain = OmegaConf.to_container(loaded, resolve=True)
     assert isinstance(plain, dict)
     return plain
+
+
+def _c4w16_config() -> dict:
+    loaded = OmegaConf.load(C4W16_CONFIG_PATH)
+    plain = OmegaConf.to_container(loaded, resolve=True)
+    assert isinstance(plain, dict)
+    return plain
+
+
+def test_h100_c4w16s1_longrun_contract_is_exact_and_keeps_every_epoch():
+    resolved = load_stage2_config(C4W16_CONFIG_PATH)
+
+    assert resolved.profile == STAGE2_H100_C4W16S1_LONGRUN_PROFILE
+    assert (resolved.chunk_frames, resolved.local_window_frames) == (4, 16)
+    assert (resolved.history_frames, resolved.global_sink_frames) == (12, 1)
+    assert resolved.physical_kv_capacity_frames == 17
+    assert resolved.num_chunks == 6
+    assert resolved.baseline_deploy_dit_calls == 31
+    assert (resolved.phase_a_epochs, resolved.phase_b_epochs) == (360, 40)
+    assert resolved.generator_optimizer.learning_rate == 5.0e-6
+    assert resolved.fake_score_optimizer.learning_rate == 1.0e-6
+    assert resolved.checkpoint_interval_generator_updates == 10
+    assert resolved.keep_last_resumable == 400
+    assert resolved.milestone_generator_updates == ()
+    assert resolved.total_generator_updates == 4_000
+    assert (
+        resolved.contract_hash()
+        == "49982f045df1b743881e490f4d2d557b1834e281c54c6ac4115ba1fa6a82206f"
+    )
+    assert (
+        resolved.contract_hash() != load_stage2_config(LONG_CONFIG_PATH).contract_hash()
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "field", "value", "message"),
+    [
+        ("rollout", "chunk_frames", 8, "rollout.chunk_frames"),
+        ("rollout", "local_window_frames", 12, "rollout.local_window_frames"),
+        ("training.optimizers.generator", "lr", 1.0e-5, "optimizers.generator.lr"),
+        ("checkpointing", "every_generator_epochs", 4, "every_generator_epochs"),
+        ("checkpointing", "keep_last_resumable", 2, "keep_last_resumable"),
+    ],
+)
+def test_h100_c4w16s1_profile_rejects_topology_lr_or_retention_drift(
+    path, field, value, message
+):
+    config = _c4w16_config()
+    target = config
+    for component in path.split("."):
+        target = target[component]
+    target[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        resolve_stage2_config(config)
 
 
 def test_h100_micro1_acc8_longrun_contract_resolves_exact_requested_budget():

@@ -110,7 +110,8 @@ GPU 0–3 跑 G60、GPU 4–7 跑 G70；两种方式的理想总耗时接近，�
 
 消融入口复用同一个 Generator、T5、VAE、metadata、断点续跑和产物验收链；不会为每组超参重复加载一套进程。
 默认矩阵在 `configs/infer_i2v_stage2_sweep.yaml`：包含冻结的
-`baseline_c8w16k4s1` 对照组和 7 个 deployment-only 动态点。动态点固定 `S=1`，因此不会误入训练。
+`baseline_c8w16k4s1`、本轮训练匹配的 `c4w16k4s1` 和 7 个 deployment-only 动态点。动态点固定
+`S=1`，因此不会误入训练。
 
 需要增删超参时，只在外网同步代码前编辑一次该 YAML 的 `profile_set.cases`：
 
@@ -142,7 +143,7 @@ bash infer_stage2_tmp.sh 70
 ```
 
 确认输出中的 `expected_sample_count`、每组 C/W/K、DiT forward 数和 self-KV GiB 后，去掉
-`STAGE2_INFERENCE_PLAN_ONLY=1` 即可跑默认 quick 集合。默认 quick 是 4 个基础案例 × 1 seed × 8 profiles = 32 个视频；
+`STAGE2_INFERENCE_PLAN_ONLY=1` 即可跑默认 quick 集合。默认 quick 是 4 个基础案例 × 1 seed × 9 profiles = 36 个视频；
 4 张卡能让同一案例跨 profile 落到同一 rank，最大化 prompt/首帧 latent 复用：
 
 ```bash

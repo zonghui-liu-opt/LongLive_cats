@@ -27,6 +27,7 @@ STAGE2_METRICS_SCHEMA = "longlive_stage2_metrics/v1"
 STAGE2_TRAINER = "stage2_distillation"
 STAGE2_PROFILE = "baseline"
 STAGE2_H100_LONGRUN_PROFILE = "h100_micro1_acc8_longrun"
+STAGE2_H100_C4W16S1_LONGRUN_PROFILE = "h100_c4w16s1_micro1_acc8_longrun"
 STAGE2_NEGATIVE_PROMPT_SHA256 = hashlib.sha256(
     DEFAULT_NEGATIVE_PROMPT.encode("utf-8")
 ).hexdigest()
@@ -40,34 +41,40 @@ _CANDIDATE_BATCH_PROFILES = ((2, 4), (1, 8))
 
 @dataclass(frozen=True)
 class _Stage2ProfileSpec:
+    rollout_profile: str
     training_batch_profiles: tuple[tuple[int, int], ...]
     phase_a_epochs: int
     phase_b_epochs: int
     generator_lr: float
     fake_score_lr: float
     checkpoint_every_generator_epochs: int
+    keep_last_resumable: int
     phase_a_milestone_epochs: tuple[int, ...]
     phase_b_milestone_epochs: tuple[int, ...]
 
 
 _STAGE2_PROFILE_SPECS = {
     STAGE2_PROFILE: _Stage2ProfileSpec(
+        rollout_profile="baseline_c8w16k4s1",
         training_batch_profiles=_CANDIDATE_BATCH_PROFILES,
         phase_a_epochs=24,
         phase_b_epochs=4,
         generator_lr=2.0e-6,
         fake_score_lr=4.0e-7,
         checkpoint_every_generator_epochs=1,
+        keep_last_resumable=2,
         phase_a_milestone_epochs=(8, 12, 16, 20, 24),
         phase_b_milestone_epochs=(1, 2, 3, 4),
     ),
     STAGE2_H100_LONGRUN_PROFILE: _Stage2ProfileSpec(
+        rollout_profile="baseline_c8w16k4s1",
         training_batch_profiles=((1, 8),),
         phase_a_epochs=360,
         phase_b_epochs=40,
         generator_lr=1.0e-5,
         fake_score_lr=2.0e-6,
         checkpoint_every_generator_epochs=4,
+        keep_last_resumable=2,
         phase_a_milestone_epochs=(
             4,
             8,
@@ -87,6 +94,18 @@ _STAGE2_PROFILE_SPECS = {
             360,
         ),
         phase_b_milestone_epochs=(1, 2, 3, 4, 10, 20, 30, 40),
+    ),
+    STAGE2_H100_C4W16S1_LONGRUN_PROFILE: _Stage2ProfileSpec(
+        rollout_profile="c4w16k4s1",
+        training_batch_profiles=((1, 8),),
+        phase_a_epochs=360,
+        phase_b_epochs=40,
+        generator_lr=5.0e-6,
+        fake_score_lr=1.0e-6,
+        checkpoint_every_generator_epochs=1,
+        keep_last_resumable=400,
+        phase_a_milestone_epochs=(),
+        phase_b_milestone_epochs=(),
     ),
 }
 _CONTRACT_LOCAL_DERIVED_FIELDS = {
@@ -821,6 +840,14 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         raise ValueError(
             f"profile must be one of {tuple(_STAGE2_PROFILE_SPECS)}, got {profile!r}"
         )
+    from pipeline.stage2_rollout_profile import resolve_stage2_rollout_profile
+
+    rollout_profile = resolve_stage2_rollout_profile(profile_spec.rollout_profile)
+    if not rollout_profile.training_allowed:
+        raise AssertionError(
+            f"Stage-2 training profile selected deployment-only rollout "
+            f"{rollout_profile.name!r}"
+        )
 
     infra = _required_section(raw, "infra", _INFRA_KEYS)
     expected_nodes = _locked_integer(infra, "expected_nodes", "infra", 1)
@@ -1115,11 +1142,27 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
             "rollout.local_window_frames must be a multiple of and at least "
             "rollout.chunk_frames."
         )
-    _locked("rollout.generated_episode_frames", generated_episode_frames, 24)
-    _locked("rollout.chunk_frames", chunk_frames, 8)
-    _locked("rollout.local_window_frames", local_window_frames, 16)
-    _locked("rollout.global_sink_frames", global_sink_frames, 1)
-    _locked("rollout.num_denoising_steps", num_denoising_steps, 4)
+    _locked(
+        "rollout.generated_episode_frames",
+        generated_episode_frames,
+        rollout_profile.generated_episode_frames,
+    )
+    _locked("rollout.chunk_frames", chunk_frames, rollout_profile.chunk_frames)
+    _locked(
+        "rollout.local_window_frames",
+        local_window_frames,
+        rollout_profile.local_window_frames,
+    )
+    _locked(
+        "rollout.global_sink_frames",
+        global_sink_frames,
+        rollout_profile.global_sink_frames,
+    )
+    _locked(
+        "rollout.num_denoising_steps",
+        num_denoising_steps,
+        rollout_profile.num_denoising_steps,
+    )
     solver = _locked_string(rollout, "solver", "rollout", "unipc")
     rollout_timestep_shift = _locked_number(rollout, "timestep_shift", "rollout", 5.0)
     exit_sampling = _locked_string(
@@ -1384,7 +1427,10 @@ def resolve_stage2_config(config: Any) -> Stage2ResolvedConfig:
         profile_spec.checkpoint_every_generator_epochs,
     )
     keep_last_resumable = _locked_integer(
-        checkpointing, "keep_last_resumable", "checkpointing", 2
+        checkpointing,
+        "keep_last_resumable",
+        "checkpointing",
+        profile_spec.keep_last_resumable,
     )
     phase_a_milestones = tuple(
         _integer(value, f"checkpointing.phase_a_milestone_epochs[{index}]", minimum=1)

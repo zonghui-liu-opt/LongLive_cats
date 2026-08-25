@@ -513,7 +513,16 @@ def test_checkpoint_rejects_resolved_config_topology_mismatch_before_tensor_load
         validate_stage2_checkpoint(directory)
 
 
-def test_checkpoint_roundtrip_authenticates_longrun_optimizer_learning_rates(tmp_path):
+@pytest.mark.parametrize(
+    ("profile", "generator_lr", "fake_score_lr"),
+    (
+        ("h100_micro1_acc8_longrun", 1.0e-5, 2.0e-6),
+        ("h100_c4w16s1_micro1_acc8_longrun", 5.0e-6, 1.0e-6),
+    ),
+)
+def test_checkpoint_roundtrip_authenticates_longrun_optimizer_learning_rates(
+    tmp_path, profile, generator_lr, fake_score_lr
+):
     def spec(role, learning_rate):
         return {
             "role": role,
@@ -527,25 +536,25 @@ def test_checkpoint_roundtrip_authenticates_longrun_optimizer_learning_rates(tmp
         }
 
     resolved_config = _resolved_config()
-    resolved_config["config"] = {"profile": "h100_micro1_acc8_longrun"}
+    resolved_config["config"] = {"profile": profile}
     resolved_config["derived"].update(
         {
-            "generator_optimizer": spec("generator", 1.0e-5),
-            "fake_score_optimizer": spec("fake_score", 2.0e-6),
+            "generator_optimizer": spec("generator", generator_lr),
+            "fake_score_optimizer": spec("fake_score", fake_score_lr),
         }
     )
     directory = _save(
         tmp_path,
         40,
         resolved_config=resolved_config,
-        generator_lr=1.0e-5,
-        fake_score_lr=2.0e-6,
+        generator_lr=generator_lr,
+        fake_score_lr=fake_score_lr,
     )
     validate_stage2_checkpoint(directory)
     payload = load_stage2_checkpoint(directory)
     assert payload.resolved_config == resolved_config
-    assert payload.generator_optimizer_state["param_groups"][0]["lr"] == 1.0e-5
-    assert payload.fake_score_optimizer_state["param_groups"][0]["lr"] == 2.0e-6
+    assert payload.generator_optimizer_state["param_groups"][0]["lr"] == generator_lr
+    assert payload.fake_score_optimizer_state["param_groups"][0]["lr"] == fake_score_lr
 
 
 def test_c0_publication_canonicalizes_runtime_optimizer_names_before_revalidation(

@@ -284,6 +284,22 @@ def test_rollout_contract_is_built_only_from_the_resolved_stage2_config():
     assert pipeline.frame_seq_length == resolved.patch_tokens_per_frame == 390
 
 
+def test_c4w16_training_contract_uses_four_current_twelve_history_and_one_sink():
+    resolved = load_stage2_config(
+        "configs/train_i2v_stage2_600cats_c4w16s1_micro1_acc8.yaml"
+    )
+    pipeline = Stage2RolloutPipeline.from_resolved_config(_FakeGenerator(), resolved)
+
+    assert pipeline.spec.name == "c4w16k4s1"
+    assert pipeline.chunk_frames == 4
+    assert pipeline.num_chunks == 6
+    assert pipeline.local_window_frames == 16
+    assert pipeline.history_frames == 12
+    assert pipeline.global_sink_frames == 1
+    assert pipeline.physical_kv_capacity_frames == 17
+    assert pipeline.cache_capacity_tokens == 17 * 390
+
+
 def test_stratified_exit_schedule_and_role_rng_resume_are_exact():
     generator = torch.Generator().manual_seed(123)
     schedule = draw_stage2_exit_schedule(
@@ -627,6 +643,7 @@ def test_generate_full_episode_is_bitwise_the_baseline_exit3_kernel():
         ("baseline_c8w16k4s1", 8, 17, 4, 16),
         ("stress_c8w24k4s1", 8, 25, 4, 16),
         ("lower_c8w8k4s1", 8, 9, 4, 16),
+        ("c4w16k4s1", 4, 17, 4, 31),
         ("c4w12k4s1", 4, 13, 4, 31),
         ("c4w8k4s1", 4, 9, 4, 31),
         ("c4w8k2s1", 4, 9, 2, 19),
