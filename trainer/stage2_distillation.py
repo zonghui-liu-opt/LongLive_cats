@@ -89,6 +89,38 @@ _STAGE2_DMD_RUNTIME_METHODS = {
         "timing_callback",
     ),
 }
+_STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION = "longlive_stage2_checkpoint_rng_runtime/v1"
+_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR = (
+    "Deploy one complete stage-2 source snapshot from "
+    "https://github.com/zonghui-liu-opt/LongLive_cats/tree/stage-2; "
+    "do not mix trainer and checkpoint utility files."
+)
+_STAGE2_CHECKPOINT_RNG_RUNTIME_SIGNATURES = {
+    "capture_stage2_rng_state": (
+        (),
+        (
+            "rank",
+            "world_size",
+            "dedicated_generators",
+            "rank0_control_generators",
+            "include_cuda",
+        ),
+    ),
+    "validate_stage2_rng_state": (
+        ("state",),
+        ("expected_rank", "expected_world_size", "expected_dedicated_names"),
+    ),
+    "restore_stage2_rng_state": (
+        ("state",),
+        (
+            "rank",
+            "expected_world_size",
+            "dedicated_generators",
+            "rank0_control_generators",
+            "require_cuda_topology",
+        ),
+    ),
+}
 
 
 def _should_apply_stage2_checkpoint_retention(resolved: Any) -> bool:
@@ -188,6 +220,119 @@ def _audit_stage2_dmd_runtime_api(model_type: type) -> dict[str, Any]:
     }
 
 
+def _audit_stage2_checkpoint_rng_runtime_api(
+    checkpoint_module: Any,
+    *,
+    expected_source: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Reject mixed trainer/checkpoint source before model construction."""
+
+    if expected_source is None:
+        expected_path = (
+            Path(__file__).resolve().parents[1] / "utils" / "stage2_checkpoint.py"
+        )
+    else:
+        expected_path = Path(expected_source).expanduser()
+    expected_path = expected_path.resolve(strict=True)
+    raw_module_source = getattr(checkpoint_module, "__file__", None)
+    if not isinstance(raw_module_source, str) or not raw_module_source:
+        raise RuntimeError(
+            "Stage-2 checkpoint RNG runtime API has no source file. "
+            f"{_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR}"
+        )
+    module_source = Path(raw_module_source).expanduser().resolve(strict=True)
+    if module_source != expected_path:
+        raise RuntimeError(
+            "Stage-2 checkpoint RNG runtime API loaded from the wrong source: "
+            f"expected={expected_path}, actual={module_source}. "
+            f"{_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR}"
+        )
+    if getattr(checkpoint_module, "STAGE2_WORLD_SIZES", None) != (4, 8):
+        raise RuntimeError(
+            "Stage-2 checkpoint RNG runtime API lacks the reviewed 4/8-card "
+            f"topology contract; source={module_source}. "
+            f"{_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR}"
+        )
+    provider_version = getattr(
+        checkpoint_module, "STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION", None
+    )
+    if provider_version != _STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION:
+        raise RuntimeError(
+            "Stage-2 checkpoint RNG runtime API version mismatch: "
+            f"expected={_STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION!r}, "
+            f"actual={provider_version!r}, source={module_source}. "
+            f"{_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR}"
+        )
+
+    signatures: dict[str, str] = {}
+    for function_name, (
+        expected_positional,
+        expected_keyword_only,
+    ) in _STAGE2_CHECKPOINT_RNG_RUNTIME_SIGNATURES.items():
+        function = getattr(checkpoint_module, function_name, None)
+        if not callable(function):
+            raise RuntimeError(
+                "Stage-2 checkpoint RNG runtime API lacks callable "
+                f"{function_name}; source={module_source}. "
+                f"{_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR}"
+            )
+        function_source = inspect.getsourcefile(function)
+        actual_function_source = (
+            Path(function_source).expanduser().resolve(strict=True)
+            if isinstance(function_source, str) and function_source
+            else None
+        )
+        if actual_function_source != expected_path:
+            raise RuntimeError(
+                f"Stage-2 checkpoint RNG callable {function_name} came from "
+                f"the wrong source: expected={expected_path}, "
+                f"actual={actual_function_source}. "
+                f"{_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR}"
+            )
+        signature = inspect.signature(function)
+        positional = tuple(
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+        keyword_only = tuple(
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        )
+        unsupported = tuple(
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }
+        )
+        if (
+            positional != expected_positional
+            or keyword_only != expected_keyword_only
+            or unsupported
+        ):
+            raise RuntimeError(
+                f"Stage-2 checkpoint RNG runtime API mismatch for {function_name}: "
+                f"expected_positional={list(expected_positional)}, "
+                f"actual_positional={list(positional)}, "
+                f"expected_keyword_only={list(expected_keyword_only)}, "
+                f"actual_keyword_only={list(keyword_only)}, "
+                f"unsupported={list(unsupported)}, source={module_source}. "
+                f"{_STAGE2_CHECKPOINT_RNG_RUNTIME_REPAIR}"
+            )
+        signatures[function_name] = str(signature)
+    return {
+        "api_version": provider_version,
+        "source_file": str(module_source),
+        "signatures": signatures,
+        "world_sizes": (4, 8),
+    }
+
+
 class Trainer:
     """Production Stage-2 trainer; construction stays CPU/light until ``train``."""
 
@@ -208,6 +353,11 @@ class Trainer:
         from model.stage2_dmd import Stage2DMD
 
         self.model_runtime_api_audit = _audit_stage2_dmd_runtime_api(Stage2DMD)
+        import utils.stage2_checkpoint as stage2_checkpoint
+
+        self.checkpoint_rng_runtime_api_audit = (
+            _audit_stage2_checkpoint_rng_runtime_api(stage2_checkpoint)
+        )
         if not output_dir:
             raise ValueError("Stage-2 requires an explicit --logdir.")
         if smoke_mode not in {None, "C0", "C1", "C2"}:

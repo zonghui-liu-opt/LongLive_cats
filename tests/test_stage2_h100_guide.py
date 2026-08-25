@@ -378,6 +378,9 @@ def test_stage2_h100_guide_keeps_release_safety_and_validation_order():
     assert "require_distinct_run_paths" in text
     assert "_audit_stage2_dmd_runtime_api" in text
     assert "STAGE2_DMD_RUNTIME_API=PASS" in text
+    assert "_audit_stage2_checkpoint_rng_runtime_api" in text
+    assert "STAGE2_CHECKPOINT_RNG_RUNTIME_API=PASS" in text
+    assert 'project_root / "utils" / "stage2_checkpoint.py"' in text
     assert "STAGE2_PARAMETER_NAMES_API=PASS" in text
     assert "STAGE2_LORA_LOAD_API=PASS" in text
     assert "expected_parameter_names" in text

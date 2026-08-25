@@ -268,6 +268,114 @@ def test_rank_rng_roundtrip_covers_general_dedicated_and_rank0_control():
         assert torch.equal(left, right)
 
 
+@pytest.mark.parametrize(
+    ("world_size", "rank"),
+    ((4, 0), (4, 3), (8, 0), (8, 7)),
+)
+def test_rank_rng_explicit_world_size_roundtrip(world_size, rank):
+    base_seed = world_size * 100 + rank
+    random.seed(base_seed + 1)
+    np.random.seed(base_seed + 2)
+    torch.manual_seed(base_seed + 3)
+    dedicated = {
+        "generator_score": torch.Generator().manual_seed(base_seed + 4),
+        "fake_score_noise": torch.Generator().manual_seed(base_seed + 5),
+    }
+    controls = (
+        {
+            "generator_exit": torch.Generator().manual_seed(base_seed + 6),
+            "fake_score_exit": torch.Generator().manual_seed(base_seed + 7),
+            "dfd_branch": torch.Generator().manual_seed(base_seed + 8),
+        }
+        if rank == 0
+        else None
+    )
+    state = capture_stage2_rng_state(
+        rank=rank,
+        world_size=world_size,
+        dedicated_generators=dedicated,
+        rank0_control_generators=controls,
+        include_cuda=False,
+    )
+    expected = (
+        random.random(),
+        np.random.rand(),
+        torch.rand(2),
+        *(torch.rand(2, generator=value) for value in dedicated.values()),
+        *(torch.rand(2, generator=value) for value in (controls or {}).values()),
+    )
+
+    restore_stage2_rng_state(
+        state,
+        rank=rank,
+        expected_world_size=world_size,
+        dedicated_generators=dedicated,
+        rank0_control_generators=controls,
+        require_cuda_topology=False,
+    )
+    actual = (
+        random.random(),
+        np.random.rand(),
+        torch.rand(2),
+        *(torch.rand(2, generator=value) for value in dedicated.values()),
+        *(torch.rand(2, generator=value) for value in (controls or {}).values()),
+    )
+    assert actual[0] == expected[0]
+    assert actual[1] == expected[1]
+    for left, right in zip(actual[2:], expected[2:]):
+        assert torch.equal(left, right)
+
+
+def test_rank_rng_world_size_mismatch_has_no_partial_mutation():
+    random.seed(101)
+    np.random.seed(102)
+    torch.manual_seed(103)
+    dedicated = {"score": torch.Generator().manual_seed(104)}
+    controls = {
+        "generator_exit": torch.Generator().manual_seed(105),
+        "fake_score_exit": torch.Generator().manual_seed(106),
+        "dfd_branch": torch.Generator().manual_seed(107),
+    }
+    state = capture_stage2_rng_state(
+        rank=0,
+        world_size=4,
+        dedicated_generators=dedicated,
+        rank0_control_generators=controls,
+        include_cuda=False,
+    )
+    random.random()
+    np.random.rand()
+    torch.rand(1)
+    for generator in (*dedicated.values(), *controls.values()):
+        torch.rand(1, generator=generator)
+    before_python = random.getstate()
+    before_numpy = copy.deepcopy(np.random.get_state())
+    before_torch = torch.get_rng_state().clone()
+    before_generators = {
+        name: generator.get_state().clone()
+        for name, generator in {**dedicated, **controls}.items()
+    }
+
+    with pytest.raises(RuntimeError, match="RNG topology mismatch"):
+        restore_stage2_rng_state(
+            state,
+            rank=0,
+            expected_world_size=8,
+            dedicated_generators=dedicated,
+            rank0_control_generators=controls,
+            require_cuda_topology=False,
+        )
+
+    assert random.getstate() == before_python
+    after_numpy = np.random.get_state()
+    assert after_numpy[0] == before_numpy[0]
+    assert np.array_equal(after_numpy[1], before_numpy[1])
+    assert after_numpy[2:] == before_numpy[2:]
+    assert torch.equal(torch.get_rng_state(), before_torch)
+    for name, generator in {**dedicated, **controls}.items():
+        assert torch.equal(generator.get_state(), before_generators[name])
+
+
 def test_rank_rng_rejects_missing_control_without_partial_generator_mutation():
     dedicated = {"score": torch.Generator().manual_seed(1)}
     controls = {

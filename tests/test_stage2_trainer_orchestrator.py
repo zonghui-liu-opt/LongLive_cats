@@ -11,6 +11,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import numpy as np
 import pytest
@@ -25,7 +26,9 @@ import utils.stage2_train_state as train_state_module
 from model.stage2_dmd import Stage2DMD
 from trainer.stage2_distillation import (
     Trainer,
+    _STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION,
     _STAGE2_DMD_RUNTIME_METHODS,
+    _audit_stage2_checkpoint_rng_runtime_api,
     _audit_stage2_dmd_runtime_api,
     _should_apply_stage2_checkpoint_retention,
 )
@@ -112,6 +115,78 @@ def test_stage2_dmd_runtime_api_rejects_stale_loss_signatures(monkeypatch):
     )
     with pytest.raises(RuntimeError, match=r"timing runtime API mismatch"):
         _audit_stage2_dmd_runtime_api(Stage2DMD)
+
+
+def test_stage2_checkpoint_rng_runtime_api_accepts_current_source():
+    audit = _audit_stage2_checkpoint_rng_runtime_api(stage2_checkpoint)
+
+    assert audit["api_version"] == _STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION
+    assert Path(audit["source_file"]) == Path(stage2_checkpoint.__file__).resolve()
+    assert audit["world_sizes"] == (4, 8)
+    assert "expected_world_size" in audit["signatures"]["restore_stage2_rng_state"]
+
+
+def test_stage2_checkpoint_rng_runtime_api_rejects_legacy_restore_signature():
+    def capture_stage2_rng_state(
+        *,
+        rank,
+        world_size=8,
+        dedicated_generators,
+        rank0_control_generators,
+        include_cuda=True,
+    ):
+        del (
+            rank,
+            world_size,
+            dedicated_generators,
+            rank0_control_generators,
+            include_cuda,
+        )
+
+    def validate_stage2_rng_state(
+        state,
+        *,
+        expected_rank,
+        expected_world_size=8,
+        expected_dedicated_names=None,
+    ):
+        del state, expected_rank, expected_world_size, expected_dedicated_names
+
+    def restore_stage2_rng_state(
+        state,
+        *,
+        rank,
+        dedicated_generators,
+        rank0_control_generators,
+        require_cuda_topology=True,
+    ):
+        del (
+            state,
+            rank,
+            dedicated_generators,
+            rank0_control_generators,
+            require_cuda_topology,
+        )
+
+    legacy = SimpleNamespace(
+        __file__=__file__,
+        STAGE2_WORLD_SIZES=(4, 8),
+        STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION=(
+            _STAGE2_CHECKPOINT_RNG_RUNTIME_API_VERSION
+        ),
+        capture_stage2_rng_state=capture_stage2_rng_state,
+        validate_stage2_rng_state=validate_stage2_rng_state,
+        restore_stage2_rng_state=restore_stage2_rng_state,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"restore_stage2_rng_state.*expected_world_size.*Deploy one complete",
+    ):
+        _audit_stage2_checkpoint_rng_runtime_api(
+            legacy,
+            expected_source=Path(__file__),
+        )
 
 
 def test_trainer_micro_loss_call_keywords_match_audited_runtime_api():
@@ -933,44 +1008,23 @@ def test_distributed_checkpoint_dataclass_drives_resume_state_sampler_loader_and
         loader_states["fake_score"],
     )
 
-    rng_calls = []
-
-    def restore_rng(
-        state,
-        *,
-        rank,
-        expected_world_size,
-        dedicated_generators,
-        rank0_control_generators,
-        require_cuda_topology,
-    ):
-        rng_calls.append(
-            {
-                "state": state,
-                "rank": rank,
-                "expected_world_size": expected_world_size,
-                "dedicated_generators": dedicated_generators,
-                "rank0_control_generators": rank0_control_generators,
-                "require_cuda_topology": require_cuda_topology,
-            }
-        )
-
+    restore_rng = create_autospec(stage2_checkpoint.restore_stage2_rng_state)
     monkeypatch.setattr(stage2_checkpoint, "restore_stage2_rng_state", restore_rng)
     trainer._restore_rng_last(loaded)
 
-    assert len(rng_calls) == 1
-    call = rng_calls[0]
-    assert call["state"] is local_rng_state
-    assert call["rank"] == 0
-    assert call["expected_world_size"] == 8
-    assert call["require_cuda_topology"] is True
-    assert call["dedicated_generators"] == {
+    restore_rng.assert_called_once()
+    call = restore_rng.call_args
+    assert call.args == (local_rng_state,)
+    assert call.kwargs["rank"] == 0
+    assert call.kwargs["expected_world_size"] == 8
+    assert call.kwargs["require_cuda_topology"] is True
+    assert call.kwargs["dedicated_generators"] == {
         "generator_rollout": generator_rollout,
         "fake_score_rollout": fake_score_rollout,
         "generator_loader": generator_loader,
         "fake_score_loader": fake_score_loader,
     }
-    assert call["rank0_control_generators"] == {
+    assert call.kwargs["rank0_control_generators"] == {
         "generator_exit": generator_exit,
         "fake_score_exit": fake_score_exit,
         "dfd_branch": branch_rng,

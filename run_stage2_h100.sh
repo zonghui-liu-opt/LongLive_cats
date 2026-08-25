@@ -293,7 +293,11 @@ project_root = Path(sys.argv[1]).resolve(strict=True)
 sys.path.insert(0, str(project_root))
 
 from model.stage2_dmd import Stage2DMD
-from trainer.stage2_distillation import _audit_stage2_dmd_runtime_api
+from trainer.stage2_distillation import (
+    _audit_stage2_checkpoint_rng_runtime_api,
+    _audit_stage2_dmd_runtime_api,
+)
+import utils.stage2_checkpoint as stage2_checkpoint
 from utils.distributed import TrainableShardedEMA
 from utils.lora_utils import (
     STAGE2_LORA_LOAD_API_VERSION,
@@ -319,6 +323,15 @@ if actual_source != expected_source:
 print(
     "STAGE2_DMD_RUNTIME_API=PASS "
     f"version={audit['api_version']} source={actual_source}"
+)
+checkpoint_rng_audit = _audit_stage2_checkpoint_rng_runtime_api(
+    stage2_checkpoint,
+    expected_source=project_root / "utils" / "stage2_checkpoint.py",
+)
+print(
+    "STAGE2_CHECKPOINT_RNG_RUNTIME_API=PASS "
+    f"version={checkpoint_rng_audit['api_version']} "
+    f"source={checkpoint_rng_audit['source_file']}"
 )
 if STAGE2_PARAMETER_NAME_API_VERSION != "longlive_stage2_parameter_names/v1":
     raise SystemExit("Stage-2参数命名API版本不匹配")
