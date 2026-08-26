@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import torch
 from torch import nn
 
 from model.stage2_dmd import Stage2DMD, Stage2DiTRole
+import utils.stage2_role_init as stage2_role_init
 from utils.stage2_config import Stage2AdapterSpec
 from utils.stage1_io import canonical_json_sha256, sha256_file
 from utils.stage2_roles import (
@@ -18,7 +20,10 @@ from utils.stage2_roles import (
     configure_stage2_role_lora,
     expected_stage2_target_names,
 )
-from utils.stage2_role_init import strict_load_stage2_role_base
+from utils.stage2_role_init import (
+    refresh_stage2_role_asset_identities,
+    strict_load_stage2_role_base,
+)
 
 
 def _file_identity(path):
@@ -57,6 +62,25 @@ def _verified_teacher_asset(checkpoint, payload, selector):
             "state_dict_keys_sha256": canonical_json_sha256(state_keys),
             "load_target": "role_wrapper",
             "metadata": metadata,
+        },
+    }
+
+
+def _verified_role_assets(checkpoint, payload, selector, architecture):
+    asset = _verified_teacher_asset(checkpoint, payload, selector)
+    asset["architecture_file"] = {
+        "name": architecture.name,
+        "path": str(architecture),
+        "size": architecture.stat().st_size,
+        "sha256": sha256_file(architecture),
+        "identity": _file_identity(architecture),
+    }
+    return {
+        "generator": copy.deepcopy(asset),
+        "real_score": copy.deepcopy(asset),
+        "fake_score": {
+            **copy.deepcopy(asset),
+            "immutable_source_role": "real_score",
         },
     }
 
@@ -393,6 +417,243 @@ def test_post_load_content_sha_is_recomputed_and_architecture_identity_is_bound(
     architecture.write_text('{"changed":true}', encoding="utf-8")
     with pytest.raises(RuntimeError, match="identity changed"):
         strict_load_stage2_role_base(target, asset=asset)
+
+
+def test_resume_reaudit_accepts_exact_bytes_after_inode_replacement(
+    tmp_path, monkeypatch
+):
+    source = Stage2DiTRole(
+        _Transformer().to(dtype=torch.bfloat16),
+        role="real_score",
+        is_causal=False,
+    ).requires_grad_(False)
+    payload = {"real_score": source.state_dict()}
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(payload, checkpoint)
+    architecture = tmp_path / "config.json"
+    architecture.write_text("{}", encoding="utf-8")
+    live_architecture_root = tmp_path / "relocated-architecture"
+    live_architecture_root.mkdir()
+    live_architecture = live_architecture_root / "config.json"
+    live_architecture.write_bytes(architecture.read_bytes())
+    recorded = _verified_role_assets(checkpoint, payload, "real_score", architecture)
+    stale_identity = dict(recorded["generator"]["checkpoint_files"][0]["identity"])
+
+    replacement = tmp_path / "same-bytes.pt"
+    replacement.write_bytes(checkpoint.read_bytes())
+    replacement.replace(checkpoint)
+    assert _file_identity(checkpoint) != stale_identity
+    real_sha256_open_file = stage2_role_init._sha256_open_file
+    hashed_paths = []
+
+    def counted_sha256_open_file(handle, *, path):
+        hashed_paths.append(path)
+        return real_sha256_open_file(handle, path=path)
+
+    monkeypatch.setattr(stage2_role_init, "_sha256_open_file", counted_sha256_open_file)
+
+    refreshed = refresh_stage2_role_asset_identities(
+        recorded,
+        architecture_root=live_architecture_root,
+    )
+
+    expected_identity = _file_identity(checkpoint)
+    assert recorded["generator"]["checkpoint_files"][0]["identity"] == stale_identity
+    assert all(
+        role["checkpoint_files"][0]["identity"] == expected_identity
+        for role in refreshed.values()
+    )
+    assert all(
+        role["architecture_file"]["identity"] == _file_identity(live_architecture)
+        for role in refreshed.values()
+    )
+    assert all(
+        role["architecture_file"]["path"] == str(live_architecture)
+        for role in refreshed.values()
+    )
+    assert all(
+        role["architecture_file"]["path"] == str(architecture)
+        for role in recorded.values()
+    )
+    assert hashed_paths == [checkpoint, live_architecture]
+
+
+def test_resume_reaudit_rejects_same_size_content_drift(tmp_path):
+    source = Stage2DiTRole(
+        _Transformer().to(dtype=torch.bfloat16),
+        role="real_score",
+        is_causal=False,
+    ).requires_grad_(False)
+    payload = {"real_score": source.state_dict()}
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(payload, checkpoint)
+    architecture = tmp_path / "config.json"
+    architecture.write_text("{}", encoding="utf-8")
+    recorded = _verified_role_assets(checkpoint, payload, "real_score", architecture)
+    changed = bytearray(checkpoint.read_bytes())
+    changed[len(changed) // 2] ^= 1
+    checkpoint.write_bytes(changed)
+
+    with pytest.raises(RuntimeError, match="content SHA changed during resume"):
+        refresh_stage2_role_asset_identities(recorded)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        (
+            "checkpoint_path",
+            "/not/an/authenticated/checkpoint.pt",
+            "checkpoint_path must identify exactly one authenticated",
+        ),
+        ("checkpoint_sha256", "0" * 64, "checkpoint SHA disagrees"),
+    ),
+)
+def test_resume_reaudit_rejects_loader_path_or_top_level_sha_drift(
+    tmp_path, field, value, match
+):
+    source = Stage2DiTRole(
+        _Transformer().to(dtype=torch.bfloat16),
+        role="real_score",
+        is_causal=False,
+    ).requires_grad_(False)
+    payload = {"real_score": source.state_dict()}
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(payload, checkpoint)
+    architecture = tmp_path / "config.json"
+    architecture.write_text("{}", encoding="utf-8")
+    recorded = _verified_role_assets(checkpoint, payload, "real_score", architecture)
+    recorded["generator"][field] = value
+
+    with pytest.raises(RuntimeError, match=match):
+        refresh_stage2_role_asset_identities(recorded)
+
+
+def test_resume_reaudit_native_teacher_hashes_index_and_each_shard_once(
+    tmp_path, monkeypatch
+):
+    generator = tmp_path / "generator.pt"
+    generator.write_bytes(b"generator")
+    index = tmp_path / "diffusion_pytorch_model.safetensors.index.json"
+    index.write_text('{"weight_map":{"a":"one","b":"two"}}', encoding="utf-8")
+    shard_one = tmp_path / "diffusion_pytorch_model-00001-of-00002.safetensors"
+    shard_two = tmp_path / "diffusion_pytorch_model-00002-of-00002.safetensors"
+    shard_one.write_bytes(b"shard-one")
+    shard_two.write_bytes(b"shard-two")
+    architecture = tmp_path / "config.json"
+    architecture.write_text("{}", encoding="utf-8")
+
+    def file_entry(path):
+        return {
+            "name": path.name,
+            "path": str(path),
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+            "identity": _file_identity(path),
+        }
+
+    architecture_entry = file_entry(architecture)
+    generator_asset = {
+        "checkpoint_path": str(generator),
+        "checkpoint_sha256": sha256_file(generator),
+        "checkpoint_format": "longlive_stage1_causal_ema_merged",
+        "checkpoint_files": [file_entry(generator)],
+        "architecture_file": copy.deepcopy(architecture_entry),
+    }
+    teacher_asset = {
+        "checkpoint_path": str(index),
+        "checkpoint_sha256": "a" * 64,
+        "checkpoint_format": "wan_native_transformer",
+        "checkpoint_files": [
+            file_entry(index),
+            file_entry(shard_one),
+            file_entry(shard_two),
+        ],
+        "architecture_file": copy.deepcopy(architecture_entry),
+    }
+    assets = {
+        "generator": generator_asset,
+        "real_score": teacher_asset,
+        "fake_score": {
+            **copy.deepcopy(teacher_asset),
+            "immutable_source_role": "real_score",
+        },
+    }
+    real_sha256_open_file = stage2_role_init._sha256_open_file
+    hashed_paths = []
+
+    def counted_sha256_open_file(handle, *, path):
+        hashed_paths.append(path)
+        return real_sha256_open_file(handle, path=path)
+
+    monkeypatch.setattr(stage2_role_init, "_sha256_open_file", counted_sha256_open_file)
+
+    refreshed = refresh_stage2_role_asset_identities(assets)
+
+    assert hashed_paths == [generator, architecture, index, shard_one, shard_two]
+    for role in ("real_score", "fake_score"):
+        assert [entry["identity"] for entry in refreshed[role]["checkpoint_files"]] == [
+            _file_identity(path) for path in (index, shard_one, shard_two)
+        ]
+
+
+def test_resume_reaudit_rejects_mutation_during_rank0_hash(tmp_path, monkeypatch):
+    source = Stage2DiTRole(
+        _Transformer().to(dtype=torch.bfloat16),
+        role="real_score",
+        is_causal=False,
+    ).requires_grad_(False)
+    payload = {"real_score": source.state_dict()}
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(payload, checkpoint)
+    architecture = tmp_path / "config.json"
+    architecture.write_text("{}", encoding="utf-8")
+    recorded = _verified_role_assets(checkpoint, payload, "real_score", architecture)
+    real_sha256_open_file = stage2_role_init._sha256_open_file
+    mutated = False
+
+    def mutate_after_hash(handle, *, path):
+        nonlocal mutated
+        digest = real_sha256_open_file(handle, path=path)
+        if path == checkpoint and not mutated:
+            mutated = True
+            changed = bytearray(checkpoint.read_bytes())
+            changed[-1] ^= 1
+            checkpoint.write_bytes(changed)
+        return digest
+
+    monkeypatch.setattr(stage2_role_init, "_sha256_open_file", mutate_after_hash)
+
+    with pytest.raises(RuntimeError, match="identity changed during resume"):
+        refresh_stage2_role_asset_identities(recorded)
+
+
+def test_live_identity_gate_still_rejects_replacement_after_resume_reaudit(tmp_path):
+    source = Stage2DiTRole(
+        _Transformer().to(dtype=torch.bfloat16),
+        role="real_score",
+        is_causal=False,
+    ).requires_grad_(False)
+    payload = {"real_score": source.state_dict()}
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(payload, checkpoint)
+    architecture = tmp_path / "config.json"
+    architecture.write_text("{}", encoding="utf-8")
+    refreshed = refresh_stage2_role_asset_identities(
+        _verified_role_assets(checkpoint, payload, "real_score", architecture)
+    )
+
+    replacement = tmp_path / "post-audit-replacement.pt"
+    replacement.write_bytes(checkpoint.read_bytes())
+    replacement.replace(checkpoint)
+    target = Stage2DiTRole(
+        _Transformer().to(dtype=torch.bfloat16),
+        role="real_score",
+        is_causal=False,
+    )
+
+    with pytest.raises(RuntimeError, match="identity changed after its rank-0 hash"):
+        strict_load_stage2_role_base(target, asset=refreshed["real_score"])
 
 
 def test_importing_stage2_role_model_does_not_import_legacy_trainer_t5_or_vae():

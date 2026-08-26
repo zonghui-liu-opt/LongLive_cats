@@ -225,6 +225,95 @@ def _bare_trainer(**attributes):
     return trainer
 
 
+def test_resume_role_initialization_reaudits_assets_before_any_model_load(
+    monkeypatch,
+):
+    import utils.stage2_role_init as role_init_module
+
+    recorded_assets = {"snapshot": "previous-job"}
+    fresh_assets = {"snapshot": "current-rank0-audit"}
+    resume_payload = SimpleNamespace(
+        provenance={"assets": recorded_assets},
+        generator_raw={"generator": "adapter"},
+        fake_score_raw={"fake_score": "adapter"},
+        manifest={"manifest_sha256": "a" * 64},
+    )
+    rank0_labels = []
+    refresh_calls = []
+    initialize_calls = []
+
+    def rank0_checked(label, callback):
+        rank0_labels.append(label)
+        return callback()
+
+    def refresh(assets, *, architecture_root):
+        refresh_calls.append((assets, architecture_root))
+        return fresh_assets
+
+    initialized_model = object()
+
+    def initialize(resolved, **kwargs):
+        initialize_calls.append((resolved, kwargs))
+        assert kwargs["assets"] is fresh_assets
+        assert kwargs["resume_adapter_states"] == {
+            "generator": resume_payload.generator_raw,
+            "fake_score": resume_payload.fake_score_raw,
+        }
+        return SimpleNamespace(
+            model=initialized_model,
+            role_audits={"roles": "audited"},
+            lora_schemas={"schemas": "immutable"},
+        )
+
+    monkeypatch.setattr(
+        role_init_module, "refresh_stage2_role_asset_identities", refresh
+    )
+    monkeypatch.setattr(role_init_module, "initialize_stage2_roles", initialize)
+    monkeypatch.setattr(
+        trainer_module,
+        "_audit_stage2_dmd_runtime_api",
+        lambda model_type: {"model_type": model_type.__name__},
+    )
+    expected_runtime_audit = {"model_type": "object"}
+    trainer = _bare_trainer(
+        resolved=SimpleNamespace(architecture_root="/current/architecture"),
+        is_main_process=True,
+        _rank0_checked=rank0_checked,
+        _world_checked=lambda _label, callback: callback(),
+        model_runtime_api_audit=expected_runtime_audit,
+    )
+
+    trainer._initialize_roles(mesh="mesh", resume_payload=resume_payload)
+
+    assert rank0_labels == ["refresh immutable role assets for resume"]
+    assert refresh_calls == [(recorded_assets, "/current/architecture")]
+    assert len(initialize_calls) == 1
+    assert trainer.assets is fresh_assets
+    assert trainer.model is initialized_model
+    assert trainer.role_audits == {"roles": "audited"}
+    assert trainer.lora_schemas == {"schemas": "immutable"}
+
+    trainer.dataset = SimpleNamespace(
+        manifest={"manifest_sha256": "b" * 64},
+        source_manifest={"manifest_sha256": "c" * 64},
+        negative_conditioning={
+            "manifest": {
+                "manifest_sha256": "d" * 64,
+                "artifact": {"sha256": "e" * 64},
+            }
+        },
+    )
+    trainer.resume_checkpoint = "/checkpoint_stage2_g000001"
+    trainer.resume_payload = resume_payload
+    trainer._last_cycle_smoke_probe = None
+    child_provenance = trainer._checkpoint_provenance()
+    assert child_provenance["assets"] is fresh_assets
+    assert child_provenance["lineage"] == {
+        "parent_checkpoint": "/checkpoint_stage2_g000001",
+        "parent_checkpoint_manifest_sha256": "a" * 64,
+    }
+
+
 def _sampler_state(*, completed_f: int, completed_g: int):
     actions = ("a", "b", "c")
     streams = build_stage2_role_samplers(

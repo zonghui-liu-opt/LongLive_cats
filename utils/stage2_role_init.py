@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import gc
 import hashlib
+import os
 from pathlib import Path
+import stat
 import sys
 from typing import Any, TypeVar
 
@@ -129,15 +132,207 @@ def stage2_init_only_side_effect_guard():
             setattr(owner, attribute, original)
 
 
-def _current_file_identity(path: Path) -> dict[str, int]:
-    stat = path.stat()
+def _file_identity_from_stat(value: os.stat_result) -> dict[str, int]:
     return {
-        "device": int(stat.st_dev),
-        "inode": int(stat.st_ino),
-        "size": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
-        "ctime_ns": int(stat.st_ctime_ns),
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+        "size": int(value.st_size),
+        "mtime_ns": int(value.st_mtime_ns),
+        "ctime_ns": int(value.st_ctime_ns),
     }
+
+
+def _current_file_identity(path: Path) -> dict[str, int]:
+    return _file_identity_from_stat(path.stat())
+
+
+def _sha256_open_file(handle: Any, *, path: Path) -> str:
+    del path
+    digest = hashlib.sha256()
+    while chunk := handle.read(8 << 20):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resume_asset_file_attestation(
+    entry: Mapping[str, Any],
+    *,
+    label: str,
+    cache: dict[tuple[str, int, str], dict[str, int]],
+) -> dict[str, int]:
+    """Reauthenticate one persisted asset and return this job's live identity."""
+
+    if not isinstance(entry, Mapping):
+        raise TypeError(f"{label} must be an object")
+    raw_path = entry.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(f"{label}.path must be a non-empty string")
+    path = Path(raw_path).expanduser()
+    try:
+        resolved = path.resolve(strict=True)
+        file_stat = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"{label} is unavailable during Stage-2 resume: {path}"
+        ) from exc
+    if path != resolved or stat.S_ISLNK(file_stat.st_mode):
+        raise RuntimeError(
+            f"{label} must remain a canonical non-symlink path during Stage-2 "
+            f"resume: recorded={path}, resolved={resolved}"
+        )
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise RuntimeError(f"{label} is not a regular file: {path}")
+
+    expected_size = entry.get("size")
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+    ):
+        raise ValueError(f"{label}.size must be a non-negative integer")
+    expected_sha = entry.get("sha256")
+    if (
+        not isinstance(expected_sha, str)
+        or len(expected_sha) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha)
+    ):
+        raise ValueError(f"{label}.sha256 must be a lowercase SHA256")
+
+    cache_key = (str(resolved), expected_size, expected_sha)
+    cached_identity = cache.get(cache_key)
+    if cached_identity is not None:
+        current_identity = _current_file_identity(resolved)
+        if resolved.is_symlink() or current_identity != cached_identity:
+            raise RuntimeError(
+                "Stage-2 checkpoint file identity changed during resume rank-0 "
+                f"audit: expected={cached_identity}, actual={current_identity}, "
+                f"path={resolved}"
+            )
+        return dict(cached_identity)
+
+    with resolved.open("rb") as handle:
+        before_stat = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before_stat.st_mode):
+            raise RuntimeError(f"{label} descriptor is not a regular file")
+        actual_sha = _sha256_open_file(handle, path=resolved)
+        after_stat = os.fstat(handle.fileno())
+    before_identity = _file_identity_from_stat(before_stat)
+    after_identity = _file_identity_from_stat(after_stat)
+    if before_identity != after_identity:
+        raise RuntimeError(
+            "Stage-2 checkpoint file identity changed during resume rank-0 "
+            f"audit: before={before_identity}, after={after_identity}, path={resolved}"
+        )
+    if before_identity["size"] != expected_size:
+        raise RuntimeError(
+            "Stage-2 checkpoint file size changed during resume rank-0 audit: "
+            f"expected={expected_size}, actual={before_identity['size']}, "
+            f"path={resolved}"
+        )
+    try:
+        after_stat = resolved.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"{label} disappeared during Stage-2 resume rank-0 audit: {resolved}"
+        ) from exc
+    if stat.S_ISLNK(after_stat.st_mode) or not stat.S_ISREG(after_stat.st_mode):
+        raise RuntimeError(
+            f"{label} changed file type during Stage-2 resume rank-0 audit: {resolved}"
+        )
+    path_identity = _current_file_identity(resolved)
+    if after_identity != path_identity:
+        raise RuntimeError(
+            "Stage-2 checkpoint path changed during resume rank-0 audit: "
+            f"descriptor={after_identity}, path_identity={path_identity}, "
+            f"path={resolved}"
+        )
+    if actual_sha != expected_sha:
+        raise RuntimeError(
+            "Stage-2 checkpoint content SHA changed during resume rank-0 audit: "
+            f"expected={expected_sha}, actual={actual_sha}, path={resolved}"
+        )
+    cache[cache_key] = after_identity
+    return dict(after_identity)
+
+
+def refresh_stage2_role_asset_identities(
+    assets: Mapping[str, Any],
+    *,
+    architecture_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Refresh historical stat identities only after a rank-0 content audit.
+
+    Checkpoint provenance deliberately keeps the immutable path/size/SHA and
+    semantic asset contract. Device, inode and timestamps authenticate only
+    one runtime mount observation, so a resumed job must not reuse those old
+    values as its live TOCTOU bracket. The architecture config may be relocated
+    by the launch config, but its recorded size/SHA remain authoritative.
+    """
+
+    if not isinstance(assets, Mapping):
+        raise TypeError("Stage-2 resume assets must be an object")
+    expected_roles = {"generator", "real_score", "fake_score"}
+    if set(assets) != expected_roles:
+        raise ValueError(
+            "Stage-2 resume assets must contain exactly generator/real_score/"
+            f"fake_score; actual={sorted(assets)}"
+        )
+    refreshed = copy.deepcopy(dict(assets))
+    cache: dict[tuple[str, int, str], dict[str, int]] = {}
+    live_architecture_path = None
+    if architecture_root is not None:
+        live_architecture_path = (
+            Path(architecture_root).expanduser() / "config.json"
+        ).resolve(strict=True)
+    for role in ("generator", "real_score", "fake_score"):
+        asset = refreshed[role]
+        if not isinstance(asset, dict):
+            raise TypeError(f"Stage-2 resume asset {role} must be an object")
+        files = asset.get("checkpoint_files")
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"Stage-2 resume asset {role} lacks checkpoint_files")
+        for index, entry in enumerate(files):
+            if not isinstance(entry, dict):
+                raise TypeError(
+                    f"Stage-2 resume asset {role}.checkpoint_files[{index}] "
+                    "must be an object"
+                )
+            entry["identity"] = _resume_asset_file_attestation(
+                entry,
+                label=f"Stage-2 {role}.checkpoint_files[{index}]",
+                cache=cache,
+            )
+        checkpoint_path = asset.get("checkpoint_path")
+        if not isinstance(checkpoint_path, str) or not checkpoint_path:
+            raise ValueError(
+                f"Stage-2 resume asset {role}.checkpoint_path must be a path string"
+            )
+        checkpoint_entries = [
+            entry for entry in files if entry.get("path") == checkpoint_path
+        ]
+        if len(checkpoint_entries) != 1:
+            raise RuntimeError(
+                f"Stage-2 resume asset {role}.checkpoint_path must identify exactly "
+                f"one authenticated checkpoint file: path={checkpoint_path}"
+            )
+        if asset.get("checkpoint_format") != "wan_native_transformer" and (
+            asset.get("checkpoint_sha256") != checkpoint_entries[0].get("sha256")
+        ):
+            raise RuntimeError(
+                f"Stage-2 resume asset {role} checkpoint SHA disagrees with its "
+                "authenticated file entry"
+            )
+        architecture = asset.get("architecture_file")
+        if not isinstance(architecture, dict):
+            raise ValueError(f"Stage-2 resume asset {role} lacks architecture_file")
+        if live_architecture_path is not None:
+            architecture["path"] = str(live_architecture_path)
+        architecture["identity"] = _resume_asset_file_attestation(
+            architecture,
+            label=f"Stage-2 {role}.architecture_file",
+            cache=cache,
+        )
+    return refreshed
 
 
 def _assert_verified_asset_files_unchanged(
@@ -160,7 +355,8 @@ def _assert_verified_asset_files_unchanged(
         if identity != entry.get("identity"):
             raise RuntimeError(
                 "Stage-2 checkpoint file identity changed after its rank-0 hash "
-                f"audit: {path}"
+                f"audit: expected={entry.get('identity')}, actual={identity}, "
+                f"path={path}"
             )
         if verify_content_hash:
             cache_key = (

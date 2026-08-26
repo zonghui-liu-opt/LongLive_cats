@@ -777,7 +777,10 @@ class Trainer:
         }
 
     def _initialize_roles(self, mesh: Any, resume_payload: Any) -> None:
-        from utils.stage2_role_init import initialize_stage2_roles
+        from utils.stage2_role_init import (
+            initialize_stage2_roles,
+            refresh_stage2_role_asset_identities,
+        )
         from utils.stage2_role_manifest import audit_stage2_init_assets
 
         if resume_payload is None:
@@ -786,7 +789,13 @@ class Trainer:
             )
             adapter_states = None
         else:
-            assets = resume_payload.provenance["assets"]
+            assets = self._rank0_checked(
+                "refresh immutable role assets for resume",
+                lambda: refresh_stage2_role_asset_identities(
+                    resume_payload.provenance["assets"],
+                    architecture_root=self.resolved.architecture_root,
+                ),
+            )
             adapter_states = {
                 "generator": resume_payload.generator_raw,
                 "fake_score": resume_payload.fake_score_raw,
