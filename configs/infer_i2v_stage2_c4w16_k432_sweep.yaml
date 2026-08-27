@@ -1,0 +1,23 @@
+schema: longlive_stage2_inference_sweep/v1
+base_config: infer_i2v_stage2_baseline.yaml
+output_root: ${oc.env:LONG_LIVE_STAGE2_INFERENCE_OUTPUT,/path/to/stage2_c4w16_k432_inference}
+
+# First-stage deployment sweep for checkpoints trained with C4/W16/S1/K4.
+# The named K4 point is the exact training topology. K3/K2 rebuild their own
+# native UniPC shift=5 schedules; they are not truncated K4 trajectories.
+profile_set:
+  named:
+    - c4w16k4s1
+  grids: []
+  cases:
+    - {chunk_frames: 4, local_window_frames: 16, num_denoising_steps: 3}
+    - {chunk_frames: 4, local_window_frames: 16, num_denoising_steps: 2}
+
+# quick: 4 base samples/profile x 3 profiles = 12 video+trace pairs/checkpoint.
+# CLI --evaluation formal promotes the unchanged profile set to
+# 56 base samples/profile = 168 video+trace pairs/checkpoint.
+evaluation:
+  mode: quick
+  seeds: [1]
+  single_row_ids: [0, 3]
+  two_action_row_ids: [0, 4]

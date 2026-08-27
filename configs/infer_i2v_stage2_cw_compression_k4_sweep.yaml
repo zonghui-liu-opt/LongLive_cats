@@ -1,0 +1,26 @@
+schema: longlive_stage2_inference_sweep/v1
+base_config: infer_i2v_stage2_baseline.yaml
+output_root: ${oc.env:LONG_LIVE_STAGE2_INFERENCE_OUTPUT,/path/to/stage2_cw_compression_k4_inference}
+
+# Second-stage topology sweep. Keep K4 fixed so quality changes can be
+# attributed to chunk/window compression instead of denoising-step changes.
+# C4/W16 is the exact training control; all dynamic points enforce S=1.
+profile_set:
+  named:
+    - c4w16k4s1
+  grids: []
+  cases:
+    # Window-only compression.
+    - {chunk_frames: 4, local_window_frames: 12, num_denoising_steps: 4}
+    - {chunk_frames: 4, local_window_frames: 8, num_denoising_steps: 4}
+    # Chunk-only compression at W16, then combined chunk/window compression.
+    - {chunk_frames: 2, local_window_frames: 16, num_denoising_steps: 4}
+    - {chunk_frames: 2, local_window_frames: 8, num_denoising_steps: 4}
+
+# quick: 4 base samples/profile x 5 profiles = 20 video+trace pairs/checkpoint.
+# formal: 56 base samples/profile x 5 profiles = 280 pairs/checkpoint.
+evaluation:
+  mode: quick
+  seeds: [1]
+  single_row_ids: [0, 3]
+  two_action_row_ids: [0, 4]
