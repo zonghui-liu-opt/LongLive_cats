@@ -1,0 +1,101 @@
+# Stage-1 Phase-A+Phase-B EMA LoRA self-rollout inference.
+#
+# The first encoded image latent is a permanent S1 global sink.  The 24 future
+# latent frames are generated from noise in causal chunks; only each chunk's
+# final model-generated clean x0 is committed to KV for the next chunk.
+
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  architecture_root: ${oc.env:LONG_LIVE_STAGE1_ARCHITECTURE_ROOT}
+  # Build the causal architecture only; generator_ckpt supplies all weights.
+  init_weights: false
+  timestep_shift: 5.0
+  num_frame_per_block: 8
+  local_attn_size: 17
+
+model_paths:
+  t5_checkpoint: ${oc.env:LONG_LIVE_STAGE1_T5_CHECKPOINT}
+  tokenizer_dir: ${oc.env:LONG_LIVE_STAGE1_TOKENIZER_DIR}
+  vae_checkpoint: ${oc.env:LONG_LIVE_STAGE1_VAE_CHECKPOINT}
+
+i2v: true
+use_ema: false
+merge_lora: false
+model_quant: false
+fp8_quant: false
+kv_quant: false
+num_output_frames: 24
+num_frame_per_block: 8
+timestep_shift: 5.0
+sampling_steps: 50
+guidance_scale: 5.0
+save_with_index: true
+inference_iter: -1
+
+data:
+  # ImagePromptDataset layout: images/<id>.(png|jpg) + prompts/<id>.txt.
+  data_path: ${oc.env:LONG_LIVE_STAGE1_ROLLOUT_INPUT}
+  image_or_video_shape: [1, 24, 48, 30, 52]
+
+checkpoints:
+  # Converted causal Stage-1 base referenced by base_reference.json.
+  generator_ckpt: ${oc.env:LONG_LIVE_STAGE1_BASE_CHECKPOINT}
+  # Must be the EMA artifact inside a complete formal Stage-1 checkpoint.
+  lora_ckpt: ${oc.env:LONG_LIVE_STAGE1_CHECKPOINT_DIR}/adapter_ema.safetensors
+
+adapter:
+  type: lora
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  bias: none
+  modules_to_save: []
+  target_patterns:
+    - '^blocks\.[0-9]+\.self_attn\.(q|k|v|o)$'
+    - '^blocks\.[0-9]+\.ffn\.(0|2)$'
+  expected_target_modules: 180
+  expected_trainable_parameters: 57016320
+  expected_adapter_tensors: 360
+  verbose: true
+
+inference:
+  output_folder: ${oc.env:LONG_LIVE_STAGE1_ROLLOUT_OUTPUT}
+  num_samples: 1
+  sampling_steps: 50
+  guidance_scale: 5.0
+  local_attn_size: 17
+  sink_size: 1
+  independent_first_frame: false
+  multi_shot_sink: false
+  shot_clean_recache: false
+  streaming_vae: false
+  async_vae: false
+  save_latents_only: false
+  dataloader_num_workers: 0
+  pin_memory: false
+  vae_type: wan
+
+stage1_rollout:
+  enabled: true
+  profile:
+    # User-facing total window = sink + generated history + current chunk.
+    chunk_size: 8
+    window_size: 17
+    global_sink_size: 1
+    generated_frames: 24
+    sampling_steps: 50
+    timestep_shift: 5.0
+    guidance_scale: 5.0
+    solver: unipc
+    kv_quant: false
+  checkpoint:
+    require_ema: true
+    verify_hashes: true
+    expected_phase_epochs: [10, 20]
+    # The audited A10+B20 run completes all declared phases at update 4500.
+    # Pass --stage1_rollout_expected_step 3750 only for the known B-in-progress
+    # ablation; its trace will be labeled phase_b_error_recycling_in_progress.
+    expected_completed_step: 4500
+
+logging:
+  seed: 1

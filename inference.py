@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import copy
 from pathlib import Path
 
 # torchrun no longer consistently prepends the script directory to sys.path,
@@ -117,11 +118,81 @@ te_quant_group.add_argument(
     help="Override config and disable TransformerEngine quantization",
 )
 parser.set_defaults(use_te_quant=None)
+parser.add_argument("--stage1_rollout_chunk_size", type=int, default=None)
+parser.add_argument("--stage1_rollout_window_size", type=int, default=None)
+parser.add_argument("--stage1_rollout_sampling_steps", type=int, default=None)
+parser.add_argument("--stage1_rollout_timestep_shift", type=float, default=None)
+parser.add_argument("--stage1_rollout_guidance_scale", type=float, default=None)
+parser.add_argument("--stage1_rollout_expected_step", type=int, default=None)
 args = parser.parse_args()
 
 config = normalize_config(OmegaConf.load(args.config_path))
 if args.use_te_quant is not None:
     config.model_quant_use_transformer_engine = args.use_te_quant
+
+stage1_rollout_section = getattr(config, "stage1_rollout", None)
+stage1_rollout_enabled = False
+stage1_rollout_profile = None
+stage1_rollout_plan = None
+if stage1_rollout_section is not None:
+    raw_enabled = getattr(stage1_rollout_section, "enabled", False)
+    if not isinstance(raw_enabled, bool):
+        raise TypeError("stage1_rollout.enabled must be a bool")
+    stage1_rollout_enabled = raw_enabled
+if stage1_rollout_enabled:
+    from utils.stage1_rollout_profile import (
+        resolve_stage1_rollout_profile_overrides,
+    )
+
+    raw_profile = getattr(stage1_rollout_section, "profile", {})
+    if OmegaConf.is_config(raw_profile):
+        raw_profile = OmegaConf.to_container(raw_profile, resolve=True)
+    stage1_rollout_profile, raw_profile = (
+        resolve_stage1_rollout_profile_overrides(
+            raw_profile,
+            {
+                "chunk_size": args.stage1_rollout_chunk_size,
+                "window_size": args.stage1_rollout_window_size,
+                "sampling_steps": args.stage1_rollout_sampling_steps,
+                "timestep_shift": args.stage1_rollout_timestep_shift,
+                "guidance_scale": args.stage1_rollout_guidance_scale,
+            },
+        )
+    )
+    # Checkpoint preflight reads this same nested source later.  Keeping the
+    # merged raw mapping here prevents CLI overrides from diverging from the
+    # audited runtime profile.
+    stage1_rollout_section.profile = raw_profile
+    if args.stage1_rollout_expected_step is not None:
+        if getattr(stage1_rollout_section, "checkpoint", None) is None:
+            stage1_rollout_section.checkpoint = {}
+        stage1_rollout_section.checkpoint.expected_completed_step = (
+            args.stage1_rollout_expected_step
+        )
+
+    # section_get() prioritizes the nested inference mapping, so publish the
+    # canonical profile to both normalized views before pipeline construction.
+    config.num_output_frames = stage1_rollout_profile.generated_frames
+    config.num_frame_per_block = stage1_rollout_profile.chunk_size
+    config.timestep_shift = stage1_rollout_profile.timestep_shift
+    config.sampling_steps = stage1_rollout_profile.sampling_steps
+    config.guidance_scale = stage1_rollout_profile.guidance_scale
+    config.negative_prompt = stage1_rollout_profile.negative_prompt
+    config.kv_quant = False
+    config.image_or_video_shape[1] = stage1_rollout_profile.generated_frames
+    config.model_kwargs.num_frame_per_block = stage1_rollout_profile.chunk_size
+    config.model_kwargs.timestep_shift = stage1_rollout_profile.timestep_shift
+    config.model_kwargs.local_attn_size = stage1_rollout_profile.window_size
+    config.inference.sampling_steps = stage1_rollout_profile.sampling_steps
+    config.inference.guidance_scale = stage1_rollout_profile.guidance_scale
+    config.inference.negative_prompt = stage1_rollout_profile.negative_prompt
+    config.inference.local_attn_size = stage1_rollout_profile.window_size
+    config.inference.sink_size = stage1_rollout_profile.global_sink_size
+    config.inference.independent_first_frame = False
+    config.inference.multi_shot_sink = False
+    config.inference.shot_clean_recache = False
+    config.inference.streaming_vae = False
+    config.inference.async_vae = False
 
 if not hasattr(config, "sampling_steps") or config.sampling_steps is None:
     raise ValueError("sampling_steps must be defined in the inference config")
@@ -156,6 +227,17 @@ def _config_bool(value, default=False):
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+if stage1_rollout_enabled:
+    from utils.stage1_rollout_inference import (
+        resolve_stage1_rollout_global_prompt,
+        resolve_stage1_rollout_inference_plan,
+    )
+
+    stage1_rollout_plan = resolve_stage1_rollout_inference_plan(config)
+    if stage1_rollout_plan.profile != stage1_rollout_profile:
+        raise AssertionError("Stage-1 rollout profile changed during preflight")
 
 
 def _expected_inference_samples(config):
@@ -320,6 +402,7 @@ if has_lora_adapter and (
 materialize_quantized_weights_for_inference = None
 generator_checkpoint = None
 generator_lora_state = None
+lora_load_report = None
 generator_ckpt_path = getattr(config, "generator_ckpt", None)
 loaded_prequantized_generator = False
 prequantized_generator_backend = None
@@ -455,6 +538,22 @@ if has_lora_adapter:
 elif merge_lora and local_rank == 0:
     print("merge_lora=True requested but no adapter config was found; continuing without LoRA merge")
 
+if stage1_rollout_enabled:
+    from utils.stage1_io import sha256_file
+
+    if not pipeline.is_lora_enabled or pipeline.is_lora_merged:
+        raise RuntimeError("Stage-1 rollout did not load a dynamic LoRA adapter")
+    if lora_load_report is None:
+        raise RuntimeError("Stage-1 rollout LoRA loader did not return an audit report")
+    for kind in ("base", "adapter"):
+        asset = stage1_rollout_plan.checkpoint_provenance[kind]
+        actual_sha256 = sha256_file(asset["path"])
+        if actual_sha256 != asset["sha256"]:
+            raise RuntimeError(
+                f"Stage-1 rollout {kind} changed between preflight and model load"
+            )
+    stage1_rollout_plan.checkpoint_provenance["post_load_sha256_verified"] = True
+
 del generator_checkpoint
 
 
@@ -531,6 +630,9 @@ if continuation_config is not None and _config_bool(
         )
     print(json.dumps(continuation_report, ensure_ascii=False, indent=2))
     raise SystemExit(0)
+
+if stage1_rollout_enabled and dist.is_initialized():
+    raise ValueError("Stage-1 rollout inference supports one GPU only")
 
 # Create dataset
 nfpb = getattr(config, 'num_frame_per_block', 8)
@@ -672,8 +774,13 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # MultiTextConcatDataset + eval_collate_fn: prompts[0] is List[str].
     block_prompts = list(batch['prompts'][0])
-    prompt = block_prompts[0]  # for filename
-    prompts = [block_prompts] * config.num_samples
+    if stage1_rollout_enabled:
+        prompt = resolve_stage1_rollout_global_prompt(block_prompts)
+        # Keep the sidecar identical to the actual single global condition.
+        block_prompts = [prompt]
+    else:
+        prompt = block_prompts[0]  # for filename
+    prompts = [list(block_prompts) for _ in range(config.num_samples)]
 
     shape = config.image_or_video_shape
     noise_generator = None
@@ -722,8 +829,33 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
     if initial_latent is not None:
         inference_kwargs["initial_latent"] = initial_latent
+    rollout_result = None
     with torch.inference_mode():
-        generated = pipeline.inference(**inference_kwargs)
+        if stage1_rollout_enabled:
+            from pipeline.stage1_rollout import run_stage1_rollout
+
+            rollout_prompts = [prompt] * config.num_samples
+            rollout_provenance = copy.deepcopy(
+                stage1_rollout_plan.checkpoint_provenance
+            )
+            rollout_provenance["adapter"]["load_report"] = copy.deepcopy(
+                lora_load_report
+            )
+            rollout_result = run_stage1_rollout(
+                pipeline,
+                initial_latent=initial_latent,
+                future_noise=sampled_noise,
+                prompts=rollout_prompts,
+                profile=stage1_rollout_profile,
+                checkpoint_provenance=rollout_provenance,
+            )
+            generated = (
+                rollout_result.latents
+                if save_latents_only
+                else rollout_result.video
+            )
+        else:
+            generated = pipeline.inference(**inference_kwargs)
 
     if not save_latents_only:
         current_video = rearrange(generated, 'b t c h w -> b t h w c').cpu()
@@ -761,10 +893,34 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             if save_latents_only:
                 latent_path = os.path.join(config.output_folder, f'{base_name}.pt')
                 torch.save(latents[seed_idx].cpu(), latent_path)
+                rollout_artifact_path = latent_path
             else:
                 output_path = os.path.join(config.output_folder, f'{base_name}.mp4')
                 fps = 24 if '5B' in config.model_kwargs.model_name else 16
                 write_video(output_path, video[seed_idx], fps=fps)
+                rollout_artifact_path = output_path
+
+            if rollout_result is not None:
+                from utils.stage1_io import atomic_write_json, sha256_file
+
+                rollout_trace = copy.deepcopy(rollout_result.trace)
+                rollout_trace["output_artifact"] = {
+                    "path": str(Path(rollout_artifact_path).resolve()),
+                    "sha256": sha256_file(rollout_artifact_path),
+                    "size": Path(rollout_artifact_path).stat().st_size,
+                    "kind": "latents" if save_latents_only else "video",
+                    "fps": None if save_latents_only else fps,
+                    "pixel_frames": (
+                        None if save_latents_only else int(video[seed_idx].shape[0])
+                    ),
+                }
+                atomic_write_json(
+                    os.path.join(
+                        config.output_folder,
+                        f"{base_name}_stage1_rollout_trace.json",
+                    ),
+                    rollout_trace,
+                )
 
             prompt_txt_path = os.path.join(config.output_folder, f'{base_name}_prompts.txt')
             save_prompts_to_txt(

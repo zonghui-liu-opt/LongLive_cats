@@ -777,6 +777,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         crossattn_cache_neg,
         anchor_latent: Optional[torch.Tensor] = None,
         zero_kv_before_recache: bool = False,
+        noisy_commit_self_kv: Optional[bool] = None,
+        clean_commit_self_kv: Optional[bool] = None,
+        terminal_direct_x0: bool = False,
+        execution_trace: Optional[dict] = None,
     ) -> torch.Tensor:
         """Denoise one causal block and recache its final clean latents.
 
@@ -784,6 +788,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         ordinary independent-video API and explicit continuation sessions.
         ``global_start_frame`` drives absolute RoPE/cache indices, while
         ``cache_start_frame`` remains the caller's local output offset.
+
+        The explicit cache-policy and terminal-x0 controls are opt-in.  Their
+        ``None``/``False`` defaults preserve the historical Stage-1 and
+        continuation behavior exactly.  Profiled self-rollout uses deferred
+        noisy K/V, commits only the final clean recache, and exits UniPC with
+        the exact-sigma flow-to-x0 identity used by Stage-2.
         """
 
         if noise_block.ndim != 5:
@@ -797,6 +807,24 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             raise ValueError("block start indices must be non-negative")
         if use_cfg and unconditional_dict is None:
             raise ValueError("CFG requires unconditional conditioning")
+        for name, value in (
+            ("noisy_commit_self_kv", noisy_commit_self_kv),
+            ("clean_commit_self_kv", clean_commit_self_kv),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool or None")
+        if not isinstance(terminal_direct_x0, bool):
+            raise TypeError("terminal_direct_x0 must be bool")
+        if terminal_direct_x0 and self.sample_solver != "unipc":
+            raise ValueError("terminal_direct_x0 currently requires UniPC")
+        if execution_trace is not None and not isinstance(execution_trace, dict):
+            raise TypeError("execution_trace must be a dict or None")
+        explicit_rollout_contract = bool(
+            noisy_commit_self_kv is not None
+            or clean_commit_self_kv is not None
+            or terminal_direct_x0
+            or execution_trace is not None
+        )
         if len(kv_cache_pos) != self.num_transformer_blocks or len(
             crossattn_cache_pos
         ) != self.num_transformer_blocks:
@@ -838,11 +866,97 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             crossattn_cache_pos[block_index]["is_init"] = False
             crossattn_cache_neg[block_index]["is_init"] = False
 
+        def call_generator(
+            *,
+            latent: torch.Tensor,
+            conditioning: dict,
+            timestep: torch.Tensor,
+            kv_cache,
+            crossattn_cache,
+            commit_self_kv: Optional[bool],
+        ):
+            kwargs = {
+                "noisy_image_or_video": latent,
+                "conditional_dict": conditioning,
+                "timestep": timestep,
+                "kv_cache": kv_cache,
+                "crossattn_cache": crossattn_cache,
+                "current_start": global_start_frame * self.frame_seq_length,
+                "cache_start": cache_start_frame * self.frame_seq_length,
+            }
+            # Do not pass a new keyword on legacy calls: several external
+            # wrappers and characterization fakes intentionally expose the
+            # pre-policy signature.
+            if commit_self_kv is not None:
+                kwargs["commit_self_kv"] = commit_self_kv
+            value = self.generator(**kwargs)
+            # Preserve the legacy seam exactly: denoising callers still unpack
+            # the historical two values, while the clean recache still ignores
+            # its return value.  Strict result validation belongs only to the
+            # new opt-in rollout contract.
+            if not explicit_rollout_contract:
+                return value
+            if not isinstance(value, tuple) or len(value) < 2:
+                raise TypeError("generator must return (raw_flow, x0_pred)")
+            raw_flow, x0_pred = value[:2]
+            if not torch.is_tensor(raw_flow):
+                raise TypeError("generator raw_flow must be a tensor")
+            if raw_flow.shape != latent.shape:
+                raise ValueError("generator changed the raw-flow block shape")
+            # Historical Stage-1 wrappers/fakes may return ``None`` for x0;
+            # this kernel deliberately derives terminal x0 from the CFG-combined
+            # raw flow and the exact UniPC sigma instead of consuming it.
+            if x0_pred is not None and (
+                not torch.is_tensor(x0_pred) or x0_pred.shape != latent.shape
+            ):
+                raise ValueError("generator changed the optional x0 block shape")
+            return raw_flow, x0_pred
+
         latents = noise_block
         sample_scheduler = self._initialize_sample_scheduler(noise_block)
         if len(sample_scheduler.timesteps) == 0:
             raise RuntimeError("sample scheduler returned no timesteps")
-        for t in tqdm(sample_scheduler.timesteps):
+        if terminal_direct_x0:
+            scheduler_sigmas = getattr(sample_scheduler, "sigmas", None)
+            if (
+                not torch.is_tensor(scheduler_sigmas)
+                or len(scheduler_sigmas) != len(sample_scheduler.timesteps) + 1
+                or not bool(torch.isfinite(scheduler_sigmas).all().item())
+                or float(scheduler_sigmas[-1].item()) != 0.0
+            ):
+                raise RuntimeError(
+                    "terminal_direct_x0 requires K+1 finite UniPC sigmas ending at zero"
+                )
+        if execution_trace is not None:
+            if execution_trace:
+                raise ValueError("execution_trace must be empty")
+            sigmas = getattr(sample_scheduler, "sigmas", None)
+            execution_trace.update(
+                {
+                    "timesteps": [
+                        int(value.item())
+                        if torch.is_tensor(value)
+                        else int(value)
+                        for value in sample_scheduler.timesteps
+                    ],
+                    "sigmas": (
+                        [float(value) for value in sigmas.detach().float().cpu()]
+                        if torch.is_tensor(sigmas)
+                        else []
+                    ),
+                    "denoising_steps": len(sample_scheduler.timesteps),
+                    "solver_update_calls": (
+                        len(sample_scheduler.timesteps) - 1
+                        if terminal_direct_x0
+                        else len(sample_scheduler.timesteps)
+                    ),
+                    "terminal_direct_x0": terminal_direct_x0,
+                    "noisy_commit_self_kv": noisy_commit_self_kv,
+                    "clean_commit_self_kv": clean_commit_self_kv,
+                }
+            )
+        timetable = sample_scheduler.timesteps
+        for step_index, t in enumerate(tqdm(timetable)):
             timestep = t * torch.ones(
                 [batch_size, current_num_frames],
                 device=noise_block.device,
@@ -854,24 +968,22 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 )
                 timestep = _zero_i2v_context_timestep(timestep, anchor_frames)
 
-            flow_pred_cond, _ = self.generator(
-                noisy_image_or_video=latents,
-                conditional_dict=conditional_dict,
+            flow_pred_cond, _ = call_generator(
+                latent=latents,
+                conditioning=conditional_dict,
                 timestep=timestep,
                 kv_cache=kv_cache_pos,
                 crossattn_cache=crossattn_cache_pos,
-                current_start=global_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length,
+                commit_self_kv=noisy_commit_self_kv,
             )
             if use_cfg:
-                flow_pred_uncond, _ = self.generator(
-                    noisy_image_or_video=latents,
-                    conditional_dict=unconditional_dict,
+                flow_pred_uncond, _ = call_generator(
+                    latent=latents,
+                    conditioning=unconditional_dict,
                     timestep=timestep,
                     kv_cache=kv_cache_neg,
                     crossattn_cache=crossattn_cache_neg,
-                    current_start=global_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length,
+                    commit_self_kv=noisy_commit_self_kv,
                 )
                 flow_pred = flow_pred_uncond + self.guidance_scale * (
                     flow_pred_cond - flow_pred_uncond
@@ -879,12 +991,31 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             else:
                 flow_pred = flow_pred_cond
 
-            latents = sample_scheduler.step(
-                flow_pred,
-                t,
-                latents,
-                return_dict=False,
-            )[0]
+            if terminal_direct_x0 and step_index == len(timetable) - 1:
+                sigmas = getattr(sample_scheduler, "sigmas", None)
+                if sigmas is None or len(sigmas) <= step_index:
+                    raise RuntimeError(
+                        "UniPC scheduler did not expose the terminal flow sigma"
+                    )
+                sigma = torch.as_tensor(
+                    sigmas[step_index],
+                    dtype=torch.float32,
+                    device=latents.device,
+                )
+                if sigma.numel() != 1 or not bool(torch.isfinite(sigma).item()):
+                    raise RuntimeError("UniPC terminal flow sigma is invalid")
+                if bool((sigma < 0).item()) or bool((sigma > 1).item()):
+                    raise RuntimeError("UniPC terminal flow sigma is outside [0,1]")
+                latents = (
+                    latents.float() - sigma.reshape(1, 1, 1, 1, 1) * flow_pred.float()
+                ).to(dtype=noise_block.dtype)
+            else:
+                latents = sample_scheduler.step(
+                    flow_pred,
+                    t,
+                    latents,
+                    return_dict=False,
+                )[0]
             if anchor_latent is not None:
                 latents = _overwrite_i2v_context(
                     latents, anchor_latent, anchor_frames
@@ -912,24 +1043,22 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             device=noise_block.device,
             dtype=torch.float32,
         )
-        self.generator(
-            noisy_image_or_video=latents,
-            conditional_dict=conditional_dict,
+        call_generator(
+            latent=latents,
+            conditioning=conditional_dict,
             timestep=clean_timestep,
             kv_cache=kv_cache_pos,
             crossattn_cache=crossattn_cache_pos,
-            current_start=global_start_frame * self.frame_seq_length,
-            cache_start=cache_start_frame * self.frame_seq_length,
+            commit_self_kv=clean_commit_self_kv,
         )
         if use_cfg:
-            self.generator(
-                noisy_image_or_video=latents,
-                conditional_dict=unconditional_dict,
+            call_generator(
+                latent=latents,
+                conditioning=unconditional_dict,
                 timestep=clean_timestep,
                 kv_cache=kv_cache_neg,
                 crossattn_cache=crossattn_cache_neg,
-                current_start=global_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length,
+                commit_self_kv=clean_commit_self_kv,
             )
         return latents
 
