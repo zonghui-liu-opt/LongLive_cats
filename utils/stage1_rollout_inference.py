@@ -294,8 +294,11 @@ def resolve_stage1_rollout_inference_plan(config: Any) -> Stage1RolloutInference
                 f"expected={expected_step}, actual={completed_step}"
             )
     expected_phase_epochs_raw = checkpoint.get("expected_phase_epochs")
+    # OmegaConf keeps YAML lists as ListConfig.  Validate its generic sequence
+    # contract, then freeze it to a tuple before downstream consumption.
     if (
-        not isinstance(expected_phase_epochs_raw, (list, tuple))
+        isinstance(expected_phase_epochs_raw, (str, bytes))
+        or not isinstance(expected_phase_epochs_raw, Sequence)
         or len(expected_phase_epochs_raw) != 2
         or any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
@@ -303,12 +306,14 @@ def resolve_stage1_rollout_inference_plan(config: Any) -> Stage1RolloutInference
         )
     ):
         raise ValueError(
-            "stage1_rollout.checkpoint.expected_phase_epochs must be two positive integers"
+            "stage1_rollout.checkpoint.expected_phase_epochs must be two "
+            "positive integers"
         )
+    expected_phase_epochs = tuple(expected_phase_epochs_raw)
     phase = _phase_provenance(
         checkpoint_dir,
         completed_step,
-        expected_phase_epochs=tuple(expected_phase_epochs_raw),
+        expected_phase_epochs=expected_phase_epochs,
     )
     if phase["teacher_forcing"] is not True:
         raise RuntimeError("Stage-1 rollout checkpoint is not teacher-forcing trained")

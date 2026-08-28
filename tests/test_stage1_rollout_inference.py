@@ -6,12 +6,17 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from omegaconf import OmegaConf
 
+from utils.config import normalize_config
 from utils.stage1_io import canonical_json_sha256, sha256_file
 from utils.stage1_rollout_inference import (
     resolve_stage1_rollout_global_prompt,
     resolve_stage1_rollout_inference_plan,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
+FORMAL_CONFIG = ROOT / "configs" / "infer_i2v_stage1_teacher_forcing_rollout.yaml"
 
 
 def _write_checkpoint(tmp_path: Path, *, step: int = 4500):
@@ -171,6 +176,73 @@ def test_formal_checkpoint_preflight_binds_ema_base_hash_and_completed_phases(
     assert stage1["all_declared_phases_complete"] is True
     assert stage1["updates_per_epoch"] == 150
     assert stage1["training_block_size"] == 8
+
+
+def test_formal_omegaconf_yaml_phase_epochs_reaches_checkpoint_preflight(
+    tmp_path, monkeypatch
+):
+    base, checkpoint = _write_checkpoint(tmp_path, step=4500)
+    environment = {
+        "LONG_LIVE_STAGE1_ARCHITECTURE_ROOT": str(tmp_path / "architecture"),
+        "LONG_LIVE_STAGE1_T5_CHECKPOINT": str(tmp_path / "t5.pth"),
+        "LONG_LIVE_STAGE1_TOKENIZER_DIR": str(tmp_path / "tokenizer"),
+        "LONG_LIVE_STAGE1_VAE_CHECKPOINT": str(tmp_path / "vae.pth"),
+        "LONG_LIVE_STAGE1_BASE_CHECKPOINT": str(base),
+        "LONG_LIVE_STAGE1_CHECKPOINT_DIR": str(checkpoint),
+        "LONG_LIVE_STAGE1_ROLLOUT_INPUT": str(tmp_path / "testset"),
+        "LONG_LIVE_STAGE1_ROLLOUT_METADATA": str(tmp_path / "metadata.csv"),
+        "LONG_LIVE_STAGE1_ROLLOUT_OUTPUT": str(tmp_path / "outputs"),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    config = normalize_config(OmegaConf.load(FORMAL_CONFIG))
+    phase_epochs = config.stage1_rollout.checkpoint.expected_phase_epochs
+    assert OmegaConf.is_list(phase_epochs)
+    assert not isinstance(phase_epochs, (list, tuple))
+
+    plan = resolve_stage1_rollout_inference_plan(config)
+    checkpoint_provenance = plan.checkpoint_provenance["checkpoint"]
+    assert checkpoint_provenance["phase_status"] == "all_phases_complete"
+    assert checkpoint_provenance["declared_training_end_step"] == 4500
+
+
+def test_preflight_accepts_tuple_phase_epochs(tmp_path):
+    base, checkpoint = _write_checkpoint(tmp_path, step=4500)
+    config = _config(base, checkpoint, expected_step=4500)
+    config.stage1_rollout["checkpoint"]["expected_phase_epochs"] = (10, 20)
+
+    plan = resolve_stage1_rollout_inference_plan(config)
+    assert plan.checkpoint_provenance["checkpoint"]["phase_status"] == (
+        "all_phases_complete"
+    )
+
+
+@pytest.mark.parametrize(
+    "phase_epochs",
+    [
+        "10,20",
+        b"10,20",
+        None,
+        10,
+        {"phase_a": 10, "phase_b": 20},
+        [10],
+        [10, 20, 30],
+        [0, 20],
+        [-1, 20],
+        [True, 20],
+        [10, True],
+        [10, 20.0],
+        ["10", 20],
+    ],
+)
+def test_preflight_rejects_invalid_phase_epoch_contract(tmp_path, phase_epochs):
+    base, checkpoint = _write_checkpoint(tmp_path, step=4500)
+    config = _config(base, checkpoint, expected_step=4500)
+    config.stage1_rollout["checkpoint"]["expected_phase_epochs"] = phase_epochs
+
+    with pytest.raises(ValueError, match="must be two positive integers"):
+        resolve_stage1_rollout_inference_plan(config)
 
 
 def test_3750_checkpoint_is_labeled_phase_b_in_progress(tmp_path):
