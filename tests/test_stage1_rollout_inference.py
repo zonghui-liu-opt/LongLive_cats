@@ -13,6 +13,7 @@ from utils.stage1_io import canonical_json_sha256, sha256_file
 from utils.stage1_rollout_inference import (
     resolve_stage1_rollout_global_prompt,
     resolve_stage1_rollout_inference_plan,
+    resolve_stage1_rollout_sample_shape,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +156,44 @@ def test_global_prompt_rejects_silent_per_block_conditioning_drift():
         resolve_stage1_rollout_global_prompt(["cat starts", "cat lands"])
     with pytest.raises(ValueError, match="non-empty global prompt"):
         resolve_stage1_rollout_global_prompt([])
+
+
+def test_rollout_sample_shape_follows_each_metadata_orientation():
+    configured = [1, 24, 48, 30, 52]
+
+    assert resolve_stage1_rollout_sample_shape(
+        configured,
+        conditioning_image_size=(480, 832),
+        spatial_compression_ratio=16,
+        frame_seq_length=390,
+    ) == (1, 24, 48, 30, 52)
+    assert resolve_stage1_rollout_sample_shape(
+        configured,
+        conditioning_image_size=(832, 480),
+        spatial_compression_ratio=16,
+        frame_seq_length=390,
+    ) == (1, 24, 48, 52, 30)
+
+
+@pytest.mark.parametrize(
+    ("configured", "image_size", "frame_seq_length", "message"),
+    [
+        ([1, 24, 32, 30, 52], (480, 832), 390, "B/T/C"),
+        ([1, 24, 48, 30, 52], (512, 512), 390, "canonical geometry"),
+        ([1, 24, 48, 30, 51], (480, 816), 390, "spatial patch"),
+        ([1, 24, 48, 30, 52], (480, 832), 391, "frame_seq_length"),
+    ],
+)
+def test_rollout_sample_shape_rejects_incompatible_geometry(
+    configured, image_size, frame_seq_length, message
+):
+    with pytest.raises(ValueError, match=message):
+        resolve_stage1_rollout_sample_shape(
+            configured,
+            conditioning_image_size=image_size,
+            spatial_compression_ratio=16,
+            frame_seq_length=frame_seq_length,
+        )
 
 
 def test_formal_checkpoint_preflight_binds_ema_base_hash_and_completed_phases(

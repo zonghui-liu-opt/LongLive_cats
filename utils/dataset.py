@@ -276,17 +276,35 @@ class _ConditioningImageMixin:
             mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
         )
 
-    def _load_image(self, image_path: Path):
+    def _load_image(
+        self,
+        image_path: Path,
+        *,
+        image_size=None,
+        allow_resize: bool = True,
+    ):
+        target_size = self.image_size if image_size is None else tuple(image_size)
         with Image.open(image_path) as img:
             array = np.array(img.convert("RGB"))
         tensor = (
             torch.from_numpy(array).permute(2, 0, 1).contiguous().float() / 255.0
         )
         if (
-            tensor.shape[1] != self.image_size[0]
-            or tensor.shape[2] != self.image_size[1]
+            tensor.shape[1] != target_size[0]
+            or tensor.shape[2] != target_size[1]
         ):
-            tensor = self.resize_transform(tensor)
+            if not allow_resize:
+                raise RuntimeError(
+                    "conditioning image geometry changed after metadata "
+                    f"validation: expected={target_size}, "
+                    f"actual={tuple(tensor.shape[1:])}, path={image_path}"
+                )
+            resize_transform = (
+                self.resize_transform
+                if target_size == self.image_size
+                else transforms.Resize(target_size, antialias=True)
+            )
+            tensor = resize_transform(tensor)
         return self.normalize(tensor).to(torch.float16)
 
 
@@ -397,21 +415,36 @@ class ImagePromptDataset(_ConditioningImageMixin, Dataset):
 
 
 class MetadataImagePromptDataset(_ConditioningImageMixin, Dataset):
-    """Strict CSV-backed image/prompt input for fixed-geometry I2V inference.
+    """Strict CSV-backed image/prompt input for canonical-geometry I2V.
 
     Relative ``input_image`` values are resolved by the shared Stage-1
     metadata loader against the CSV's parent directory. Each CSV row is an
     independent rollout case, so multiple rows may intentionally reuse one
-    input image. The loader still validates prompts, declared geometry,
-    bucket, RGB/EXIF contract, file existence and image hashes before this
-    dataset is constructed.
+    input image. A caller may explicitly allow the configured geometry's
+    transposed orientation; each row is then preserved at its native geometry
+    rather than rotated or resized. The loader still validates prompts,
+    declared geometry, bucket, RGB/EXIF contract, file existence and image
+    hashes before this dataset is constructed.
     """
 
-    def __init__(self, metadata_path: str, image_size, num_blocks: int):
+    def __init__(
+        self,
+        metadata_path: str,
+        image_size,
+        num_blocks: int,
+        *,
+        allow_transposed_image_size: bool = False,
+    ):
         from utils.stage1_causal_validation import load_causal_testset_records
         from utils.stage1_io import sha256_file
 
+        if not isinstance(allow_transposed_image_size, bool):
+            raise TypeError("allow_transposed_image_size must be a bool")
         self._configure_image_preprocessing(image_size)
+        allowed_image_sizes = {self.image_size}
+        if allow_transposed_image_size:
+            allowed_image_sizes.add((self.image_size[1], self.image_size[0]))
+        self.allowed_image_sizes = frozenset(allowed_image_sizes)
         self.num_blocks = int(num_blocks)
         if self.num_blocks <= 0:
             raise ValueError("metadata I2V num_blocks must be positive")
@@ -428,15 +461,19 @@ class MetadataImagePromptDataset(_ConditioningImageMixin, Dataset):
             )
         self.metadata_sha256 = metadata_sha256
         mismatched = [
-            (record.row_id, record.height, record.width)
+            (record.row_id, record.height, record.width, record.bucket)
             for record in self.records
-            if (record.height, record.width) != self.image_size
+            if (record.height, record.width) not in self.allowed_image_sizes
         ]
         if mismatched:
             raise ValueError(
-                "metadata image geometry must match the configured inference "
-                f"size {self.image_size}; mismatched rows={mismatched}"
+                "metadata image geometry must use the configured canonical "
+                f"geometry {self.image_size} or its enabled transpose; "
+                f"unsupported rows={mismatched}"
             )
+        self.record_image_sizes = tuple(
+            (record.height, record.width) for record in self.records
+        )
         # Decode and preprocess every conditioning image during construction.
         # Stage-1 rollout creates this dataset before CUDA/model bootstrap, so
         # truncated pixels fail early and the exact validated tensors are the
@@ -444,7 +481,11 @@ class MetadataImagePromptDataset(_ConditioningImageMixin, Dataset):
         images = []
         for record in self.records:
             image_path = Path(record.input_image)
-            image = self._load_image(image_path)
+            image = self._load_image(
+                image_path,
+                image_size=(record.height, record.width),
+                allow_resize=False,
+            )
             if sha256_file(image_path) != record.image_sha256:
                 raise RuntimeError(
                     f"metadata input image changed during preflight: {image_path}"

@@ -68,6 +68,88 @@ def resolve_stage1_rollout_global_prompt(block_prompts: Sequence[Any]) -> str:
     return prompts[0]
 
 
+def resolve_stage1_rollout_sample_shape(
+    configured_shape: Sequence[Any],
+    *,
+    conditioning_image_size: Sequence[Any],
+    spatial_compression_ratio: int,
+    frame_seq_length: int,
+) -> tuple[int, int, int, int, int]:
+    """Resolve one row's latent geometry without rotating its input image."""
+
+    if isinstance(configured_shape, (str, bytes)) or not isinstance(
+        configured_shape, Sequence
+    ):
+        raise TypeError("Stage-1 rollout configured shape must be a sequence")
+    shape = tuple(configured_shape)
+    if len(shape) != 5:
+        raise ValueError("Stage-1 rollout configured shape must have five values")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in shape):
+        raise TypeError("Stage-1 rollout configured shape values must be integers")
+    if any(value <= 0 for value in shape):
+        raise ValueError(
+            "Stage-1 rollout configured shape must contain five positive integers"
+        )
+    if shape[:3] != (1, 24, 48):
+        raise ValueError(
+            "Stage-1 rollout configured B/T/C must be (1, 24, 48), " f"got {shape[:3]}"
+        )
+    if isinstance(conditioning_image_size, (str, bytes)) or not isinstance(
+        conditioning_image_size, Sequence
+    ):
+        raise TypeError("conditioning image size must be a sequence")
+    image_size = tuple(conditioning_image_size)
+    if len(image_size) != 2:
+        raise ValueError("conditioning image size must have two values")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) for value in image_size
+    ):
+        raise TypeError("conditioning image size values must be integers")
+    if any(value <= 0 for value in image_size):
+        raise ValueError("conditioning image size must contain two positive integers")
+    if isinstance(spatial_compression_ratio, bool) or not isinstance(
+        spatial_compression_ratio, int
+    ):
+        raise TypeError("spatial_compression_ratio must be an integer")
+    if spatial_compression_ratio <= 0:
+        raise ValueError("spatial_compression_ratio must be a positive integer")
+    if isinstance(frame_seq_length, bool) or not isinstance(frame_seq_length, int):
+        raise TypeError("frame_seq_length must be an integer")
+    if frame_seq_length <= 0:
+        raise ValueError("frame_seq_length must be a positive integer")
+
+    canonical_image_size = (
+        shape[3] * spatial_compression_ratio,
+        shape[4] * spatial_compression_ratio,
+    )
+    if image_size not in {
+        canonical_image_size,
+        canonical_image_size[::-1],
+    }:
+        raise ValueError(
+            "conditioning image must use the configured canonical geometry "
+            f"{canonical_image_size} or its transpose; got {image_size}"
+        )
+    if any(value % spatial_compression_ratio for value in image_size):
+        raise ValueError(
+            "conditioning image geometry must be divisible by the VAE spatial "
+            "compression ratio"
+        )
+    latent_height = image_size[0] // spatial_compression_ratio
+    latent_width = image_size[1] // spatial_compression_ratio
+    if latent_height % 2 or latent_width % 2:
+        raise ValueError(
+            "conditioning latent geometry must be divisible by the Wan spatial patch"
+        )
+    resolved_frame_seq_length = (latent_height // 2) * (latent_width // 2)
+    if resolved_frame_seq_length != frame_seq_length:
+        raise ValueError(
+            "conditioning geometry does not match pipeline frame_seq_length: "
+            f"expected={frame_seq_length}, actual={resolved_frame_seq_length}"
+        )
+    return (shape[0], shape[1], shape[2], latent_height, latent_width)
+
+
 def _phase_provenance(
     checkpoint_dir: Path,
     completed_step: int,
@@ -350,4 +432,5 @@ __all__ = [
     "Stage1RolloutInferencePlan",
     "resolve_stage1_rollout_global_prompt",
     "resolve_stage1_rollout_inference_plan",
+    "resolve_stage1_rollout_sample_shape",
 ]

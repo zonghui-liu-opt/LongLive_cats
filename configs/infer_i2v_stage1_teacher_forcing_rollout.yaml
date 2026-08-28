@@ -37,6 +37,8 @@ data:
   data_path: ${oc.env:LONG_LIVE_STAGE1_ROLLOUT_INPUT}
   # Preferred CSV mode. Relative input_image paths resolve from the CSV parent.
   metadata_path: ${oc.env:LONG_LIVE_STAGE1_ROLLOUT_METADATA,null}
+  # Canonical latent geometry. Metadata mode also accepts its per-row H/W
+  # transpose (52x30) without rotating or resizing the conditioning image.
   image_or_video_shape: [1, 24, 48, 30, 52]
 
 checkpoints:

@@ -169,6 +169,7 @@ def test_inference_opt_in_keeps_fixed_negative_and_writes_trace():
     assert "stage1_rollout_section.profile = raw_profile" in text
     assert "resolve_stage1_rollout_inference_plan" in text
     assert "resolve_stage1_rollout_global_prompt" in text
+    assert "resolve_stage1_rollout_sample_shape" in text
     assert "run_stage1_rollout" in text
     assert "stage1_rollout_profile.negative_prompt" in text
     assert "post_load_sha256_verified" in text
@@ -178,6 +179,7 @@ def test_inference_opt_in_keeps_fixed_negative_and_writes_trace():
     assert "atomic_write_json" in text
     assert "dist.is_initialized()" in text
     assert "MetadataImagePromptDataset" in text
+    assert "allow_transposed_image_size=True" in text
     assert 'rollout_trace["input"]["metadata_record"]' in text
     assert '"metadata_sha256": dataset.metadata_sha256' in text
     assert '"row_sha256": metadata_record.row_sha256' in text
@@ -187,6 +189,14 @@ def test_inference_opt_in_keeps_fixed_negative_and_writes_trace():
     assert text.index(
         "stage1_rollout_input_dataset = MetadataImagePromptDataset("
     ) < text.index("pipeline = CausalDiffusionInferencePipeline(")
+    assert text.index("for rollout_image_size in sorted(") < text.index(
+        "pipeline = CausalDiffusionInferencePipeline("
+    )
+    assert text.index("shape = resolve_stage1_rollout_sample_shape(") < text.index(
+        "sampled_noise = torch.randn("
+    )
+    assert "initial_latent.shape[2:]" in text
+    assert '"batch_size": 1' in text
     assert text.index("if stage1_rollout_input_dataset is not None:") < text.index(
         "elif not _has_video_layout:"
     )

@@ -244,6 +244,7 @@ if stage1_rollout_enabled:
     from utils.stage1_rollout_inference import (
         resolve_stage1_rollout_global_prompt,
         resolve_stage1_rollout_inference_plan,
+        resolve_stage1_rollout_sample_shape,
     )
 
     stage1_rollout_plan = resolve_stage1_rollout_inference_plan(config)
@@ -278,7 +279,21 @@ if stage1_rollout_enabled:
                 stage1_rollout_profile.generated_frames
                 // stage1_rollout_profile.chunk_size
             ),
+            allow_transposed_image_size=True,
         )
+        # Prove every row has the same per-frame patch-token contract before
+        # constructing the 5B pipeline. The actual H/W orientation remains a
+        # per-row runtime value; only the token count is shared by KV caches.
+        rollout_frame_seq_length = int(rollout_shape[3]) * int(rollout_shape[4]) // 4
+        for rollout_image_size in sorted(
+            set(stage1_rollout_input_dataset.record_image_sizes)
+        ):
+            resolve_stage1_rollout_sample_shape(
+                rollout_shape,
+                conditioning_image_size=rollout_image_size,
+                spatial_compression_ratio=int(rollout_spatial_ratio),
+                frame_seq_length=rollout_frame_seq_length,
+            )
 
 
 def _expected_inference_samples(config):
@@ -836,7 +851,19 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         prompt = block_prompts[0]  # for filename
     prompts = [list(block_prompts) for _ in range(config.num_samples)]
 
-    shape = config.image_or_video_shape
+    shape = list(config.image_or_video_shape)
+    if stage1_rollout_input_dataset is not None:
+        model_name = str(config.model_kwargs.model_name)
+        shape = resolve_stage1_rollout_sample_shape(
+            shape,
+            conditioning_image_size=tuple(
+                int(value) for value in batch["image"].shape[-2:]
+            ),
+            spatial_compression_ratio=int(
+                wan_default_config[model_name]["spatial_compression_ratio"]
+            ),
+            frame_seq_length=int(pipeline.frame_seq_length),
+        )
     noise_generator = None
     if sample_seeds is not None:
         noise_generator = torch.Generator(device=device)
@@ -859,6 +886,15 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         elif image.ndim != 5:
             raise ValueError(f"Expected i2v image with shape [B,C,H,W] or [B,C,T,H,W], got {tuple(image.shape)}")
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
+        if stage1_rollout_input_dataset is not None and tuple(
+            initial_latent.shape[2:]
+        ) != tuple(shape[2:]):
+            raise RuntimeError(
+                "Stage-1 rollout VAE latent geometry does not match the "
+                "metadata-derived noise geometry: "
+                f"latent={tuple(initial_latent.shape[2:])}, "
+                f"noise={tuple(shape[2:])}"
+            )
         if initial_latent.shape[0] != config.num_samples:
             initial_latent = initial_latent.repeat(config.num_samples, 1, 1, 1, 1)
         if config.num_output_frames <= initial_latent.shape[1]:
