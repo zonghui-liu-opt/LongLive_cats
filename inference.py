@@ -48,6 +48,7 @@ from torch.utils.data.distributed import DistributedSampler
 from pipeline import CausalDiffusionInferencePipeline
 from utils.dataset import (
     ImagePromptDataset,
+    MetadataImagePromptDataset,
     MultiTextConcatDataset,
     MultiVideoConcatDataset,
     eval_collate_fn,
@@ -134,6 +135,7 @@ stage1_rollout_section = getattr(config, "stage1_rollout", None)
 stage1_rollout_enabled = False
 stage1_rollout_profile = None
 stage1_rollout_plan = None
+stage1_rollout_input_dataset = None
 if stage1_rollout_section is not None:
     raw_enabled = getattr(stage1_rollout_section, "enabled", False)
     if not isinstance(raw_enabled, bool):
@@ -194,6 +196,15 @@ if stage1_rollout_enabled:
     config.inference.streaming_vae = False
     config.inference.async_vae = False
 
+    # This rollout path is intentionally single-process.  Reject torchrun
+    # before CSV decoding, NCCL initialization, or constructing/loading the 5B
+    # pipeline so an accidental multi-rank launch fails cheaply and clearly.
+    if "LOCAL_RANK" in os.environ:
+        raise ValueError(
+            "Stage-1 rollout inference supports direct single-GPU launch only; "
+            "do not use torchrun"
+        )
+
 if not hasattr(config, "sampling_steps") or config.sampling_steps is None:
     raise ValueError("sampling_steps must be defined in the inference config")
 
@@ -238,6 +249,36 @@ if stage1_rollout_enabled:
     stage1_rollout_plan = resolve_stage1_rollout_inference_plan(config)
     if stage1_rollout_plan.profile != stage1_rollout_profile:
         raise AssertionError("Stage-1 rollout profile changed during preflight")
+
+    # Validate CSV metadata and every referenced image before constructing the
+    # 5B CUDA pipeline.  Reuse this exact dataset after model bootstrap so the
+    # preflight and runtime cannot select different rows or path semantics.
+    rollout_metadata_path = getattr(config, "metadata_path", None)
+    if rollout_metadata_path:
+        rollout_model_name = str(config.model_kwargs.model_name)
+        if rollout_model_name not in wan_default_config:
+            raise ValueError(
+                f"Unknown Wan model for rollout metadata: {rollout_model_name}"
+            )
+        rollout_shape = list(config.image_or_video_shape)
+        if len(rollout_shape) != 5:
+            raise ValueError(
+                "Stage-1 rollout image_or_video_shape must have five dimensions"
+            )
+        rollout_spatial_ratio = wan_default_config[rollout_model_name][
+            "spatial_compression_ratio"
+        ]
+        stage1_rollout_input_dataset = MetadataImagePromptDataset(
+            metadata_path=str(rollout_metadata_path),
+            image_size=(
+                int(rollout_shape[3]) * rollout_spatial_ratio,
+                int(rollout_shape[4]) * rollout_spatial_ratio,
+            ),
+            num_blocks=(
+                stage1_rollout_profile.generated_frames
+                // stage1_rollout_profile.chunk_size
+            ),
+        )
 
 
 def _expected_inference_samples(config):
@@ -637,6 +678,7 @@ if stage1_rollout_enabled and dist.is_initialized():
 # Create dataset
 nfpb = getattr(config, 'num_frame_per_block', 8)
 data_path = config.data_path
+metadata_path = getattr(config, "metadata_path", None)
 chunks_per_shot = getattr(config, 'chunks_per_shot', 0)
 scene_cut_prefix = getattr(config, 'scene_cut_prefix', "The scene transitions. ")
 if getattr(config, "i2v", False):
@@ -653,7 +695,10 @@ if getattr(config, "i2v", False):
     # frame of each video.
     _i2v_root = Path(data_path)
     _has_video_layout = (_i2v_root / "video").is_dir()
-    if not _has_video_layout:
+    if stage1_rollout_input_dataset is not None:
+        dataset = stage1_rollout_input_dataset
+        collate_fn = image_prompt_collate_fn
+    elif not _has_video_layout:
         dataset = ImagePromptDataset(
             data_path=data_path,
             image_size=(frame_raw_height, frame_raw_width),
@@ -690,7 +735,16 @@ else:
     )
     collate_fn = eval_collate_fn
 if local_rank == 0:
-    print(f"[data] data_path={data_path}, mode={getattr(dataset, '_mode', dataset.__class__.__name__)}, num_blocks={num_blocks}")
+    metadata_detail = (
+        f", metadata_path={Path(metadata_path).expanduser().resolve()}"
+        if stage1_rollout_input_dataset is not None
+        else ""
+    )
+    print(
+        f"[data] data_path={data_path}{metadata_detail}, "
+        f"mode={getattr(dataset, '_mode', dataset.__class__.__name__)}, "
+        f"num_blocks={num_blocks}"
+    )
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
@@ -904,6 +958,23 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                 from utils.stage1_io import atomic_write_json, sha256_file
 
                 rollout_trace = copy.deepcopy(rollout_result.trace)
+                if isinstance(dataset, MetadataImagePromptDataset):
+                    metadata_record = dataset.records[idx]
+                    if metadata_record.row_id != idx:
+                        raise RuntimeError(
+                            "Stage-1 rollout metadata row/index mapping changed"
+                        )
+                    rollout_trace["input"]["metadata_record"] = {
+                        "metadata_path": str(dataset.metadata_path),
+                        "metadata_sha256": dataset.metadata_sha256,
+                        "row_id": metadata_record.row_id,
+                        "row_sha256": metadata_record.row_sha256,
+                        "input_image": metadata_record.input_image,
+                        "image_sha256": metadata_record.image_sha256,
+                        "height": metadata_record.height,
+                        "width": metadata_record.width,
+                        "bucket": metadata_record.bucket,
+                    }
                 rollout_trace["output_artifact"] = {
                     "path": str(Path(rollout_artifact_path).resolve()),
                     "sha256": sha256_file(rollout_artifact_path),

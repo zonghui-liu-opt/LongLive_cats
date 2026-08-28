@@ -60,9 +60,36 @@ export LONG_LIVE_STAGE1_VAE_CHECKPOINT=/path/to/Wan2.2_VAE.pth
 export LONG_LIVE_STAGE1_BASE_CHECKPOINT=/path/to/converted_causal_base.pt
 export LONG_LIVE_STAGE1_CHECKPOINT_DIR=/path/to/checkpoint_model_004500
 
-# ImagePromptDataset：images/<id>.png + prompts/<id>.txt
-export LONG_LIVE_STAGE1_ROLLOUT_INPUT=/path/to/i2v_inputs
+# CSV metadata模式；input_image相对路径以CSV所在目录为基准解析。
+export LONG_LIVE_STAGE1_ROLLOUT_INPUT=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/testset
+export LONG_LIVE_STAGE1_ROLLOUT_METADATA=/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/testset/metadata_20cases_480x832.csv
 export LONG_LIVE_STAGE1_ROLLOUT_OUTPUT=/path/to/stage1_rollout_outputs
+```
+
+`metadata_20cases_480x832.csv`可替换成实际文件名。当前示例profile固定输出
+480×832横屏，因此CSV应为：
+
+```csv
+input_image,prompt,height,width,bucket
+images_20cases_832x480/000554.png,你的提示词,480,832,landscape
+```
+
+这里的`images_20cases_832x480/000554.png`会解析成
+`/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/testset/images_20cases_832x480/000554.png`。
+不要在`.png`后增加句点。入口会在加载5B模型前逐行检查必需列、prompt、文件存在、
+重复图片、RGB、EXIF、真实尺寸、bucket和图片hash；CSV中的全部记录按行顺序推理，
+`inference.num_samples: 1`表示每条记录生成一个样本，不是只处理CSV第一行。
+
+正式脚本`infer_stage1_teacher_forcing_rollout.sh`要求显式提供metadata CSV，避免漏设变量后
+加载5B模型才发现输入模式错误。底层`inference.py`仍保留旧的
+`images/<id>.png + prompts/<id>.txt`目录兼容；如需使用旧模式，可取消metadata变量并直接
+调用配置：
+
+```bash
+unset LONG_LIVE_STAGE1_ROLLOUT_METADATA
+export LONG_LIVE_STAGE1_ROLLOUT_INPUT=/path/to/i2v_inputs
+"${PYTHON_BIN}" inference.py \
+  --config_path configs/infer_i2v_stage1_teacher_forcing_rollout.yaml
 ```
 
 ## 执行
@@ -113,7 +140,8 @@ STAGE1_ROLLOUT_SAMPLING_STEPS=4 \
 
 每个 MP4（或 latent PT）旁会写 `*_stage1_rollout_trace.json`，记录 profile/hash、
 固定 negative prompt/hash、base/EMA/manifest hash、训练phase、输入noise identity、
-每个chunk的schedule/sigma bit pattern、cache cursor、commit policy、输出hash和帧数。
+CSV/row/image hash、每个chunk的schedule/sigma bit pattern、cache cursor、commit policy、
+输出hash和帧数。
 
 Phase A/B 训练始终是 teacher forcing；Phase B 注入预测残差，但不是KV self-rollout。
 因此本入口是在测量真实 train/infer gap，而不是声称权重曾用同一rollout拓扑训练。

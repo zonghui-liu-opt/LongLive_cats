@@ -13,6 +13,7 @@ required_env=(
   LONG_LIVE_STAGE1_BASE_CHECKPOINT
   LONG_LIVE_STAGE1_CHECKPOINT_DIR
   LONG_LIVE_STAGE1_ROLLOUT_INPUT
+  LONG_LIVE_STAGE1_ROLLOUT_METADATA
   LONG_LIVE_STAGE1_ROLLOUT_OUTPUT
 )
 for name in "${required_env[@]}"; do
@@ -21,6 +22,15 @@ for name in "${required_env[@]}"; do
     exit 2
   fi
 done
+
+if [[ ! -d "${LONG_LIVE_STAGE1_ROLLOUT_INPUT}" ]]; then
+  echo "Stage-1 rollout input directory does not exist: ${LONG_LIVE_STAGE1_ROLLOUT_INPUT}" >&2
+  exit 2
+fi
+if [[ ! -f "${LONG_LIVE_STAGE1_ROLLOUT_METADATA}" ]]; then
+  echo "Stage-1 rollout metadata file does not exist: ${LONG_LIVE_STAGE1_ROLLOUT_METADATA}" >&2
+  exit 2
+fi
 
 if [[ "${CUDA_VISIBLE_DEVICES:-0}" == *,* ]]; then
   echo "Stage-1 rollout currently supports exactly one visible GPU" >&2
@@ -51,6 +61,7 @@ expected_step="${STAGE1_ROLLOUT_EXPECTED_STEP:-4500}"
 
 echo "Stage-1 rollout profile: C=${chunk_size} totalW=${window_size} S=1 K=${sampling_steps} shift=${timestep_shift} CFG=${guidance_scale} expected_step=${expected_step}"
 echo "Checkpoint: ${checkpoint_dir}/adapter_ema.safetensors"
+echo "Input metadata: ${LONG_LIVE_STAGE1_ROLLOUT_METADATA}"
 echo "Output: ${LONG_LIVE_STAGE1_ROLLOUT_OUTPUT}"
 
 exec "${PYTHON_BIN}" "${SCRIPT_DIR}/inference.py" \

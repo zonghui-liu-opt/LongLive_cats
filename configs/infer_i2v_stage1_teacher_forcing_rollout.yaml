@@ -33,8 +33,10 @@ save_with_index: true
 inference_iter: -1
 
 data:
-  # ImagePromptDataset layout: images/<id>.(png|jpg) + prompts/<id>.txt.
+  # Root for the legacy images/<id> + prompts/<id>.txt fallback.
   data_path: ${oc.env:LONG_LIVE_STAGE1_ROLLOUT_INPUT}
+  # Preferred CSV mode. Relative input_image paths resolve from the CSV parent.
+  metadata_path: ${oc.env:LONG_LIVE_STAGE1_ROLLOUT_METADATA,null}
   image_or_video_shape: [1, 24, 48, 30, 52]
 
 checkpoints:

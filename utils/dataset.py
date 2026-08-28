@@ -266,7 +266,31 @@ class MultiTextConcatDataset(Dataset):
         return prompts
 
 
-class ImagePromptDataset(Dataset):
+class _ConditioningImageMixin:
+    """Shared preprocessing for single-image I2V inference datasets."""
+
+    def _configure_image_preprocessing(self, image_size):
+        self.image_size = tuple(image_size)
+        self.resize_transform = transforms.Resize(self.image_size, antialias=True)
+        self.normalize = transforms.Normalize(
+            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+        )
+
+    def _load_image(self, image_path: Path):
+        with Image.open(image_path) as img:
+            array = np.array(img.convert("RGB"))
+        tensor = (
+            torch.from_numpy(array).permute(2, 0, 1).contiguous().float() / 255.0
+        )
+        if (
+            tensor.shape[1] != self.image_size[0]
+            or tensor.shape[2] != self.image_size[1]
+        ):
+            tensor = self.resize_transform(tensor)
+        return self.normalize(tensor).to(torch.float16)
+
+
+class ImagePromptDataset(_ConditioningImageMixin, Dataset):
     """I2V inference from single images + text prompts (no source video needed).
 
     ``MultiVideoConcatDataset`` can also drive I2V, but it takes the conditioning
@@ -310,11 +334,9 @@ class ImagePromptDataset(Dataset):
         num_blocks: int,
         scene_cut_prefix: str = DEFAULT_SCENE_CUT_PREFIX,
     ):
-        self.image_size = tuple(image_size)
+        self._configure_image_preprocessing(image_size)
         self.num_blocks = int(num_blocks)
         self.scene_cut_prefix = scene_cut_prefix
-        self.resize_transform = transforms.Resize(self.image_size, antialias=True)
-        self.normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
         root = Path(data_path)
         if not root.is_dir():
@@ -365,20 +387,77 @@ class ImagePromptDataset(Dataset):
             prompts.extend([prompts[-1] if prompts else ""] * (self.num_blocks - len(prompts)))
         return prompts
 
-    def _load_image(self, image_path: Path):
-        with Image.open(image_path) as img:
-            array = np.array(img.convert("RGB"))
-        tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous().float() / 255.0
-        if tensor.shape[1] != self.image_size[0] or tensor.shape[2] != self.image_size[1]:
-            tensor = self.resize_transform(tensor)
-        return self.normalize(tensor).to(torch.float16)
-
     def __getitem__(self, idx):
         image_path = self.images[idx % len(self.images)]
         return {
             "image": self._load_image(image_path),
             "prompts": self._load_prompts(image_path),
             "idx": idx,
+        }
+
+
+class MetadataImagePromptDataset(_ConditioningImageMixin, Dataset):
+    """Strict CSV-backed image/prompt input for fixed-geometry I2V inference.
+
+    Relative ``input_image`` values are resolved by the shared Stage-1
+    metadata loader against the CSV's parent directory.  The loader also
+    validates the declared geometry, bucket, RGB/EXIF contract, duplicates,
+    file existence and image hashes before this dataset is constructed.
+    """
+
+    def __init__(self, metadata_path: str, image_size, num_blocks: int):
+        from utils.stage1_causal_validation import load_causal_testset_records
+        from utils.stage1_io import sha256_file
+
+        self._configure_image_preprocessing(image_size)
+        self.num_blocks = int(num_blocks)
+        if self.num_blocks <= 0:
+            raise ValueError("metadata I2V num_blocks must be positive")
+
+        self.metadata_path = Path(metadata_path).expanduser().resolve()
+        metadata_sha256 = sha256_file(self.metadata_path)
+        self.records = load_causal_testset_records(self.metadata_path)
+        if sha256_file(self.metadata_path) != metadata_sha256:
+            raise RuntimeError(
+                f"metadata CSV changed during preflight: {self.metadata_path}"
+            )
+        self.metadata_sha256 = metadata_sha256
+        mismatched = [
+            (record.row_id, record.height, record.width)
+            for record in self.records
+            if (record.height, record.width) != self.image_size
+        ]
+        if mismatched:
+            raise ValueError(
+                "metadata image geometry must match the configured inference "
+                f"size {self.image_size}; mismatched rows={mismatched}"
+            )
+        # Decode and preprocess every conditioning image during construction.
+        # Stage-1 rollout creates this dataset before CUDA/model bootstrap, so
+        # truncated pixels fail early and the exact validated tensors are the
+        # ones later consumed even if a source file changes mid-run.
+        images = []
+        for record in self.records:
+            image_path = Path(record.input_image)
+            image = self._load_image(image_path)
+            if sha256_file(image_path) != record.image_sha256:
+                raise RuntimeError(
+                    f"metadata input image changed during preflight: {image_path}"
+                )
+            images.append(image)
+        self.images = tuple(images)
+        self._mode = "metadata-image+prompt"
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record_index = int(idx) % len(self.records)
+        record = self.records[record_index]
+        return {
+            "image": self.images[record_index],
+            "prompts": [record.prompt] * self.num_blocks,
+            "idx": record.row_id,
         }
 
 
