@@ -71,13 +71,20 @@ export LONG_LIVE_STAGE1_ROLLOUT_OUTPUT=/path/to/stage1_rollout_outputs
 
 ```csv
 input_image,prompt,height,width,bucket
-images_20cases_832x480/000554.png,你的提示词,480,832,landscape
+images_20cases_832x480/000313.png,第一条提示词,480,832,landscape
+images_20cases_832x480/000313.png,同一首帧的第二条提示词,480,832,landscape
 ```
 
-这里的`images_20cases_832x480/000554.png`会解析成
-`/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/testset/images_20cases_832x480/000554.png`。
+这里的`images_20cases_832x480/000313.png`会解析成
+`/srv/workspace/Kirin_AI_Workspace/TMG_I/l00832862/LongLive-2.0/testset/images_20cases_832x480/000313.png`。
+CSV的一行就是一个独立推理样本，因此同一张首帧可以出现在多行并搭配不同prompt；
+这些行会分别生成输出，并由CSV行号和trace区分。
+正式YAML固定`save_with_index: true`，上例两行会分别使用
+`rank0-0-0_lora.*`和`rank0-1-0_lora.*`作为产物前缀；同图的`image_sha256`
+相同，但`row_sha256`和`prompt_sha256`各自独立。每一行的prompt会作为该条rollout
+全程使用的global prompt，而不是在同一个episode内切换prompt。
 不要在`.png`后增加句点。入口会在加载5B模型前逐行检查必需列、prompt、文件存在、
-重复图片、RGB、EXIF、真实尺寸、bucket和图片hash；CSV中的全部记录按行顺序推理，
+RGB、EXIF、真实尺寸、bucket和图片hash；CSV中的全部记录按行顺序推理，
 `inference.num_samples: 1`表示每条记录生成一个样本，不是只处理CSV第一行。
 
 正式脚本`infer_stage1_teacher_forcing_rollout.sh`要求显式提供metadata CSV，避免漏设变量后

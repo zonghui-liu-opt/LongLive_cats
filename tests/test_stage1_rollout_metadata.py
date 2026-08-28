@@ -90,6 +90,53 @@ def test_metadata_dataset_resolves_relative_images_and_preserves_csv_order(
     assert batch["idx"].tolist() == [0, 1]
 
 
+def test_metadata_dataset_allows_one_image_with_distinct_prompts(tmp_path):
+    image_dir = tmp_path / "images_20cases_832x480"
+    image_dir.mkdir()
+    image_path = image_dir / "000313.png"
+    Image.new("RGB", (48, 32), color=(12, 34, 56)).save(image_path)
+    metadata = tmp_path / "metadata.csv"
+    _write_metadata(
+        metadata,
+        [
+            {
+                "input_image": "images_20cases_832x480/000313.png",
+                "prompt": "The cat jumps over a toy.",
+                "height": 32,
+                "width": 48,
+                "bucket": "landscape",
+            },
+            {
+                "input_image": "images_20cases_832x480/000313.png",
+                "prompt": "The same cat slowly sits down.",
+                "height": 32,
+                "width": 48,
+                "bucket": "landscape",
+            },
+        ],
+    )
+
+    dataset = MetadataImagePromptDataset(
+        metadata_path=str(metadata),
+        image_size=(32, 48),
+        num_blocks=3,
+    )
+
+    assert len(dataset) == 2
+    assert dataset.records[0].input_image == dataset.records[1].input_image
+    assert dataset.records[0].image_sha256 == dataset.records[1].image_sha256
+    assert dataset.records[0].row_sha256 != dataset.records[1].row_sha256
+    assert dataset[0]["idx"] == 0
+    assert dataset[1]["idx"] == 1
+    assert dataset[0]["prompts"] == ["The cat jumps over a toy."] * 3
+    assert dataset[1]["prompts"] == ["The same cat slowly sits down."] * 3
+    assert torch.equal(dataset[0]["image"], dataset[1]["image"])
+    batch = image_prompt_collate_fn([dataset[0], dataset[1]])
+    assert batch["image"].shape == (2, 3, 32, 48)
+    assert batch["idx"].tolist() == [0, 1]
+    assert batch["prompts"] == [dataset[0]["prompts"], dataset[1]["prompts"]]
+
+
 def test_metadata_dataset_rejects_profile_geometry_mismatch(tmp_path):
     Image.new("RGB", (48, 32)).save(tmp_path / "000554.png")
     metadata = tmp_path / "metadata.csv"

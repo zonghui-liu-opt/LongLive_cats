@@ -400,9 +400,11 @@ class MetadataImagePromptDataset(_ConditioningImageMixin, Dataset):
     """Strict CSV-backed image/prompt input for fixed-geometry I2V inference.
 
     Relative ``input_image`` values are resolved by the shared Stage-1
-    metadata loader against the CSV's parent directory.  The loader also
-    validates the declared geometry, bucket, RGB/EXIF contract, duplicates,
-    file existence and image hashes before this dataset is constructed.
+    metadata loader against the CSV's parent directory. Each CSV row is an
+    independent rollout case, so multiple rows may intentionally reuse one
+    input image. The loader still validates prompts, declared geometry,
+    bucket, RGB/EXIF contract, file existence and image hashes before this
+    dataset is constructed.
     """
 
     def __init__(self, metadata_path: str, image_size, num_blocks: int):
@@ -416,7 +418,10 @@ class MetadataImagePromptDataset(_ConditioningImageMixin, Dataset):
 
         self.metadata_path = Path(metadata_path).expanduser().resolve()
         metadata_sha256 = sha256_file(self.metadata_path)
-        self.records = load_causal_testset_records(self.metadata_path)
+        self.records = load_causal_testset_records(
+            self.metadata_path,
+            allow_repeated_input_images=True,
+        )
         if sha256_file(self.metadata_path) != metadata_sha256:
             raise RuntimeError(
                 f"metadata CSV changed during preflight: {self.metadata_path}"
