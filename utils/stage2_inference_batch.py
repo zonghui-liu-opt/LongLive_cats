@@ -168,7 +168,11 @@ def build_stage2_inference_samples(
     single_row_ids: Sequence[int] | None = None,
     two_action_row_ids: Sequence[int] | None = None,
 ) -> tuple[Stage2InferenceSample, ...]:
-    """Build the exact dataset x row x seed x profile Cartesian product."""
+    """Build the dataset x row x seed x profile Cartesian product.
+
+    An explicit empty two-action selection excludes that dataset entirely,
+    including its metadata and image validation.
+    """
 
     if (single_row_ids is None) is not (two_action_row_ids is None):
         raise ValueError(
@@ -178,22 +182,23 @@ def build_stage2_inference_samples(
     seed_values = _sweep_seeds(seeds) if is_sweep else _formal_seeds(seeds)
     profile_values = _profile_names(profiles)
     singles = load_causal_testset_records(single_metadata)
-    doubles = load_continuation_metadata(two_action_metadata)
     if len(singles) != 6:
         raise RuntimeError(
             f"Stage-2 single-action metadata must contain 6 rows, got {len(singles)}"
         )
-    if len(doubles) != 8:
-        raise RuntimeError(
-            "Stage-2 two-action metadata must contain 8 rows, " f"got {len(doubles)}"
-        )
     if is_sweep:
         singles = _selected_records(singles, single_row_ids, label="single-action")
-        doubles = _selected_records(
-            doubles,
-            two_action_row_ids,
-            label="two-action",
-        )
+    two_action_ids = tuple(two_action_row_ids) if is_sweep else None
+    doubles = ()
+    if two_action_ids != ():
+        doubles = load_continuation_metadata(two_action_metadata)
+        if len(doubles) != 8:
+            raise RuntimeError(
+                "Stage-2 two-action metadata must contain 8 rows, "
+                f"got {len(doubles)}"
+            )
+        if is_sweep:
+            doubles = _selected_records(doubles, two_action_ids, label="two-action")
 
     samples: list[Stage2InferenceSample] = []
     for profile in profile_values:

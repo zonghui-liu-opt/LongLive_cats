@@ -205,9 +205,10 @@ def _canonical_int_set(
     *,
     minimum: int,
     maximum: int,
+    allow_empty: bool = False,
 ) -> tuple[int, ...]:
     values = _plain_list(value, label)
-    if not values:
+    if not values and not allow_empty:
         raise ValueError(f"{label} must be non-empty")
     normalized: list[int] = []
     for index, item in enumerate(values):
@@ -249,15 +250,16 @@ def _resolve_evaluation(
         "evaluation.two_action_row_ids",
         minimum=0,
         maximum=7,
+        allow_empty=True,
     )
     if mode == "formal" and (
         seeds != _FORMAL_SEEDS
         or single_rows != _FORMAL_SINGLE_ROW_IDS
-        or two_action_rows != _FORMAL_TWO_ACTION_ROW_IDS
+        or two_action_rows not in ((), _FORMAL_TWO_ACTION_ROW_IDS)
     ):
         raise ValueError(
             "formal evaluation requires seeds 1..4, single rows 0..5, "
-            "and two-action rows 0..7"
+            "and two-action rows 0..7 or [] to disable two-action generation"
         )
     return mode, seeds, single_rows, two_action_rows
 

@@ -98,6 +98,44 @@ def test_sweep_plan_selects_rows_and_seeds_without_weakening_formal_defaults():
 
 
 @pytest.mark.parametrize(
+    ("single_row_ids", "seeds", "expected_count"),
+    [
+        ((0, 3), (1,), 2),
+        (tuple(range(6)), (1, 2, 3, 4), 24),
+    ],
+)
+def test_c4_timing_single_only_plan_skips_continuation_metadata(
+    monkeypatch, tmp_path, single_row_ids, seeds, expected_count
+):
+    def reject_continuation_read(_path):
+        pytest.fail(
+            "single-action inference must not read continuation metadata/images"
+        )
+
+    monkeypatch.setattr(
+        "utils.stage2_inference_batch.load_continuation_metadata",
+        reject_continuation_read,
+    )
+    samples = build_stage2_inference_samples(
+        single_metadata=SINGLE_METADATA,
+        two_action_metadata=tmp_path / "unavailable_two_action_metadata.csv",
+        profiles=("c4w16k4s1",),
+        seeds=seeds,
+        single_row_ids=single_row_ids,
+        two_action_row_ids=[],
+    )
+
+    assert len(samples) == expected_count
+    assert {sample.dataset for sample in samples} == {STAGE2_SINGLE_DATASET}
+    assert {sample.row_id for sample in samples} == set(single_row_ids)
+    assert {sample.seed for sample in samples} == set(seeds)
+    assert {sample.profile for sample in samples} == {"c4w16k4s1"}
+    assert all(len(sample.prompts) == 1 for sample in samples)
+    assert all(sample.sample_key.startswith("single_action/") for sample in samples)
+    assert len({sample.sample_key for sample in samples}) == expected_count
+
+
+@pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"single_row_ids": (0,)}, "provide both"),
@@ -105,6 +143,9 @@ def test_sweep_plan_selects_rows_and_seeds_without_weakening_formal_defaults():
             {"single_row_ids": (0,), "two_action_row_ids": (99,)},
             "unknown",
         ),
+        ({"single_row_ids": (), "two_action_row_ids": ()}, "non-empty"),
+        ({"single_row_ids": (), "two_action_row_ids": (0,)}, "non-empty"),
+        ({"single_row_ids": (0,), "two_action_row_ids": (True,)}, "plain integers"),
         (
             {
                 "seeds": (1, 1),

@@ -13,16 +13,16 @@ fail() {
 
 usage() {
   cat <<'EOF'
-Stage-2 C4/W16/S1/K4 推理与分阶段计时
+Stage-2 C4/W16/S1/K4 单动作推理与分阶段计时
 
 用法：
   bash infer_stage2_c4w16k4s1_timing.sh MODE CHECKPOINT_STEP
 
 MODE：
   plan-quick    CPU 预检 quick 计划，不启动 CUDA/torchrun
-  quick         4 个视频（2 单动作、2 双动作，seed=1）
+  quick         2 个单动作视频（row 0、3，seed=1）
   plan-formal   CPU 预检 formal 计划，不启动 CUDA/torchrun
-  formal        56 个视频（6 单动作、8 双动作，各 4 个 seed）
+  formal        24 个单动作视频（6 个单动作，各 4 个 seed）
 
 示例：
   bash infer_stage2_c4w16k4s1_timing.sh plan-quick G120
@@ -35,6 +35,7 @@ CHECKPOINT_STEP 是训练 checkpoint 步数，例如 120/G120/000120；
 可省略 CHECKPOINT_STEP；其他目录名仍需显式指定步数。
 
 默认使用 GPU 0、单卡数据并行进程，按样本报告 DiT、VAE decode、视频后处理。
+本入口只生成单动作；quick/formal 均不生成双动作。
 可设置 CUDA_VISIBLE_DEVICES（自动推导进程数），或同时设置
 CUDA_VISIBLE_DEVICES / STAGE2_INFERENCE_NPROC；其余路径覆盖沿用
 infer_stage2_tmp.sh。默认权重目录匹配 C4/W16/S1 的 8 卡训练入口。

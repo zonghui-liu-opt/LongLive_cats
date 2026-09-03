@@ -159,6 +159,34 @@ def test_sweep_hashes_are_order_invariant_and_launch_only_binds_output(tmp_path)
     assert resolved_left.launch_hash() != resolved_right.launch_hash()
 
 
+@pytest.mark.parametrize(
+    ("mode", "seeds", "single_rows"),
+    [
+        ("quick", [7], [5, 1]),
+        ("formal", [4, 3, 2, 1], [5, 4, 3, 2, 1, 0]),
+    ],
+)
+def test_sweep_empty_two_action_rows_selects_only_single_action(
+    tmp_path, mode, seeds, single_rows
+):
+    _write_base_config(tmp_path)
+    raw = _raw_sweep()
+    raw["evaluation"] = {
+        "mode": mode,
+        "seeds": seeds,
+        "single_row_ids": single_rows,
+        "two_action_row_ids": [],
+    }
+
+    resolved = load_stage2_inference_sweep_config(_write_sweep(tmp_path, raw))
+
+    assert resolved.evaluation_mode == mode
+    assert resolved.seeds == tuple(sorted(seeds))
+    assert resolved.single_row_ids == tuple(sorted(single_rows))
+    assert resolved.two_action_row_ids == ()
+    assert resolved.to_dict()["two_action_row_ids"] == []
+
+
 def test_sweep_rejects_nonbaseline_base_and_non_s1_named_profile(tmp_path):
     _write_base_config(tmp_path, profiles=["c4w8k2s1"])
     path = _write_sweep(tmp_path, _raw_sweep())
@@ -260,6 +288,51 @@ def test_sweep_rejects_schema_drift(tmp_path, mutate, message):
                 "two_action_row_ids": [0],
             },
             "seeds must be non-empty",
+        ),
+        (
+            {
+                "mode": "quick",
+                "seeds": [7],
+                "single_row_ids": [],
+                "two_action_row_ids": [],
+            },
+            "single_row_ids must be non-empty",
+        ),
+        (
+            {
+                "mode": "formal",
+                "seeds": [1, 2, 3, 4],
+                "single_row_ids": [0],
+                "two_action_row_ids": [],
+            },
+            "formal evaluation requires",
+        ),
+        (
+            {
+                "mode": "formal",
+                "seeds": [1, 2, 3, 4],
+                "single_row_ids": list(range(6)),
+                "two_action_row_ids": [0],
+            },
+            "formal evaluation requires",
+        ),
+        (
+            {
+                "mode": "quick",
+                "seeds": [7],
+                "single_row_ids": [0],
+                "two_action_row_ids": [True],
+            },
+            r"two_action_row_ids\[0\].*\[0, 7\]",
+        ),
+        (
+            {
+                "mode": "quick",
+                "seeds": [7],
+                "single_row_ids": [0],
+                "two_action_row_ids": [0, 0],
+            },
+            "two_action_row_ids must contain unique",
         ),
         (
             {

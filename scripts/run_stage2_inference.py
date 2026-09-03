@@ -76,11 +76,11 @@ def _override_sweep_evaluation(
     if mode == "formal":
         seeds = _FORMAL_SEEDS
         single_rows = _FORMAL_SINGLE_ROWS
-        two_action_rows = _FORMAL_TWO_ACTION_ROWS
+        two_action_rows = _FORMAL_TWO_ACTION_ROWS if config.two_action_row_ids else ()
     elif mode == "quick":
         seeds = _QUICK_SEEDS
         single_rows = _QUICK_SINGLE_ROWS
-        two_action_rows = _QUICK_TWO_ACTION_ROWS
+        two_action_rows = _QUICK_TWO_ACTION_ROWS if config.two_action_row_ids else ()
     else:  # argparse guards the public CLI; keep the helper fail-closed.
         raise ValueError(f"unknown Stage-2 sweep evaluation mode: {mode!r}")
     return replace(
@@ -171,6 +171,12 @@ def build_stage2_inference_plan(
         "profile_count": len(config.profiles),
         "base_samples_per_profile": base_samples,
         "expected_sample_count": len(samples),
+        "single_action_sample_count": sum(
+            sample.dataset == STAGE2_SINGLE_DATASET for sample in samples
+        ),
+        "two_action_sample_count": sum(
+            sample.dataset != STAGE2_SINGLE_DATASET for sample in samples
+        ),
         "sample_plan_sha256": canonical_json_sha256(
             [sample.to_manifest_source() for sample in samples]
         ),
@@ -201,8 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--evaluation",
         choices=("quick", "formal"),
         help=(
-            "Override only a sweep config's evaluation subset. 'formal' expands "
-            "to all 56 canonical samples per profile."
+            "Override a sweep config's evaluation subset while preserving disabled "
+            "datasets. 'formal' uses all rows and four seeds for enabled datasets."
         ),
     )
     parser.add_argument(

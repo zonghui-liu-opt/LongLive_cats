@@ -298,3 +298,99 @@ def test_code_update_resumes_real_artifacts_and_rebuilds_derived_reports(
         canonical_json_bytes(expected_summary) + b"\n"
     )
     assert (root / "timing_samples.csv").read_bytes() == expected_csv
+
+
+def test_single_action_c4_run_writes_measured_reports_and_resumes_without_generation(
+    tmp_path: Path,
+) -> None:
+    spec = resolve_stage2_rollout_profile("c4w16k4s1")
+    config = replace(
+        _sweep_config(tmp_path),
+        profiles=(spec.name,),
+        seeds=(1,),
+        two_action_row_ids=(),
+        profile_set_sha256=canonical_json_sha256([spec.to_dict()]),
+        _rollout_specs=(spec,),
+    )
+    sample = replace(
+        _sample(
+            tmp_path,
+            dataset=STAGE2_SINGLE_DATASET,
+            row_id=0,
+            seed=1,
+            prompts=("single prompt",),
+            profile=spec.name,
+        ),
+        width=64,
+    )
+    samples = (sample,)
+    calls: dict[str, Any] = {}
+
+    def forbidden_two_generation(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("single-action configuration must never generate two actions")
+
+    ops = replace(
+        _production_artifact_ops(samples, calls),
+        generate_two=forbidden_two_generation,
+    )
+    result = run_stage2_inference(config, context=_context(), ops=ops)
+
+    assert result["status"] == "complete"
+    assert result["local_generated"] == 1
+    assert result["local_skipped"] == 0
+    assert calls["single_calls"] == [spec.name]
+    assert calls["two_calls"] == []
+    assert calls["video_writes"] == 1
+
+    root = Path(config.output_root)
+    manifest = json.loads((root / STAGE2_INFERENCE_MANIFEST_NAME).read_text())
+    inference_config = build_stage2_inference_config_identity(
+        config, runtime_assets=_runtime_asset_identity(config)
+    )
+    assert (
+        validate_stage2_inference_manifest_artifacts(
+            root,
+            manifest,
+            expected_checkpoint=_CHECKPOINT,
+            expected_resolved_config=inference_config["resolved"],
+            expected_samples=samples,
+        )
+        == manifest
+    )
+    assert manifest["expected_sample_count"] == 1
+    assert [entry["dataset"] for entry in manifest["samples"]] == [
+        STAGE2_SINGLE_DATASET
+    ]
+    summary = json.loads((root / "timing_summary.json").read_text())
+    assert summary["sample_count"] == summary["measured_sample_count"] == 1
+    assert summary["missing_timing_sample_count"] == 0
+    assert len(summary["groups"]) == 1
+    assert summary["groups"][0]["dataset"] == STAGE2_SINGLE_DATASET
+    assert summary["groups"][0]["profile"] == spec.name
+    with (root / "timing_samples.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["sample_key"] == sample.sample_key
+    assert rows[0]["dataset"] == STAGE2_SINGLE_DATASET
+    assert rows[0]["profile"] == spec.name
+    assert rows[0]["dit_calls"] == "31"
+    assert rows[0]["vae_decode_calls"] == "1"
+    assert rows[0]["video_postprocess_calls"] == "2"
+    for stage in ("dit", "vae_decode", "video_postprocess"):
+        assert float(rows[0][f"{stage}_seconds"]) > 0
+
+    def forbidden_resume_generation(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("completed single-action sample must be reused on resume")
+
+    resumed = run_stage2_inference(
+        config,
+        context=_context(),
+        ops=replace(ops, generate_single=forbidden_resume_generation),
+    )
+    assert resumed["status"] == "complete"
+    assert resumed["local_generated"] == 0
+    assert resumed["local_skipped"] == 1
+    assert calls["single_calls"] == [spec.name]
+    assert calls["two_calls"] == []
+    assert calls["video_writes"] == 1
+    assert json.loads((root / "timing_summary.json").read_text()) == summary

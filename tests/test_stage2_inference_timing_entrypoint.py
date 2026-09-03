@@ -16,7 +16,7 @@ CONFIG = PROJECT_ROOT / "configs" / "infer_i2v_stage2_c4w16k4s1_timing.yaml"
 
 @pytest.mark.parametrize(
     ("mode", "samples", "forwards"),
-    [("quick", 4, 184), ("formal", 56, 2696)],
+    [("quick", 2, 62), ("formal", 24, 744)],
 )
 def test_timing_plan_selects_only_requested_topology(
     tmp_path: Path,
@@ -39,8 +39,11 @@ def test_timing_plan_selects_only_requested_topology(
     plan = inference_entrypoint.build_stage2_inference_plan(config)
 
     assert config.profiles == ("c4w16k4s1",)
+    assert config.two_action_row_ids == ()
     assert plan["evaluation_mode"] == mode
     assert plan["expected_sample_count"] == samples
+    assert plan["single_action_sample_count"] == samples
+    assert plan["two_action_sample_count"] == 0
     assert plan["generator_forward_calls"] == forwards
     profile = plan["profiles"][0]
     assert (
@@ -50,6 +53,10 @@ def test_timing_plan_selects_only_requested_topology(
         profile["num_denoising_steps"],
         profile["fresh_episode_dit_calls"],
     ) == (4, 16, 1, 4, 31)
+    # A mode round-trip must not silently re-enable the excluded dataset.
+    switched = inference_entrypoint._override_sweep_evaluation(config, "formal")
+    switched = inference_entrypoint._override_sweep_evaluation(switched, "quick")
+    assert switched.two_action_row_ids == ()
 
 
 @pytest.fixture

@@ -205,9 +205,11 @@ def _canonical_int_list(
     *,
     minimum: int,
     maximum: int,
+    allow_empty: bool = False,
 ) -> list[int]:
-    if not isinstance(value, list) or not value:
-        raise ValueError(f"{label} must be a non-empty list")
+    if not isinstance(value, list) or (not value and not allow_empty):
+        expected = "a list" if allow_empty else "a non-empty list"
+        raise ValueError(f"{label} must be {expected}")
     if any(
         isinstance(item, bool)
         or not isinstance(item, int)
@@ -268,6 +270,7 @@ def _validate_sweep_resolved_config(resolved: Mapping[str, Any]) -> None:
         "Stage-2 resolved inference sweep two-action row ids",
         minimum=0,
         maximum=7,
+        allow_empty=True,
     )
     evaluation_mode = resolved.get("evaluation_mode")
     if evaluation_mode not in {"formal", "quick"}:
@@ -275,11 +278,11 @@ def _validate_sweep_resolved_config(resolved: Mapping[str, Any]) -> None:
     if evaluation_mode == "formal" and (
         seeds != [1, 2, 3, 4]
         or single_row_ids != list(range(6))
-        or two_action_row_ids != list(range(8))
+        or two_action_row_ids not in ([], list(range(8)))
     ):
         raise ValueError(
             "formal Stage-2 inference sweep requires seeds 1..4, "
-            "single rows 0..5, and two-action rows 0..7"
+            "single rows 0..5, and two-action rows 0..7 or []"
         )
 
 

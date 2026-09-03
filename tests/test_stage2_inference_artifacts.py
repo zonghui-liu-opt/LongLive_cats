@@ -692,6 +692,130 @@ def test_sweep_config_identity_recomputes_profile_set_and_validates_evaluation(
         validate_stage2_inference_config_identity(extra_key)
 
 
+@pytest.mark.parametrize(
+    ("mode", "seeds", "single_rows", "expected_count"),
+    [
+        ("quick", (9,), (0, 5), 2),
+        ("formal", (1, 2, 3, 4), tuple(range(6)), 24),
+    ],
+)
+def test_single_action_sweep_manifest_roundtrip(
+    tmp_path: Path, mode, seeds, single_rows, expected_count
+) -> None:
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=4,
+        local_window_frames=16,
+        num_denoising_steps=4,
+    )
+    config = _resolved_sweep_config(
+        tmp_path,
+        specs=(spec,),
+        seeds=seeds,
+        evaluation_mode=mode,
+        single_row_ids=single_rows,
+        two_action_row_ids=(),
+    )
+    identity = build_stage2_inference_config_identity(
+        config, runtime_assets=_runtime_asset_identity(config)
+    )
+    assert validate_stage2_inference_config_identity(identity) == identity
+    samples = build_stage2_inference_samples(
+        single_metadata=SINGLE_METADATA,
+        two_action_metadata=TWO_METADATA,
+        profiles=config.profiles,
+        seeds=seeds,
+        single_row_ids=single_rows,
+        two_action_row_ids=(),
+    )
+    assert len(samples) == expected_count
+    assert {sample.dataset for sample in samples} == {STAGE2_SINGLE_DATASET}
+    traces = {}
+    trace_paths = {}
+    for sample in samples:
+        trace = build_stage2_sample_trace(
+            sample=sample,
+            generation_trace=_generation(sample, profile_spec=spec),
+            output_root=tmp_path,
+            video_path=_write_video(tmp_path, sample),
+            checkpoint=CHECKPOINT,
+            inference_config=identity,
+            probe_fn=lambda _, sample=sample: _probe(sample),
+        )
+        traces[sample.sample_key] = trace
+        trace_paths[sample.sample_key] = write_stage2_sample_trace(
+            tmp_path, sample=sample, trace=trace
+        )
+    metadata = {
+        dataset: {"path": str(path), "sha256": sha256_file(path)}
+        for dataset, path in (
+            (STAGE2_SINGLE_DATASET, SINGLE_METADATA),
+            (STAGE2_TWO_ACTION_DATASET, TWO_METADATA),
+        )
+    }
+    manifest = build_stage2_inference_manifest(
+        output_root=tmp_path,
+        samples=samples,
+        traces=traces,
+        trace_paths=trace_paths,
+        checkpoint=CHECKPOINT,
+        inference_config=identity,
+        metadata=metadata,
+    )
+    assert manifest["expected_sample_count"] == expected_count
+    assert validate_stage2_inference_manifest(manifest) == manifest
+    write_stage2_inference_manifest(tmp_path, manifest=manifest)
+    write_stage2_review_index(tmp_path, manifest=manifest)
+    assert (
+        validate_stage2_inference_manifest_artifacts(
+            tmp_path,
+            manifest,
+            expected_checkpoint=CHECKPOINT,
+            expected_resolved_config=identity["resolved"],
+            expected_samples=samples,
+        )
+        == manifest
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"seeds": ()}, "seeds must be a non-empty list"),
+        ({"single_row_ids": ()}, "single row ids must be a non-empty list"),
+        ({"two_action_row_ids": (True,)}, "plain integers"),
+        ({"two_action_row_ids": (0, 0)}, "sorted and unique"),
+        (
+            {"evaluation_mode": "formal", "single_row_ids": (0,)},
+            "formal Stage-2 inference sweep",
+        ),
+        (
+            {"evaluation_mode": "formal", "two_action_row_ids": (0,)},
+            "formal Stage-2 inference sweep",
+        ),
+    ],
+)
+def test_single_action_sweep_identity_still_rejects_invalid_selection(
+    tmp_path: Path, overrides, message
+) -> None:
+    spec = build_stage2_deployment_rollout_spec(
+        chunk_frames=4,
+        local_window_frames=16,
+        num_denoising_steps=4,
+    )
+    config = _resolved_sweep_config(
+        tmp_path,
+        specs=(spec,),
+        seeds=(1, 2, 3, 4),
+        single_row_ids=tuple(range(6)),
+        two_action_row_ids=(),
+    )
+    invalid = replace(config, **overrides)
+    with pytest.raises(ValueError, match=message):
+        build_stage2_inference_config_identity(
+            invalid, runtime_assets=_runtime_asset_identity(invalid)
+        )
+
+
 def test_sweep_config_identity_rejects_noncanonical_or_forged_profiles(
     tmp_path: Path,
 ) -> None:
