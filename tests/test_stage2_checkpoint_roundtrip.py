@@ -817,6 +817,59 @@ def test_generator_ema_inference_gate_requires_initialized_ema(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "code_version",
+    [
+        None,
+        {},
+        {"legacy_commit": "old-checkout"},
+        {"stage2_source_sha256": "old"},
+        "missing",
+    ],
+    ids=["null", "empty", "legacy", "non-sha", "missing"],
+)
+def test_generator_ema_inference_ignores_historical_code_metadata(
+    tmp_path, code_version
+):
+    directory = _save(tmp_path, 40)
+    provenance_path = directory / "provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    if code_version == "missing":
+        provenance.pop("code_version")
+    else:
+        provenance["code_version"] = code_version
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    manifest_path = directory / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["provenance_sha256"] = canonical_json_sha256(provenance)
+    entry = next(
+        item for item in manifest["files"] if item["name"] == "provenance.json"
+    )
+    entry["size"] = provenance_path.stat().st_size
+    entry["sha256"] = sha256_file(provenance_path)
+    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    manifest["manifest_sha256"] = canonical_json_sha256(body)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    original_provenance_bytes = provenance_path.read_bytes()
+    original_manifest_bytes = manifest_path.read_bytes()
+
+    payload = load_stage2_generator_ema_checkpoint(
+        directory,
+        expected_contract_hash="a" * 64,
+        expected_launch_hash="b" * 64,
+        expected_generator_schema=GENERATOR_SCHEMA,
+    )
+
+    assert payload.provenance == provenance
+    assert provenance_path.read_bytes() == original_provenance_bytes
+    assert manifest_path.read_bytes() == original_manifest_bytes
+    assert torch.equal(
+        payload.generator_ema["generator.lora_A.weight"],
+        torch.full((2, 3), 42.0),
+    )
+
+
 def test_generator_ema_inference_gate_rejects_rehashed_invalid_provenance(tmp_path):
     directory = _save(tmp_path, 40)
     provenance_path = directory / "provenance.json"

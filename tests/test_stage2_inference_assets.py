@@ -363,6 +363,53 @@ def test_detailed_attestation_rejects_resigned_file_aggregate_disagreement(
         validate_stage2_runtime_assets(duplicated)
 
 
+@pytest.mark.parametrize(
+    "code_version",
+    [
+        None,
+        {},
+        {"legacy_commit": "old-checkout"},
+        {"stage2_source_sha256": "old"},
+        "missing",
+    ],
+    ids=["null", "empty", "legacy", "non-sha", "missing"],
+)
+def test_runtime_assets_ignore_historical_checkpoint_code_metadata(
+    tmp_path: Path,
+    code_version: Any,
+) -> None:
+    config, fixture, _ = _fixture(tmp_path)
+    checkpoint = Path(config.stage2_checkpoint)
+    provenance_path = checkpoint / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if code_version == "missing":
+        provenance.pop("code_version")
+    else:
+        provenance["code_version"] = code_version
+    provenance_bytes = _write_json(provenance_path, provenance)
+
+    manifest_path = checkpoint / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["provenance_sha256"] = canonical_json_sha256(provenance)
+    entry = next(
+        item for item in manifest["files"] if item["name"] == "provenance.json"
+    )
+    entry["size"] = len(provenance_bytes)
+    entry["sha256"] = hashlib.sha256(provenance_bytes).hexdigest()
+    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    manifest["manifest_sha256"] = canonical_json_sha256(body)
+    manifest_bytes = _write_json(manifest_path, manifest)
+
+    assets = build_stage2_runtime_assets(
+        config,
+        validate_generator_manifest_fn=fixture["validator"],
+    )
+
+    assert assets["checkpoint"]["manifest_sha256"] == manifest["manifest_sha256"]
+    assert provenance_path.read_bytes() == provenance_bytes
+    assert manifest_path.read_bytes() == manifest_bytes
+
+
 def test_checkpoint_provenance_rejects_rehashed_source_manifest_replacement(
     tmp_path: Path,
 ) -> None:

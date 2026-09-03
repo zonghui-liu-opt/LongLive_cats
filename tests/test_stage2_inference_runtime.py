@@ -944,7 +944,7 @@ def test_same_path_runtime_asset_content_drift_rejects_resume_before_any_write(
     assert calls["trace_writes"] == 0
 
 
-def test_code_version_drift_rejects_resume_before_any_sample_write(
+def test_code_version_drift_resumes_without_rewriting_existing_samples(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -960,23 +960,29 @@ def test_code_version_drift_rejects_resume_before_any_sample_write(
         context=_context(),
         ops=_runtime_ops((sample,), {}),
     )
+    root = Path(config.output_root)
+    trace_path = root / sample.trace_relative_path
+    trace = json.loads(trace_path.read_text())
+    trace["code_version"] = {"stage2_source_sha256": "f" * 64}
+    atomic_write_json(trace_path, trace)
+    manifest_path = root / STAGE2_INFERENCE_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["code_version"] = {"stage2_source_sha256": "f" * 64}
+    atomic_write_json(manifest_path, manifest)
+    original_trace = trace_path.read_bytes()
+    original_manifest = manifest_path.read_bytes()
 
     calls: dict[str, Any] = {}
     ops = _runtime_ops((sample,), calls)
-    with pytest.raises(RuntimeError, match="code version"):
-        run_stage2_inference(
-            config,
-            context=_context(),
-            ops=replace(
-                ops,
-                capture_code_version=lambda: {"stage2_source_sha256": "f" * 64},
-            ),
-        )
+    result = run_stage2_inference(config, context=_context(), ops=ops)
 
+    assert result["local_skipped"] == 1
+    assert result["local_generated"] == 0
     assert calls["generator_loads"] == 1
-    assert calls["vae_builds"] == 0
     assert calls["video_writes"] == 0
     assert calls["trace_writes"] == 0
+    assert trace_path.read_bytes() == original_trace
+    assert manifest_path.read_bytes() == original_manifest
 
 
 @pytest.mark.parametrize(
@@ -1436,7 +1442,7 @@ def test_video_probe_failure_commits_neither_pair_nor_complete_manifest(
     assert not (root / STAGE2_INFERENCE_MANIFEST_NAME).exists()
 
 
-def test_invalid_source_version_stops_before_loading_any_model(tmp_path: Path) -> None:
+def test_inference_never_invokes_legacy_code_version_callback(tmp_path: Path) -> None:
     config = _config(tmp_path)
     sample = _sample(
         tmp_path,
@@ -1447,21 +1453,18 @@ def test_invalid_source_version_stops_before_loading_any_model(tmp_path: Path) -
     )
     calls: dict[str, Any] = {}
 
+    def reject_capture():
+        raise AssertionError("source code must not be hashed during inference")
+
     ops = replace(
         _runtime_ops((sample,), calls),
-        capture_code_version=lambda: {"stage2_source_sha256": "invalid"},
+        capture_code_version=reject_capture,
     )
-    with pytest.raises(ValueError, match="source version is invalid"):
-        run_stage2_inference(
-            config,
-            context=_context(),
-            ops=ops,
-        )
-
-    assert calls["text_encoder_builds"] == 0
-    assert calls["generator_loads"] == 0
-    assert calls["vae_builds"] == 0
-    assert not (Path(config.output_root) / STAGE2_INFERENCE_MANIFEST_NAME).exists()
+    result = run_stage2_inference(config, context=_context(), ops=ops)
+    assert result["status"] == "complete"
+    assert calls["video_writes"] == 1
+    manifest_path = Path(config.output_root) / STAGE2_INFERENCE_MANIFEST_NAME
+    assert json.loads(manifest_path.read_text())["code_version"] == {}
 
 
 def test_metadata_change_during_sample_planning_stops_before_loading_models(

@@ -35,7 +35,6 @@ from utils.stage1_io import (
     canonical_json_sha256,
     sha256_file,
 )
-from utils.stage2_code_version import capture_stage2_source_version
 from utils.stage2_inference import (
     STAGE2_INFERENCE_FPS,
     Stage2InferenceResult,
@@ -311,9 +310,9 @@ class Stage2InferenceRuntimeOps:
     )
     write_manifest: Callable[..., Path] = write_stage2_inference_manifest
     write_review_index: Callable[..., Path] = write_stage2_review_index
-    capture_code_version: Callable[[], Mapping[str, Any]] = (
-        capture_stage2_source_version
-    )
+    # Accepted for callers that still construct legacy operation bundles.
+    # Inference never invokes this callback or hashes its source code.
+    capture_code_version: Callable[[], Mapping[str, Any]] | None = None
     all_gather_object: Callable[..., tuple[Any, ...]] = _default_all_gather_object
     barrier: Callable[..., None] = _default_barrier
 
@@ -1018,7 +1017,6 @@ def _validate_existing_pair(
             _strict_json_object(guard, trace_path),
             sample=sample,
             inference_config=inference_config,
-            code_version=code_version,
         )
     )
     _assert_output_root_guard(guard)
@@ -1030,10 +1028,6 @@ def _validate_existing_pair(
         raise RuntimeError(
             "existing Stage-2 sample uses another inference config: "
             f"{sample.sample_key}"
-        )
-    if trace.get("code_version") != dict(code_version):
-        raise RuntimeError(
-            f"existing Stage-2 sample uses another code version: {sample.sample_key}"
         )
     technical = dict(
         validate_stage2_video_artifact(
@@ -1171,16 +1165,11 @@ def _generate_one_sample(
             trace,
             sample=sample,
             inference_config=inference_config,
-            code_version=code_version,
         )
     )
     if trace.get("inference_config") != dict(inference_config):
         raise RuntimeError(
             f"Stage-2 sample trace lost its inference config: {sample.sample_key}"
-        )
-    if trace.get("code_version") != dict(code_version):
-        raise RuntimeError(
-            f"Stage-2 sample trace lost its code version: {sample.sample_key}"
         )
     _assert_regular_parents(guard, trace_path, allow_missing=False)
     ops.write_sample_trace(root, sample=sample, trace=trace)
@@ -1249,7 +1238,6 @@ def _finalize_artifacts(
                 _strict_json_object(guard, trace_path),
                 sample=sample,
                 inference_config=inference_config,
-                code_version=code_version,
             )
         )
         _assert_regular_parents(guard, trace_path, allow_missing=False)
@@ -1302,10 +1290,6 @@ def _finalize_artifacts(
         raise RuntimeError("Stage-2 manifest lost its inference config identity")
     manifest_path = root / STAGE2_INFERENCE_MANIFEST_NAME
     index_path = root / STAGE2_REVIEW_INDEX_NAME
-    _assert_output_root_guard(guard)
-    expected_index = _render_review_index_bytes(manifest, ops=ops)
-    _assert_output_root_guard(guard)
-
     manifest_exists = manifest_path.exists() or manifest_path.is_symlink()
     index_exists = index_path.exists() or index_path.is_symlink()
     _assert_output_root_guard(guard)
@@ -1317,20 +1301,32 @@ def _finalize_artifacts(
             )
         )
         _assert_output_root_guard(guard)
-        if existing_manifest != manifest:
+
+        # Historical provenance is informational. Compare the actual inputs and
+        # artifact records, then retain the original manifest and its self hash.
+        def artifact_identity(value: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                key: item
+                for key, item in value.items()
+                if key not in {"code_version", "manifest_sha256"}
+            }
+
+        if artifact_identity(existing_manifest) != artifact_identity(manifest):
             raise RuntimeError("existing Stage-2 manifest differs from live artifacts")
-        if not index_exists:
-            raise RuntimeError("complete Stage-2 manifest is missing its review index")
+        manifest = existing_manifest
+    _assert_output_root_guard(guard)
+    expected_index = _render_review_index_bytes(manifest, ops=ops)
+    _assert_output_root_guard(guard)
+    index_matches = False
     if index_exists:
         _assert_output_root_guard(guard)
         if index_path.is_symlink() or not index_path.is_file():
             raise RuntimeError("Stage-2 review index is not a regular file")
-        if index_path.read_bytes() != expected_index:
-            raise RuntimeError(
-                "existing Stage-2 review index differs from its manifest"
-            )
+        index_matches = index_path.read_bytes() == expected_index
         _assert_output_root_guard(guard)
-    else:
+    if not index_matches:
+        # HTML and timing reports are derived views. Rebuild stale or interrupted
+        # versions from the validated traces without touching videos/timings.
         _assert_output_root_guard(guard)
         written_index = Path(ops.write_review_index(root, manifest=manifest))
         _assert_output_root_guard(guard)
@@ -1350,12 +1346,12 @@ def _finalize_artifacts(
     ):
         destination = root / name
         _assert_output_root_guard(guard)
+        report_matches = False
         if destination.exists() or destination.is_symlink():
             if destination.is_symlink() or not destination.is_file():
                 raise RuntimeError(f"Stage-2 timing report is not a file: {name}")
-            if destination.read_bytes() != payload:
-                raise RuntimeError(f"Stage-2 timing report differs from traces: {name}")
-        else:
+            report_matches = destination.read_bytes() == payload
+        if not report_matches:
             atomic_write_bytes(destination, payload)
         _assert_output_root_guard(guard)
 
@@ -1444,7 +1440,9 @@ def run_stage2_inference(
         phase="runtime asset authentication",
     )
     startup_exception: Exception | None = None
-    code_version: Mapping[str, Any] | None = None
+    # Keep empty legacy metadata for existing builder interfaces; do not scan,
+    # compare, or validate source-code versions during inference.
+    code_version: Mapping[str, Any] = {}
     inference_config: Mapping[str, Any] | None = None
     root: Path | None = None
     root_guard: _Stage2OutputRootGuard | None = None
@@ -1510,16 +1508,6 @@ def run_stage2_inference(
         sample_plan_sha256 = canonical_json_sha256(
             [sample.to_manifest_source() for sample in samples]
         )
-        code_version = dict(runtime_ops.capture_code_version())
-        if set(code_version) != {"stage2_source_sha256"}:
-            raise ValueError("Stage-2 inference code version schema mismatch")
-        source_sha256 = code_version["stage2_source_sha256"]
-        if (
-            not isinstance(source_sha256, str)
-            or len(source_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in source_sha256)
-        ):
-            raise ValueError("Stage-2 inference source version is invalid")
     except Exception as exc:  # noqa: BLE001 - synchronize every rank before raising
         startup_exception = exc
     startup = _collective_phase_result(
@@ -1530,7 +1518,6 @@ def run_stage2_inference(
                 if startup_exception is None
                 else f"{type(startup_exception).__name__}: {startup_exception}"
             ),
-            "code_version": code_version,
             "inference_config": inference_config,
             "output_root": os.fspath(root) if root is not None else None,
             "output_root_guard": root_guard_identity,
@@ -1569,10 +1556,6 @@ def run_stage2_inference(
     root = _assert_output_root_guard(root_guard)
     if root != Path(root_values[0]):
         raise RuntimeError("Stage-2 local output root differs from rank consensus")
-    versions = [dict(item["code_version"]) for item in startup]
-    if any(value != versions[0] for value in versions[1:]):
-        raise RuntimeError("Stage-2 ranks do not share one source snapshot")
-    code_version = versions[0]
     metadata_values = [dict(item["metadata"]) for item in startup]
     if any(value != metadata_values[0] for value in metadata_values[1:]):
         raise RuntimeError("Stage-2 ranks do not share one metadata snapshot")
@@ -1838,9 +1821,6 @@ def run_stage2_inference(
                 runtime_assets,
                 include_source_manifest=True,
             )
-            final_code_version = dict(runtime_ops.capture_code_version())
-            if final_code_version != code_version:
-                raise RuntimeError("Stage-2 source changed during inference")
             manifest_path, index_path = _finalize_artifacts(
                 root_guard,
                 samples=samples,

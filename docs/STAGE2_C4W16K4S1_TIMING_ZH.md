@@ -99,3 +99,9 @@ $STAGE2_TRAIN_ROOT/inference_early_g000120_infer_i2v_stage2_c4w16k4s1_timing_qui
 ```
 
 入口打印最终完整路径。目录中还包括 `videos/`、`traces/`、`manifest.json`、`index.html`；日志位于输出目录对应的相邻 `.log` 文件。已完整的视频与 trace 会校验后跳过，沿用历史计时，不能把续跑当作一次新的性能测量。重新测量时通过 `STAGE2_EARLY_OUTPUT` 指定新的空目录。
+
+## 更新代码后继续运行
+
+Stage-2 推理不再计算或校验源码版本，不比较当前代码与历史 trace、manifest、checkpoint 中的 `code_version`，也不要求各 rank 的源码 hash 一致。旧版本字段只保留为历史记录；无需手动编辑 trace、删除视频、更换输出目录或设置跳过校验的环境变量。
+
+更新代码后直接重跑原命令即可继续。完整视频与 trace 保持原样，只生成尚未完成的样本；已有 manifest 仍按真实输入、权重、推理配置和产物检查。旧 HTML 和计时汇总会根据已验证的 trace 自动刷新，避免因展示文件格式或历史代码版本变化再次中断。以前未记录计时的样本在汇总中标为缺失，不补造耗时；新生成样本继续记录三段计时。

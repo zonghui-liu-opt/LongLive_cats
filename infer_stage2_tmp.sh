@@ -104,7 +104,6 @@ export LONG_LIVE_FFPROBE="${LONG_LIVE_FFPROBE:-}"
 readonly INFERENCE_CONFIG="${STAGE2_INFERENCE_CONFIG:-configs/infer_i2v_stage2_baseline.yaml}"
 readonly SWEEP_EVALUATION="${STAGE2_SWEEP_EVALUATION:-}"
 readonly PLAN_ONLY="${STAGE2_INFERENCE_PLAN_ONLY:-0}"
-readonly EXPECTED_ASSET_API="longlive_stage2_inference_assets/v2"
 readonly HEARTBEAT_SECONDS="${STAGE2_INFERENCE_HEARTBEAT_SECONDS:-30}"
 
 run_stage2_cli() {
@@ -173,21 +172,14 @@ validate_gpu_layout() {
     done
 }
 
-preflight_code() {
-    "$STAGE2_PYTHON" -I -B - "$STAGE2_PROJECT_ROOT" "$EXPECTED_ASSET_API" <<'PY'
+preflight_runtime() {
+    "$STAGE2_PYTHON" -I -B - "$STAGE2_PROJECT_ROOT" <<'PY'
 import sys
 
-project_root, expected = sys.argv[1:]
+project_root = sys.argv[1]
 sys.path.insert(0, project_root)
-from utils.stage2_inference_assets import STAGE2_INFERENCE_ASSET_API_VERSION
 from utils.stage1_causal_validation import resolve_ffprobe
 
-if STAGE2_INFERENCE_ASSET_API_VERSION != expected:
-    raise SystemExit(
-        "Stage-2 跨节点权重校验代码不是最新版："
-        f"expected={expected}, actual={STAGE2_INFERENCE_ASSET_API_VERSION}"
-    )
-print(f"STAGE2_INFERENCE_ASSET_API=PASS ({expected})", flush=True)
 print(f"STAGE2_FFPROBE=PASS ({resolve_ffprobe()})", flush=True)
 PY
 }
@@ -214,7 +206,7 @@ validate_common_inputs() {
     [[ "$HEARTBEAT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
         fail "STAGE2_INFERENCE_HEARTBEAT_SECONDS 必须是正整数"
     cd -- "$STAGE2_PROJECT_ROOT"
-    preflight_code
+    preflight_runtime
 }
 
 verify_outputs() {

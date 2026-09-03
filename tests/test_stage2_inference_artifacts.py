@@ -473,7 +473,7 @@ def test_config_identity_is_self_verifying_and_trace_rejects_resolved_drift(
         validate_stage2_inference_config_identity(tampered)
 
 
-def test_trace_rejects_code_version_and_bit_inexact_sigma_drift(
+def test_trace_ignores_code_version_but_rejects_bit_inexact_sigma_drift(
     tmp_path: Path,
 ) -> None:
     sample = _samples()[0]
@@ -489,12 +489,14 @@ def test_trace_rejects_code_version_and_bit_inexact_sigma_drift(
         probe_fn=lambda _: _probe(sample),
     )
 
-    with pytest.raises(RuntimeError, match="code version mismatch"):
+    assert (
         validate_stage2_sample_trace(
             trace,
             sample=sample,
             code_version={"stage2_source_sha256": "b" * 64},
         )
+        == trace
+    )
 
     drifted = deepcopy(trace)
     sigmas = [0.9, 0.6, 0.3, 0.1, 0.0]
@@ -508,6 +510,54 @@ def test_trace_rejects_code_version_and_bit_inexact_sigma_drift(
     drifted["trace_sha256"] = canonical_json_sha256(body)
     with pytest.raises(RuntimeError, match="sigma schedule drifted"):
         validate_stage2_sample_trace(drifted, sample=sample)
+
+
+@pytest.mark.parametrize(
+    ("has_code_version", "stored_code_version"),
+    [
+        (False, None),
+        (True, None),
+        (True, "legacy source"),
+        (True, []),
+        (True, {"stage2_source_sha256": "not a digest"}),
+        (True, {"psnr": "historical metadata"}),
+    ],
+)
+def test_trace_code_metadata_is_optional_and_opaque(
+    tmp_path: Path, has_code_version: bool, stored_code_version: object
+) -> None:
+    sample = _samples()[0]
+    video = _write_video(tmp_path, sample)
+    trace = build_stage2_sample_trace(
+        sample=sample,
+        generation_trace=_generation(sample),
+        output_root=tmp_path,
+        video_path=video,
+        checkpoint=CHECKPOINT,
+        inference_config=_inference_config(tmp_path),
+        probe_fn=lambda _: _probe(sample),
+    )
+    assert trace["code_version"] == {}
+    if has_code_version:
+        trace["code_version"] = stored_code_version
+    else:
+        trace.pop("code_version")
+    body = dict(trace)
+    body.pop("trace_sha256")
+    trace["trace_sha256"] = canonical_json_sha256(body)
+    assert (
+        validate_stage2_sample_trace(
+            trace, sample=sample, code_version={"unrecognized_current_metadata": True}
+        )
+        == trace
+    )
+    path = write_stage2_sample_trace(tmp_path, sample=sample, trace=trace)
+    assert json.loads(path.read_text()) == trace
+
+    corrupted = deepcopy(trace)
+    corrupted["output"]["sha256"] = "f" * 64
+    with pytest.raises(RuntimeError, match="self hash mismatch"):
+        validate_stage2_sample_trace(corrupted, sample=sample)
 
 
 def test_formal_config_identity_cannot_smuggle_a_dynamic_sweep_profile(
@@ -688,7 +738,20 @@ def test_sweep_config_identity_rejects_noncanonical_or_forged_profiles(
         validate_stage2_inference_config_identity(forged)
 
 
-def test_dynamic_sweep_profile_trace_and_manifest_roundtrip(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("has_code_version", "stored_code_version"),
+    [
+        (False, None),
+        (True, None),
+        (True, "legacy source"),
+        (True, []),
+        (True, {"stage2_source_sha256": "not a digest"}),
+        (True, {"psnr": "historical metadata"}),
+    ],
+)
+def test_dynamic_sweep_manifest_accepts_optional_code_metadata_and_mixed_traces(
+    tmp_path: Path, has_code_version: bool, stored_code_version: object
+) -> None:
     spec = build_stage2_deployment_rollout_spec(
         chunk_frames=6,
         local_window_frames=12,
@@ -764,7 +827,7 @@ def test_dynamic_sweep_profile_trace_and_manifest_roundtrip(tmp_path: Path) -> N
         video_path=second_video,
         checkpoint=CHECKPOINT,
         inference_config=inference_config,
-        code_version=CODE_VERSION,
+        code_version={"stage2_source_sha256": "different legacy source"},
         probe_fn=lambda _: _probe(second),
     )
     traces[second.sample_key] = second_trace
@@ -781,8 +844,15 @@ def test_dynamic_sweep_profile_trace_and_manifest_roundtrip(tmp_path: Path) -> N
         checkpoint=CHECKPOINT,
         inference_config=inference_config,
         metadata=metadata,
-        code_version=CODE_VERSION,
     )
+    assert manifest["code_version"] == {}
+    if has_code_version:
+        manifest["code_version"] = stored_code_version
+    else:
+        manifest.pop("code_version")
+    manifest_body = dict(manifest)
+    manifest_body.pop("manifest_sha256")
+    manifest["manifest_sha256"] = canonical_json_sha256(manifest_body)
     assert manifest["seeds"] == [9]
     assert manifest["profiles"] == [trace["profile"]]
     assert manifest["samples"][0]["seed"] == 9
@@ -938,12 +1008,14 @@ def test_compression_and_multi_sink_trace_uses_native_profile_contract(
         ]
 
 
-def test_complete_56_sample_manifest_and_static_review_index(tmp_path):
+def test_complete_56_sample_manifest_with_mixed_code_versions_and_static_review_index(
+    tmp_path,
+):
     samples = _samples()
     inference_config = _inference_config(tmp_path)
     traces = {}
     trace_paths = {}
-    for sample in samples:
+    for index, sample in enumerate(samples):
         video = _write_video(tmp_path, sample)
         trace = build_stage2_sample_trace(
             sample=sample,
@@ -952,9 +1024,16 @@ def test_complete_56_sample_manifest_and_static_review_index(tmp_path):
             video_path=video,
             checkpoint=CHECKPOINT,
             inference_config=inference_config,
-            code_version=CODE_VERSION,
+            code_version=(
+                CODE_VERSION if index % 2 else {"stage2_source_sha256": "b" * 64}
+            ),
             probe_fn=lambda _, item=sample: _probe(item),
         )
+        if index % 3 == 0:
+            trace.pop("code_version")
+            trace_body = dict(trace)
+            trace_body.pop("trace_sha256")
+            trace["trace_sha256"] = canonical_json_sha256(trace_body)
         trace_path = write_stage2_sample_trace(tmp_path, sample=sample, trace=trace)
         traces[sample.sample_key] = trace
         trace_paths[sample.sample_key] = trace_path

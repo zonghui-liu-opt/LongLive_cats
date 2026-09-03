@@ -349,7 +349,6 @@ def test_launcher_delegates_plan_only_to_the_real_tmp_contract(tmp_path: Path) -
 set -eu
 for value in "$@"; do
   if [[ "$value" == "-" ]]; then
-    printf 'STAGE2_INFERENCE_ASSET_API=PASS (fake)\\n'
     printf 'STAGE2_FFPROBE=PASS (fake)\\n'
     exit 0
   fi
@@ -392,7 +391,7 @@ printf '{"expected_sample_count": 12}\\n'
     completed = _run("plan-quick", "matched", "40", env=environment)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "STAGE2_INFERENCE_ASSET_API=PASS" in completed.stdout
+    assert "STAGE2_FFPROBE=PASS" in completed.stdout
     assert "仅规划模式完成；未初始化模型、CUDA 或 torchrun" in completed.stdout
     assert "STAGE2_PROFILE_SWEEP=PASS phases=1 checkpoints=1" in completed.stdout
     log = (

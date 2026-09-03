@@ -360,7 +360,11 @@ def _checkpoint_provenance_snapshot(
         manifest.get("provenance_sha256"), "checkpoint provenance_sha256"
     ):
         raise RuntimeError("Stage-2 checkpoint provenance self binding mismatch")
-    return manifest, validate_stage2_provenance(provenance), directory
+    return (
+        manifest,
+        validate_stage2_provenance(provenance, validate_code_version=False),
+        directory,
+    )
 
 
 def _architecture_expected(recorded: Any) -> dict[str, Any]:

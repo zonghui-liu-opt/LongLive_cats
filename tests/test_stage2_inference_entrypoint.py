@@ -192,10 +192,10 @@ def test_early_checkpoint_shell_is_observable_and_cross_node_safe() -> None:
     subprocess.run(["bash", "-n", str(shell)], check=True)
 
     assert text.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail\n")
-    assert "STAGE2_INFERENCE_ASSET_API=PASS" in text
+    assert "STAGE2_INFERENCE_ASSET_API" not in text
     assert "STAGE2_FFPROBE=PASS" in text
     assert "LONG_LIVE_FFPROBE" in text
-    assert "longlive_stage2_inference_assets/v2" in text
+    assert "EXPECTED_ASSET_API" not in text
     assert '--nproc-per-node="$STAGE2_INFERENCE_NPROC"' in text
     assert "CUDA_VISIBLE_DEVICES" in text
     assert "仍在运行" in text
@@ -252,7 +252,6 @@ def test_early_checkpoint_plan_only_runs_with_bash3_and_caller_roots(
 set -eu
 for value in "$@"; do
     if [[ "$value" == "-" ]]; then
-        printf 'STAGE2_INFERENCE_ASSET_API=PASS (fake)\\n'
         printf 'STAGE2_FFPROBE=PASS (fake)\\n'
         exit 0
     fi

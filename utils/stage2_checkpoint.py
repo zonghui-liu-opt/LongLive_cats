@@ -142,8 +142,9 @@ def validate_stage2_provenance(
     provenance: Mapping[str, Any],
     *,
     add_code_version: bool = False,
+    validate_code_version: bool = True,
 ) -> dict[str, Any]:
-    """Normalize and validate the exact checkpoint provenance schema."""
+    """Validate checkpoint provenance; inference ignores optional code metadata."""
 
     if not isinstance(provenance, Mapping):
         raise TypeError("Stage-2 checkpoint provenance must be a mapping")
@@ -152,18 +153,20 @@ def validate_stage2_provenance(
     normalized_keys = {
         "schema",
         "schema_version",
-        "code_version",
         *raw_keys,
     }
+    if validate_code_version or "code_version" in value:
+        normalized_keys.add("code_version")
     if set(value) == raw_keys:
         if not add_code_version:
-            raise ValueError("Stage-2 provenance is missing schema/code_version")
+            raise ValueError("Stage-2 provenance is missing schema metadata")
         value = {
             "schema": STAGE2_PROVENANCE_SCHEMA,
             "schema_version": STAGE2_PROVENANCE_SCHEMA_VERSION,
             "code_version": capture_stage2_source_version(),
             **value,
         }
+        normalized_keys.add("code_version")
     value = _exact_mapping(
         value,
         label="Stage-2 checkpoint provenance",
@@ -175,12 +178,13 @@ def validate_stage2_provenance(
         or value["schema_version"] != STAGE2_PROVENANCE_SCHEMA_VERSION
     ):
         raise ValueError("unsupported Stage-2 checkpoint provenance schema")
-    code = _exact_mapping(
-        value["code_version"],
-        label="Stage-2 code_version",
-        expected_keys={"stage2_source_sha256"},
-    )
-    _sha256(code["stage2_source_sha256"], "code_version.stage2_source_sha256")
+    if validate_code_version:
+        code = _exact_mapping(
+            value["code_version"],
+            label="Stage-2 code_version",
+            expected_keys={"stage2_source_sha256"},
+        )
+        _sha256(code["stage2_source_sha256"], "code_version.stage2_source_sha256")
 
     assets = _exact_mapping(
         value["assets"],
@@ -3036,7 +3040,7 @@ def load_stage2_generator_ema_checkpoint(
         or canonical_json_sha256(dict(provenance)) != manifest["provenance_sha256"]
     ):
         raise RuntimeError("checkpoint provenance self binding mismatch")
-    provenance = validate_stage2_provenance(provenance)
+    provenance = validate_stage2_provenance(provenance, validate_code_version=False)
 
     generator_ema_entry = next(
         item

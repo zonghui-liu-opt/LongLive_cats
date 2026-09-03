@@ -183,17 +183,6 @@ def _plain_int(value: Any, label: str, *, minimum: int = 0) -> int:
     return value
 
 
-def _validate_code_version(value: Any) -> dict[str, str]:
-    if not isinstance(value, Mapping) or set(value) != {"stage2_source_sha256"}:
-        raise ValueError("Stage-2 inference code_version schema mismatch")
-    return {
-        "stage2_source_sha256": _sha256(
-            value["stage2_source_sha256"],
-            "code_version.stage2_source_sha256",
-        )
-    }
-
-
 def _rollout_topology_key(spec: Stage2RolloutSpec) -> tuple[Any, ...]:
     return (
         int(spec.generated_episode_frames),
@@ -994,7 +983,7 @@ def build_stage2_sample_trace(
     video_path: str | os.PathLike[str],
     checkpoint: Mapping[str, Any],
     inference_config: Mapping[str, Any],
-    code_version: Mapping[str, Any],
+    code_version: Mapping[str, Any] | None = None,
     probe_fn: Callable[[str | os.PathLike[str]], Mapping[str, Any]] = probe_video,
 ) -> dict[str, Any]:
     """Bind one technically validated video to all deterministic inputs."""
@@ -1003,7 +992,6 @@ def build_stage2_sample_trace(
     _validate_generation_trace(sample, generation_trace, profile)
     checkpoint_identity = _validate_checkpoint_identity(checkpoint)
     config_identity = validate_stage2_inference_config_identity(inference_config)
-    source_identity = _validate_code_version(code_version)
     root = Path(output_root)
     if root.expanduser().resolve() != Path(config_identity["resolved"]["output_root"]):
         raise RuntimeError("Stage-2 sample trace output root differs from its config")
@@ -1024,7 +1012,7 @@ def build_stage2_sample_trace(
         "raw_prompt_sha256": [_raw_prompt_sha256(item) for item in sample.prompts],
         "checkpoint": checkpoint_identity,
         "inference_config": config_identity,
-        "code_version": source_identity,
+        "code_version": {} if code_version is None else code_version,
         "profile": profile_value,
         "generation": dict(generation_trace),
         "output": {
@@ -1044,6 +1032,8 @@ def validate_stage2_sample_trace(
     inference_config: Mapping[str, Any] | None = None,
     code_version: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Validate content and inputs; code_version is historical metadata only."""
+
     expected_keys = {
         "schema",
         "status",
@@ -1051,14 +1041,13 @@ def validate_stage2_sample_trace(
         "raw_prompt_sha256",
         "checkpoint",
         "inference_config",
-        "code_version",
         "profile",
         "generation",
         "output",
         "quality_metrics",
         "trace_sha256",
     }
-    if not isinstance(trace, Mapping) or set(trace) != expected_keys:
+    if not isinstance(trace, Mapping) or set(trace) - {"code_version"} != expected_keys:
         raise ValueError("Stage-2 sample trace top-level schema mismatch")
     if (
         trace.get("schema") != STAGE2_SAMPLE_TRACE_SCHEMA
@@ -1073,7 +1062,9 @@ def validate_stage2_sample_trace(
         raise RuntimeError("Stage-2 raw prompt hash mismatch")
     if trace.get("quality_metrics") is not None:
         raise RuntimeError("Stage-2 automatic visual quality metrics are forbidden")
-    forbidden = _forbidden_quality_key(trace)
+    forbidden = _forbidden_quality_key(
+        {key: value for key, value in trace.items() if key != "code_version"}
+    )
     if forbidden is not None:
         raise RuntimeError(
             f"Stage-2 trace contains a forbidden quality metric key: {forbidden}"
@@ -1099,11 +1090,6 @@ def validate_stage2_sample_trace(
         validate_stage2_inference_config_identity(inference_config)
     ):
         raise RuntimeError("Stage-2 sample trace inference config mismatch")
-    source_identity = _validate_code_version(trace.get("code_version"))
-    if code_version is not None and source_identity != _validate_code_version(
-        code_version
-    ):
-        raise RuntimeError("Stage-2 sample trace code version mismatch")
     _validate_sample_config_scope(sample, config_identity["resolved"])
     _validate_generation_trace(sample, trace["generation"], profile)
     output = trace.get("output")
@@ -1283,7 +1269,6 @@ def validate_stage2_inference_manifest(
     expected_keys = {
         "schema",
         "status",
-        "code_version",
         "checkpoint",
         "inference_config",
         "metadata",
@@ -1294,7 +1279,10 @@ def validate_stage2_inference_manifest(
         "quality_metrics",
         "manifest_sha256",
     }
-    if not isinstance(manifest, Mapping) or set(manifest) != expected_keys:
+    if (
+        not isinstance(manifest, Mapping)
+        or set(manifest) - {"code_version"} != expected_keys
+    ):
         raise ValueError("Stage-2 inference manifest top-level schema mismatch")
     if (
         manifest.get("schema") != STAGE2_INFERENCE_MANIFEST_SCHEMA
@@ -1303,12 +1291,13 @@ def validate_stage2_inference_manifest(
         raise ValueError("Stage-2 inference manifest schema/status mismatch")
     if manifest.get("quality_metrics") is not None:
         raise RuntimeError("Stage-2 manifest may not contain automatic quality metrics")
-    forbidden = _forbidden_quality_key(manifest)
+    forbidden = _forbidden_quality_key(
+        {key: value for key, value in manifest.items() if key != "code_version"}
+    )
     if forbidden is not None:
         raise RuntimeError(
             f"Stage-2 manifest contains a forbidden quality metric key: {forbidden}"
         )
-    _validate_code_version(manifest.get("code_version"))
     _validate_checkpoint_identity(manifest.get("checkpoint"))
     config_identity = validate_stage2_inference_config_identity(
         manifest.get("inference_config")
@@ -1571,7 +1560,6 @@ def validate_stage2_inference_manifest_artifacts(
             trace,
             sample=sample,
             inference_config=config_identity,
-            code_version=validated["code_version"],
         )
         if checked_trace["checkpoint"] != checkpoint_identity:
             raise RuntimeError("Stage-2 trace checkpoint differs from final manifest")
@@ -1627,7 +1615,7 @@ def build_stage2_inference_manifest(
     checkpoint: Mapping[str, Any],
     inference_config: Mapping[str, Any],
     metadata: Mapping[str, Mapping[str, Any]],
-    code_version: Mapping[str, Any],
+    code_version: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a complete manifest only after every expected trace is committed."""
 
@@ -1645,14 +1633,12 @@ def build_stage2_inference_manifest(
     if root != Path(config_identity["resolved"]["output_root"]):
         raise RuntimeError("Stage-2 manifest output root differs from its config")
     metadata_identity = _validate_metadata_identity(metadata)
-    source_identity = _validate_code_version(code_version)
     entries = []
     for sample in samples:
         trace = validate_stage2_sample_trace(
             traces[sample.sample_key],
             sample=sample,
             inference_config=config_identity,
-            code_version=source_identity,
         )
         if trace["checkpoint"] != checkpoint_identity:
             raise RuntimeError(
@@ -1676,7 +1662,7 @@ def build_stage2_inference_manifest(
     payload = {
         "schema": STAGE2_INFERENCE_MANIFEST_SCHEMA,
         "status": "complete",
-        "code_version": source_identity,
+        "code_version": {} if code_version is None else code_version,
         "checkpoint": checkpoint_identity,
         "inference_config": config_identity,
         "metadata": {
