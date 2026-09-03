@@ -15,6 +15,8 @@ from typing import Any
 
 import torch
 
+from utils.stage2_inference_timing import stage2_timing_span
+
 STAGE2_INFERENCE_SEEDS = (1, 2, 3, 4)
 STAGE2_EPISODE_FUTURE_LATENTS = 24
 STAGE2_DECODE_INPUT_LATENTS = 25
@@ -204,7 +206,8 @@ def decode_stage2_episode(
     if decode_input.shape[1] != STAGE2_DECODE_INPUT_LATENTS:
         raise AssertionError("Stage-2 VAE input must contain exactly 25 latents")
     cache_cleared = clear_stage2_vae_cache(vae)
-    decoded = vae.decode_to_pixel(decode_input)
+    with stage2_timing_span("vae_decode", decode_input.device):
+        decoded = vae.decode_to_pixel(decode_input)
     if not isinstance(decoded, torch.Tensor) or decoded.ndim != 5:
         raise RuntimeError("Stage-2 VAE decode must return [B,T,C,H,W]")
     if decoded.shape[0] != initial_latent.shape[0]:
@@ -217,7 +220,8 @@ def decode_stage2_episode(
         )
     if not bool(torch.isfinite(decoded).all().item()):
         raise RuntimeError("Stage-2 VAE decode returned NaN or Inf")
-    video = (decoded[:, 1:].float() * 0.5 + 0.5).clamp(0.0, 1.0)
+    with stage2_timing_span("video_postprocess", decoded.device):
+        video = (decoded[:, 1:].float() * 0.5 + 0.5).clamp(0.0, 1.0)
     if video.shape[1] != STAGE2_OUTPUT_PIXEL_FRAMES_PER_EPISODE:
         raise AssertionError("Stage-2 episode output must contain 96 pixel frames")
     return Stage2DecodedEpisode(
@@ -417,7 +421,8 @@ def generate_stage2_two_action(
         initial_latent=initial_latent,
         future_latents=rollout_b.latents,
     )
-    video = torch.cat((decoded_a.video, decoded_b.video), dim=1)
+    with stage2_timing_span("video_postprocess", decoded_a.video.device):
+        video = torch.cat((decoded_a.video, decoded_b.video), dim=1)
     expected_frames = 2 * STAGE2_OUTPUT_PIXEL_FRAMES_PER_EPISODE
     if video.shape[1] != expected_frames:
         raise AssertionError("Stage-2 two-action output must contain 192 frames")

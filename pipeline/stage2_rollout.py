@@ -26,6 +26,7 @@ from pipeline.stage2_rollout_profile import (
     resolve_stage2_shift5_schedule,
 )
 from utils.stage2_cross_kv import Stage2CrossKVInitState
+from utils.stage2_inference_timing import stage2_timing_span
 
 STAGE2_K2_SHIFT5_TIMESTEPS = (999, 833)
 STAGE2_K4_SHIFT5_TIMESTEPS = (999, 937, 833, 624)
@@ -705,17 +706,18 @@ class Stage2RolloutPipeline:
         commit_self_kv: bool,
         flow_sigma: torch.Tensor | float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        value = self.generator(
-            noisy_image_or_video=latent,
-            conditional_dict=dict(conditioning),
-            timestep=timestep,
-            kv_cache=state.self_kv,
-            crossattn_cache=state.cross_kv,
-            current_start=current_start_frame * self.frame_seq_length,
-            cache_start=current_start_frame * self.frame_seq_length,
-            commit_self_kv=commit_self_kv,
-            flow_sigma=flow_sigma,
-        )
+        with stage2_timing_span("dit", latent.device):
+            value = self.generator(
+                noisy_image_or_video=latent,
+                conditional_dict=dict(conditioning),
+                timestep=timestep,
+                kv_cache=state.self_kv,
+                crossattn_cache=state.cross_kv,
+                current_start=current_start_frame * self.frame_seq_length,
+                cache_start=current_start_frame * self.frame_seq_length,
+                commit_self_kv=commit_self_kv,
+                flow_sigma=flow_sigma,
+            )
         raw_flow, x0_pred = self._generator_outputs(value)
         if raw_flow.shape != latent.shape:
             raise ValueError("Stage-2 generator changed the rollout latent shape")

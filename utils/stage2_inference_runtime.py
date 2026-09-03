@@ -28,7 +28,13 @@ from pipeline.stage2_rollout_profile import resolve_stage2_rollout_profile
 from utils.inference_utils import save_video
 from utils.stage1_causal_validation import probe_video
 from utils.stage1_i2v_data import load_stage1_input_image
-from utils.stage1_io import atomic_output_path, canonical_json_sha256, sha256_file
+from utils.stage1_io import (
+    atomic_output_path,
+    atomic_write_bytes,
+    canonical_json_bytes,
+    canonical_json_sha256,
+    sha256_file,
+)
 from utils.stage2_code_version import capture_stage2_source_version
 from utils.stage2_inference import (
     STAGE2_INFERENCE_FPS,
@@ -67,6 +73,8 @@ from utils.stage2_inference_batch import (
 from utils.stage2_inference_config import ResolvedStage2InferenceConfig
 from utils.stage2_inference_loader import load_stage2_ema_generator_for_inference
 from utils.stage2_inference_sweep_config import ResolvedStage2InferenceSweepConfig
+from utils.stage2_inference_timing import Stage2InferenceTiming, stage2_timing_span
+from utils.stage2_inference_timing_report import build_stage2_timing_report
 
 _OUTPUT_ROOT_GUARD_SCHEMA = "longlive_stage2_output_root_guard/v2"
 _OUTPUT_ROOT_ANCHOR_SCHEMA = "longlive_stage2_output_root_anchor/v1"
@@ -1059,6 +1067,9 @@ def _generate_one_sample(
     inference_config: Mapping[str, Any],
     code_version: Mapping[str, Any],
     ops: Stage2InferenceRuntimeOps,
+    rank: int,
+    rank_sample_index: int,
+    process_run_id: str,
 ) -> dict[str, Any]:
     root = _assert_output_root_guard(guard)
     existing = _validate_existing_pair(
@@ -1072,66 +1083,80 @@ def _generate_one_sample(
     if existing is not None:
         return existing
 
-    target_spec = resolve_stage2_rollout_profile(sample.profile)
-    target_pipeline = pipelines[sample.profile]
-    episode1_pipeline = (
-        pipelines["baseline_c8w16k4s1"]
-        if target_spec.global_sink_frames > 1
-        else target_pipeline
-    )
-    with torch.inference_mode():
-        if sample.dataset == STAGE2_SINGLE_DATASET:
-            result = ops.generate_single(
-                episode1_pipeline,
-                vae,
-                initial_latent=initial_latent,
-                conditional_dict=prompt_cache[sample.prompts[0]],
-                seeds=(sample.seed,),
-            )
-        elif sample.dataset == STAGE2_TWO_ACTION_DATASET:
-            result = ops.generate_two(
-                episode1_pipeline,
-                target_pipeline,
-                vae,
-                initial_latent=initial_latent,
-                action_a_conditional_dict=prompt_cache[sample.prompts[0]],
-                action_b_conditional_dict=prompt_cache[sample.prompts[1]],
-                seeds=(sample.seed,),
-            )
-        else:  # pragma: no cover - guarded by the strict batch planner
-            raise ValueError(f"unknown Stage-2 dataset {sample.dataset!r}")
-    _validate_video_tensor(sample, result)
-
-    video_path = root / sample.output_relative_path
-    trace_path = root / sample.trace_relative_path
-    _ensure_regular_parents(guard, video_path)
-    _ensure_regular_parents(guard, trace_path)
-    _assert_output_root_guard(guard)
-    if video_path.exists() or video_path.is_symlink():
-        raise FileExistsError(video_path)
-    _assert_regular_parents(guard, video_path, allow_missing=False)
-    # These pre/post checks fail closed for ordinary replacement races.  They
-    # intentionally do not claim to defeat a malicious local process that can
-    # switch a path inside the unavoidable check-to-open micro-window.
-    with atomic_output_path(video_path, suffix=".mp4") as temporary:
-        _assert_regular_parents(guard, temporary, allow_missing=False)
-        ops.save_video(result.video, temporary, fps=STAGE2_INFERENCE_FPS)
-        _assert_regular_parents(guard, temporary, allow_missing=False)
-        validate_stage2_video_artifact(
-            sample,
-            temporary,
-            probe_fn=ops.probe_video,
+    timing = Stage2InferenceTiming(initial_latent.device)
+    with timing.record():
+        target_spec = resolve_stage2_rollout_profile(sample.profile)
+        target_pipeline = pipelines[sample.profile]
+        episode1_pipeline = (
+            pipelines["baseline_c8w16k4s1"]
+            if target_spec.global_sink_frames > 1
+            else target_pipeline
         )
-        _assert_regular_parents(guard, temporary, allow_missing=False)
+        with torch.inference_mode():
+            if sample.dataset == STAGE2_SINGLE_DATASET:
+                result = ops.generate_single(
+                    episode1_pipeline,
+                    vae,
+                    initial_latent=initial_latent,
+                    conditional_dict=prompt_cache[sample.prompts[0]],
+                    seeds=(sample.seed,),
+                )
+            elif sample.dataset == STAGE2_TWO_ACTION_DATASET:
+                result = ops.generate_two(
+                    episode1_pipeline,
+                    target_pipeline,
+                    vae,
+                    initial_latent=initial_latent,
+                    action_a_conditional_dict=prompt_cache[sample.prompts[0]],
+                    action_b_conditional_dict=prompt_cache[sample.prompts[1]],
+                    seeds=(sample.seed,),
+                )
+            else:  # pragma: no cover - guarded by the strict batch planner
+                raise ValueError(f"unknown Stage-2 dataset {sample.dataset!r}")
+        _validate_video_tensor(sample, result)
+
+        video_path = root / sample.output_relative_path
+        trace_path = root / sample.trace_relative_path
+        _ensure_regular_parents(guard, video_path)
+        _ensure_regular_parents(guard, trace_path)
+        _assert_output_root_guard(guard)
         if video_path.exists() or video_path.is_symlink():
             raise FileExistsError(video_path)
-        _assert_output_root_guard(guard)
+        _assert_regular_parents(guard, video_path, allow_missing=False)
+        # Keep output guards and technical validation outside the postprocess
+        # span: they contribute to other_seconds, not model or encoding time.
+        with atomic_output_path(video_path, suffix=".mp4") as temporary:
+            _assert_regular_parents(guard, temporary, allow_missing=False)
+            with stage2_timing_span("video_postprocess", result.video.device):
+                ops.save_video(result.video, temporary, fps=STAGE2_INFERENCE_FPS)
+            _assert_regular_parents(guard, temporary, allow_missing=False)
+            validate_stage2_video_artifact(
+                sample,
+                temporary,
+                probe_fn=ops.probe_video,
+            )
+            _assert_regular_parents(guard, temporary, allow_missing=False)
+            if video_path.exists() or video_path.is_symlink():
+                raise FileExistsError(video_path)
+            _assert_output_root_guard(guard)
+    measured = {
+        **timing.to_dict(),
+        "rank": rank,
+        "rank_sample_index": rank_sample_index,
+        "cold_start": rank_sample_index == 0,
+        "process_run_id": process_run_id,
+        "device_name": (
+            torch.cuda.get_device_name(initial_latent.device)
+            if initial_latent.device.type == "cuda"
+            else str(initial_latent.device)
+        ),
+    }
     _assert_regular_parents(guard, video_path, allow_missing=False)
     trace = dict(
         # The injected builder probes and hashes the committed video.
         ops.build_sample_trace(
             sample=sample,
-            generation_trace=result.trace,
+            generation_trace={**result.trace, "timing": measured},
             output_root=root,
             video_path=video_path,
             checkpoint=checkpoint,
@@ -1163,6 +1188,17 @@ def _generate_one_sample(
     if not trace_path.is_file() or trace_path.is_symlink():
         raise RuntimeError(f"Stage-2 trace commit failed: {trace_path}")
     _assert_output_root_guard(guard)
+    print(
+        f"[stage2-timing rank={rank}] {sample.sample_key} "
+        f"DiT={measured['dit_seconds']:.6f}s "
+        f"({measured['dit_calls']} calls), "
+        f"VAE_decode={measured['vae_decode_seconds']:.6f}s, "
+        f"video_postprocess={measured['video_postprocess_seconds']:.6f}s, "
+        f"other={measured['other_seconds']:.6f}s, "
+        f"total={measured['total_seconds']:.6f}s, "
+        f"cold_start={measured['cold_start']}",
+        flush=True,
+    )
     return trace
 
 
@@ -1300,6 +1336,27 @@ def _finalize_artifacts(
         _assert_output_root_guard(guard)
         if written_index != index_path or written_index.read_bytes() != expected_index:
             raise RuntimeError("Stage-2 review index commit failed")
+        _assert_output_root_guard(guard)
+
+    summary, samples_csv = build_stage2_timing_report(
+        samples,
+        traces,
+        checkpoint=checkpoint,
+        code_version=code_version,
+    )
+    for name, payload in (
+        ("timing_summary.json", canonical_json_bytes(summary) + b"\n"),
+        ("timing_samples.csv", samples_csv),
+    ):
+        destination = root / name
+        _assert_output_root_guard(guard)
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_file():
+                raise RuntimeError(f"Stage-2 timing report is not a file: {name}")
+            if destination.read_bytes() != payload:
+                raise RuntimeError(f"Stage-2 timing report differs from traces: {name}")
+        else:
+            atomic_write_bytes(destination, payload)
         _assert_output_root_guard(guard)
 
     # The complete manifest is the final commit marker.  No preceding failure
@@ -1671,6 +1728,7 @@ def run_stage2_inference(
             }
             resources.extend(pipelines.values())
             latent_cache = {}
+            process_run_id = secrets.token_hex(16)
             for sample in local_samples:
                 prior = _validate_existing_pair(
                     root_guard,
@@ -1718,6 +1776,9 @@ def run_stage2_inference(
                     inference_config=inference_config,
                     code_version=code_version,
                     ops=runtime_ops,
+                    rank=distributed.rank,
+                    rank_sample_index=generated,
+                    process_run_id=process_run_id,
                 )
                 generated += 1
     except Exception as exc:  # noqa: BLE001 - synchronize every rank before raising
@@ -1816,6 +1877,12 @@ def run_stage2_inference(
         "checkpoint": checkpoint,
         "manifest": os.fspath(manifest_path) if manifest_path is not None else None,
         "review_index": os.fspath(index_path) if index_path is not None else None,
+        "timing_summary": (
+            os.fspath(root / "timing_summary.json") if distributed.rank == 0 else None
+        ),
+        "timing_samples": (
+            os.fspath(root / "timing_samples.csv") if distributed.rank == 0 else None
+        ),
     }
 
 

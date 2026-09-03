@@ -48,6 +48,7 @@ from utils.stage2_inference_sweep_config import (
     STAGE2_INFERENCE_SWEEP_MAX_PROFILES,
     ResolvedStage2InferenceSweepConfig,
 )
+from utils.stage2_inference_timing_report import validate_stage2_timing
 
 STAGE2_SAMPLE_TRACE_SCHEMA = "longlive_stage2_sample_trace/v2"
 STAGE2_INFERENCE_MANIFEST_SCHEMA = "longlive_stage2_inference_manifest/v2"
@@ -682,6 +683,29 @@ def _validate_generation_trace(
     }
     if expected_mode == "two_action":
         expected_keys.add("reset_events")
+    if "timing" in generation:
+        expected_keys.add("timing")
+        timing = validate_stage2_timing(generation["timing"])
+        episode1_spec = (
+            resolve_stage2_rollout_profile("baseline_c8w16k4s1")
+            if profile.global_sink_frames > 1
+            else profile
+        )
+        expected_dit_calls = episode1_spec.fresh_deploy_dit_calls
+        expected_vae_calls = 1
+        # Each decode normalizes pixels; two-action additionally concatenates,
+        # and the runtime saves the finished video exactly once.
+        expected_postprocess_calls = 2
+        if expected_mode == "two_action":
+            expected_dit_calls += profile.fresh_deploy_dit_calls - 1
+            expected_vae_calls = 2
+            expected_postprocess_calls = 4
+        if (
+            timing["dit_calls"] != expected_dit_calls
+            or timing["vae_decode_calls"] != expected_vae_calls
+            or timing["video_postprocess_calls"] != expected_postprocess_calls
+        ):
+            raise ValueError("Stage-2 timing call counts differ from its rollout")
     if set(generation) != expected_keys:
         raise ValueError("Stage-2 generation trace schema mismatch")
     if generation.get("schema") != STAGE2_INFERENCE_TRACE_SCHEMA:

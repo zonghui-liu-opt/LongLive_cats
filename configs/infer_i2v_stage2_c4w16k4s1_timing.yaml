@@ -1,0 +1,18 @@
+schema: longlive_stage2_inference_sweep/v1
+base_config: infer_i2v_stage2_baseline.yaml
+output_root: ${oc.env:LONG_LIVE_STAGE2_INFERENCE_OUTPUT,/path/to/stage2_c4w16k4s1_timing}
+
+# Exact C4/W16/S1/K4 topology. Timings are collected automatically by inference.
+profile_set:
+  named:
+    - c4w16k4s1
+  grids: []
+  cases: []
+
+# quick: 2 single-action + 2 two-action samples, one seed = 4 videos.
+# --evaluation formal: 6 single + 8 two-action samples, four seeds = 56 videos.
+evaluation:
+  mode: quick
+  seeds: [1]
+  single_row_ids: [0, 3]
+  two_action_row_ids: [0, 4]
